@@ -1,0 +1,30 @@
+{
+  "_README": [
+    "A LOCATION POLICY: where a candidate can work. Both location gates read it:",
+    "location-core.mjs (the scanner) and scripts/eval-prep.py (evaluation packets), plus the",
+    "triage, sweep and board tools through scripts/_location.py.",
+    "home_state: the state a state-scoped remote offer must name ('US, CA, Remote').",
+    "commute: places inside the commute ceiling; onsite or hybrid there passes. A missing",
+    "  city is a silent discard, so err long. Matched case-insensitively on word boundaries.",
+    "same_state_out: metros in YOUR state that are outside the commute (for California, the",
+    "  Bay Area). They veto an otherwise-passing onsite or remote-flagged option.",
+    "hard_out_metro: other metros that are out for onsite work, and that narrow a",
+    "  metro-scoped remote offer out of range. Both gates read it.",
+    "onsite_outside_commute: 'fail' (no relocation) or 'unknown' (ask a human).",
+    "To add a location, copy california-socal.json, which is the worked example."
+  ],
+  "name": "remote-us",
+  "description": "Remote anywhere in the US, no commute area. setup.mjs replaces home_state with yours so state-scoped remote offers can be judged.",
+  "home_state": null,
+  "commute": {
+    "label": "Commute",
+    "signals": []
+  },
+  "same_state_out": {
+    "label": null,
+    "signals": []
+  },
+  "hard_out_metro": [],
+  "onsite_outside_commute": "fail",
+  "review_metro_companies": []
+}

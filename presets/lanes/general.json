@@ -1,0 +1,71 @@
+{
+  "_README": [
+    "A LANE PRESET: what a search is looking for and what it is not.",
+    "Copied to config/lane-vocab.json by `node setup.mjs`, then yours to edit.",
+    "Underscore sections are read by one consumer each (named in `_comment`); every other",
+    "top-level key is a shared anti-lane FAMILY that both title scorers read, with one weight",
+    "per scorer because each penalty is sized against the bonus it answers.",
+    "Patterns in shared families and `_ranker` must be valid in BOTH JavaScript and Python."
+  ],
+  "_preset": {
+    "name": "general",
+    "description": "No field-specific tuning. setup.mjs fills `_ranker`, `_lane` and `_title_filter` from the role keywords you give it."
+  },
+  "_ranker": {
+    "_comment": "Read by pipeline-audit.mjs --rank. JavaScript regex, case-insensitive. `lanes` add their weight per matching term; `deprioritised` and `managerial` subtract; `out_of_lane` is an outright -99; `ic_director` exempts IC director titles from the managerial penalty.",
+    "lanes": [],
+    "out_of_lane": null,
+    "managerial": null,
+    "deprioritised": null,
+    "ic_director": null
+  },
+  "_lane": {
+    "_comment": "Read by scripts/_lane.py (board sweeps). Python regex, case-insensitive.",
+    "title_up": [],
+    "title_down": [],
+    "body_up": [],
+    "body_down": []
+  },
+  "_assist": {
+    "_comment": "Read by scripts/eval-assist.py. Python regex, case-insensitive.",
+    "lane": [],
+    "anti": [],
+    "gates": [
+      [
+        "security clearance",
+        "\\b(security clearance|ts/sci|top secret|secret clearance|itar|us citizen(ship)? (is )?required)\\b",
+        "dispose"
+      ],
+      [
+        "degree required",
+        "\\b(ph\\.?d\\.?|master'?s degree|ms or phd|advanced degree)\\b[^.]{0,60}\\b(required|must have|is a requirement)\\b|\\brequire[sd]?\\b[^.]{0,40}\\b(ph\\.?d\\.?|master'?s)\\b"
+      ],
+      [
+        "degree preferred",
+        "\\b(ph\\.?d\\.?|master'?s)\\b[^.]{0,40}\\b(preferred|a plus|ideally)\\b"
+      ]
+    ]
+  },
+  "_board": {
+    "_comment": "Read by the board builders. Each role goes to the FIRST lane whose words appear in ' <lowercased title> '; `cv` is the CV variant the dashboard suggests; lanes with a `button` get a filter button on the boards.",
+    "lanes": [],
+    "fallback": {
+      "name": "Other",
+      "cv": "CV"
+    }
+  },
+  "_title_filter": {
+    "_comment": "Written into portals.yml title_filter by setup.mjs. Substring match, case-insensitive; at least one positive and no negative must match.",
+    "positive": [],
+    "negative": [],
+    "seniority_boost": []
+  },
+  "_triage": {
+    "_comment": "Read by scripts/triage-leads.py. [label, Python regex]: a pasted lead whose title matches is set aside with that label (still printed, never silently dropped).",
+    "gates": []
+  },
+  "_sweep": {
+    "_comment": "Read by scripts/nvidia-sweep.py: the search terms it sends to NVIDIA's board. With none, it falls back to the title filter's positives.",
+    "terms": []
+  }
+}

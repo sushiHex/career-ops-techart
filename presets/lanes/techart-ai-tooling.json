@@ -1,0 +1,885 @@
+{
+  "_README": [
+    "A LANE PRESET: what a search is looking for and what it is not.",
+    "Copied to config/lane-vocab.json by `node setup.mjs`, then yours to edit.",
+    "Underscore sections are read by one consumer each (named in `_comment`); every other",
+    "top-level key is a shared anti-lane FAMILY that both title scorers read, with one weight",
+    "per scorer because each penalty is sized against the bonus it answers.",
+    "Patterns in shared families and `_ranker` must be valid in BOTH JavaScript and Python."
+  ],
+  "_preset": {
+    "name": "techart-ai-tooling",
+    "description": "Senior technical art (rigging, pipeline, tools, digital humans) plus AI tooling, agentic and evaluation engineering. The tuning this fork was built with."
+  },
+  "_ranker": {
+    "lanes": [
+      {
+        "tag": "B",
+        "terms": [
+          [
+            "\\bagentic\\b|\\bagent\\b|\\bagents\\b",
+            6
+          ],
+          [
+            "\\bLLM\\b|large language model",
+            5
+          ],
+          [
+            "\\bMCP\\b|model context protocol",
+            6
+          ],
+          [
+            "\\beval(uation)?s?\\b|benchmark|observability|\\bquality\\b",
+            5
+          ],
+          [
+            "\\bRAG\\b|retrieval",
+            3
+          ],
+          [
+            "applied AI|applied research|AI engineer|ML engineer|machine learning|\\bMLOps\\b|AI\\/ML",
+            4
+          ],
+          [
+            "developer tools?|dev tools?|AI tools?|tooling|toolchain|developer (productivity|platform)|internal tool",
+            3
+          ],
+          [
+            "inference|fine.?tun|diffusion|generative|genai",
+            3
+          ],
+          [
+            "simulation|physics|omniverse|isaac|synthetic data|world model|neural graphics",
+            4
+          ]
+        ]
+      },
+      {
+        "tag": "A",
+        "terms": [
+          [
+            "technical artist|technical direct|technical animat|\\bTD\\b",
+            4
+          ],
+          [
+            "rigging|deformation|character tech|digital human|avatar",
+            4
+          ],
+          [
+            "pipeline|tools? (engineer|programmer)|build engineer|creative technolog|VFX|animation|graphics",
+            3
+          ],
+          [
+            "openusd|\\bUSD\\b|\\bAOUSD\\b|universal scene description",
+            3
+          ],
+          [
+            "unreal|unity|houdini|maya",
+            2
+          ]
+        ]
+      }
+    ],
+    "deprioritised": {
+      "pattern": "\\b(technical marketing|account|recruit|intern\\b|enablement)\\b",
+      "weight": -8,
+      "tag": "deprioritised"
+    },
+    "out_of_lane": "\\b(propulsion|mechanical|electrical|structural|thermal|manufactur|supply chain|finance|accountant|legal|counsel|marketing manager|payroll|clinical|nurse|driver|technician|security guard)\\b",
+    "managerial": {
+      "pattern": "\\b(director|vp|head of|engineering manager|senior manager|manager,)\\b",
+      "weight": -4,
+      "tag": "managerial"
+    },
+    "ic_director": "\\b(technical|art|creative|audio|cinematic|narrative|animation|lighting|effects|fx|pipeline|character|creature)\\s+director\\b",
+    "_comment": "Read by pipeline-audit.mjs --rank. JavaScript regex, case-insensitive. `lanes` add their weight per matching term; `deprioritised` and `managerial` subtract; `out_of_lane` is an outright -99; `ic_director` exempts IC director titles from the managerial penalty."
+  },
+  "_lane": {
+    "_comment": "Read by scripts/_lane.py (board sweeps). Python regex, case-insensitive.",
+    "title_up": [
+      [
+        "\\bagent(s|ic)?\\b",
+        4
+      ],
+      [
+        "\\beval(uation)?s?\\b",
+        4
+      ],
+      [
+        "\\bharness(es)?\\b",
+        4
+      ],
+      [
+        "\\borchestrat",
+        3
+      ],
+      [
+        "\\bLLM\\b",
+        2
+      ],
+      [
+        "\\bMCP\\b",
+        3
+      ],
+      [
+        "\\btool(s|ing|chain)?\\b",
+        2
+      ],
+      [
+        "\\bdeveloper (tools?|productivity|experience)\\b",
+        3
+      ],
+      [
+        "\\bOmniverse\\b",
+        3
+      ],
+      [
+        "\\bOpenUSD\\b|\\bUSD\\b",
+        3
+      ],
+      [
+        "\\bsimulation\\b",
+        2
+      ],
+      [
+        "\\bsynthetic data\\b",
+        2
+      ],
+      [
+        "\\bdigital human|avatars?\\b",
+        3
+      ],
+      [
+        "\\btechnical marketing\\b",
+        2
+      ],
+      [
+        "\\bapplied AI\\b",
+        2
+      ],
+      [
+        "\\bsafety\\b",
+        1
+      ],
+      [
+        "\\bgraphics|raytracing|rendering\\b",
+        2
+      ],
+      [
+        "\\bphysics\\b",
+        2
+      ]
+    ],
+    "title_down": [
+      [
+        "\\binference\\b",
+        -4
+      ],
+      [
+        "\\bautonomous (driving|vehicles?)\\b",
+        -4
+      ],
+      [
+        "\\bsales|account manager\\b",
+        -6
+      ],
+      [
+        "\\bproduct marketing\\b",
+        -4
+      ],
+      [
+        "\\bquantum\\b",
+        -4
+      ],
+      [
+        "\\bPh\\.?\\s?D\\.?\\b",
+        -6
+      ],
+      [
+        "\\bdistributed systems|DGX Cloud|storage\\b",
+        -4
+      ],
+      [
+        "\\bnetwork reliability|detection engineering\\b",
+        -4
+      ],
+      [
+        "\\bresearch scientist|applied research\\b",
+        -3
+      ],
+      [
+        "\\bdatabases?\\b",
+        -3
+      ],
+      [
+        "\\b(recruiter|talent acquisition|people partner|payroll|accounts payable)\\b",
+        -6
+      ]
+    ],
+    "body_up": [
+      [
+        "\\bagent(ic|-enabled)?\\b",
+        3
+      ],
+      [
+        "\\bautonomous\\b",
+        2
+      ],
+      [
+        "\\beval(uation)?s?\\b",
+        3
+      ],
+      [
+        "\\bharness\\b",
+        3
+      ],
+      [
+        "\\bMCP\\b",
+        3
+      ],
+      [
+        "\\borchestrat",
+        2
+      ],
+      [
+        "\\bfrom the ground up\\b",
+        1
+      ],
+      [
+        "\\binternal tool",
+        2
+      ],
+      [
+        "\\bOpenUSD|\\bUSD\\b",
+        3
+      ],
+      [
+        "\\bdomain experts? (who |will )?(help|partner)",
+        2
+      ]
+    ],
+    "body_down": [
+      [
+        "\\btelemetry\\b",
+        -6
+      ],
+      [
+        "\\bGPU health|host metrics|node health\\b",
+        -6
+      ],
+      [
+        "\\bfleet\\b",
+        -4
+      ],
+      [
+        "\\battestation\\b",
+        -4
+      ],
+      [
+        "\\bcloud-scale\\b",
+        -4
+      ],
+      [
+        "\\bagent-side\\b",
+        -6
+      ],
+      [
+        "\\bDGX Cloud\\b",
+        -5
+      ],
+      [
+        "\\bdaemon\\b",
+        -5
+      ],
+      [
+        "\\bprovisioning|bare metal|firmware\\b",
+        -3
+      ],
+      [
+        "\\binference (latency|throughput|optimi)",
+        -5
+      ],
+      [
+        "\\bquantization|FP8|speculative decoding\\b",
+        -5
+      ]
+    ]
+  },
+  "_assist": {
+    "_comment": "Read by scripts/eval-assist.py. Python regex, case-insensitive.",
+    "lane": [
+      [
+        "agentic",
+        "\\bagentic\\b|\\bagent(s)?\\b|multi[- ]agent|tool[- ]use",
+        3
+      ],
+      [
+        "eval",
+        "\\beval(uation)?s?\\b[^.]{0,40}\\b(model|llm|agent|output|prompt|quality|harness)\\b|\\b(model|llm|agent|output|prompt)\\b[^.]{0,40}\\beval(uation)?s?\\b|llm[- ]as[- ]judge|red[- ]team|golden (set|dataset)|eval harness|benchmark suite",
+        3
+      ],
+      [
+        "MCP",
+        "\\bMCP\\b|model context protocol",
+        3
+      ],
+      [
+        "harness/tooling",
+        "\\bharness\\b|internal tool|developer tool|pipeline tool",
+        2
+      ],
+      [
+        "generative media",
+        "\\bdiffusion\\b|comfyui|\\blora\\b|image generation|video generation",
+        2
+      ],
+      [
+        "craft",
+        "\\brigging\\b|technical art|\\bmaya\\b|houdini|unreal|animation pipeline",
+        2
+      ]
+    ],
+    "anti": [
+      [
+        "model training",
+        "\\btraining (large|foundation)|pre[- ]training|from scratch\\b",
+        2
+      ],
+      [
+        "serving infra",
+        "\\binference (serving|infrastructure)\\b|\\bthroughput\\b|\\btriton\\b|\\bvllm\\b",
+        2
+      ],
+      [
+        "ranking/ads",
+        "\\brecommendation\\b|\\branking\\b|\\bads? (platform|ranking)\\b|\\bctr\\b",
+        2
+      ]
+    ],
+    "gates": [
+      [
+        "security clearance",
+        "\\b(security clearance|ts/sci|top secret|secret clearance|itar|us citizen(ship)? (is )?required)\\b",
+        "dispose"
+      ],
+      [
+        "degree required",
+        "\\b(ph\\.?d\\.?|master'?s degree|ms or phd|advanced degree)\\b[^.]{0,60}\\b(required|must have|is a requirement)\\b|\\brequire[sd]?\\b[^.]{0,40}\\b(ph\\.?d\\.?|master'?s)\\b"
+      ],
+      [
+        "degree preferred",
+        "\\b(ph\\.?d\\.?|master'?s)\\b[^.]{0,40}\\b(preferred|a plus|ideally)\\b"
+      ],
+      [
+        "10+ yrs",
+        "\\b(1[0-9]|2[0-9])\\+?\\s*years\\b"
+      ],
+      [
+        "distributed systems",
+        "\\bdistributed systems\\b|\\bfault[- ]tolerant\\b|\\bkubernetes\\b|\\bterraform\\b"
+      ],
+      [
+        "research/publication",
+        "\\b(publications?|first[- ]author|peer[- ]reviewed|neurips|siggraph paper|iccv|cvpr)\\b"
+      ],
+      [
+        "customer-facing",
+        "\\b(customer[- ]facing|client[- ]facing|quota|pre[- ]sales|account team|trusted advisor|partner[- ]facing)\\b"
+      ],
+      [
+        "on-call",
+        "\\bon[- ]call\\b|\\bpager\\b"
+      ]
+    ]
+  },
+  "_role_gate": {
+    "pattern": "\\b(developer advocate|developer relations|devrel|developer experience|technical marketing|solutions engineer|solutions architect|forward deployed|sales engineer|customer engineer|field engineer|evangelist|content workflow)\\b",
+    "_comment": "Read by score-model.mjs. Titles this search de-prioritises: a matching title keeps only 25% of its company preference. Omit to disable the gate."
+  },
+  "_board": {
+    "_comment": "Read by the board builders. Each role goes to the FIRST lane whose words appear in ' <lowercased title> '; `cv` is the CV variant the dashboard suggests; lanes with a `button` get a filter button on the boards.",
+    "lanes": [
+      {
+        "name": "Eval / Agentic",
+        "button": "Eval",
+        "cv": "AI-Eval CV",
+        "words": [
+          "eval",
+          "evaluat",
+          "observ",
+          "agent",
+          "agentic"
+        ]
+      },
+      {
+        "name": "Applied AI",
+        "button": "Applied AI",
+        "cv": "AI-Eval CV",
+        "words": [
+          "ai dev",
+          "dev tools",
+          "ai platform",
+          "ai engineer",
+          "applied ai",
+          "forward deployed",
+          "machine learning",
+          "ml engineer",
+          "ai/ml",
+          "ai-ml",
+          "solutions"
+        ]
+      },
+      {
+        "name": "Creative-Tech / Sim",
+        "cv": "CreativeTech CV",
+        "words": [
+          "creative technologist",
+          "vfx",
+          "content workflow",
+          "digital tw",
+          "sim",
+          "physics",
+          "omniverse"
+        ]
+      },
+      {
+        "name": "AI DevRel",
+        "cv": "AI CV",
+        "words": [
+          "developer relations",
+          "developer advocate",
+          "enablement"
+        ]
+      },
+      {
+        "name": "Tech-Art / Craft",
+        "button": "Craft",
+        "cv": "TA CV",
+        "words": [
+          "technical artist",
+          "rigger",
+          "rigging",
+          "animator",
+          "character",
+          "pipeline",
+          "technical director",
+          " td",
+          "tools"
+        ]
+      },
+      {
+        "name": "Applied AI",
+        "cv": "AI-Eval CV",
+        "words": [
+          "software engineer",
+          " ai "
+        ]
+      }
+    ],
+    "fallback": {
+      "name": "Other",
+      "cv": "AI-Eval CV"
+    }
+  },
+  "_title_filter": {
+    "positive": [
+      "Technical Artist",
+      "Tech Artist",
+      "Tech Art",
+      "Technical Art",
+      "Technical Director",
+      "Technical Animator",
+      "Pipeline Technical Artist",
+      "Pipeline Engineer",
+      "Tools Engineer",
+      "Tools Programmer",
+      "Rigging",
+      "Rigger",
+      "Character TA",
+      "Character Tools",
+      "Avatar",
+      "Shader",
+      "Look Dev",
+      "Lookdev",
+      "Look Development",
+      "Real-Time",
+      "Realtime",
+      "Pipeline",
+      "Cinematics",
+      "Character",
+      "Deformation",
+      "Graphics",
+      "Rendering",
+      "VFX",
+      "Simulation",
+      "Creative Tech*",
+      "Build Engineer",
+      "Tooling",
+      "AI Engineer*",
+      "ML Engineer*",
+      "Machine Learning Engineer*",
+      "AI Tooling",
+      "AI/ML",
+      "ML Tools",
+      "Applied AI",
+      "Applied Modeling",
+      "MLOps",
+      "Pipeline TD",
+      "Agent*",
+      "Eval*",
+      "LLM",
+      "Generative AI",
+      "GenAI",
+      "Research Engineer",
+      "Forward Deployed",
+      "AI Platform",
+      "AI Infrastructure",
+      "AI Systems",
+      "AI Safety",
+      "AI Dev Tools",
+      "AI Developer Tools",
+      "Developer Tools",
+      "Dev Tools",
+      "Developer Experience",
+      "Developer Advocate",
+      "Technical Marketing",
+      "Prompt Engineer",
+      "Automation",
+      "Enablement",
+      "Harness",
+      "USD",
+      "OpenUSD",
+      "Benchmark*",
+      "Observability",
+      "Orchestration",
+      "MCP",
+      "Model Context Protocol",
+      "Enterprise AI",
+      "Developer Productivity",
+      "Digital Human",
+      "Production Technology",
+      "Expression*"
+    ],
+    "negative": [
+      "Intern",
+      "Internship",
+      "Junior",
+      "Co-op",
+      "Apprentice",
+      "Sales",
+      "Product Marketing",
+      "Field Marketing",
+      "Brand Marketing",
+      "Growth Marketing",
+      "Marketing Manager",
+      "Marketing Operations",
+      "Marketing Analyst",
+      "Recruiter",
+      "Recruiting",
+      "Account Executive",
+      "Customer Success",
+      "Web3",
+      "Crypto",
+      "Blockchain",
+      "Recommendation",
+      "Bidding",
+      "Advertis*",
+      "Autonomous Driving",
+      "VLSI",
+      "Finance",
+      "Financial",
+      "Accounting",
+      "Payroll",
+      "Counsel",
+      "People Operations",
+      "Procurement",
+      "Post-Silicon",
+      "Silicon Validation",
+      "Design Verification",
+      "Physical Design",
+      "Analog",
+      "RTL",
+      "Trust & Safety",
+      "Trust and Safety",
+      "Trust & Risk",
+      "Customer Experience Agent",
+      "Support Agent",
+      "Fraud Agent",
+      "Warehouse Agent",
+      "Dispatch Agent",
+      "Escalations Agent",
+      "Chat Agent",
+      "Live Agent",
+      "Claims Agent"
+    ],
+    "seniority_boost": [
+      "Senior",
+      "Staff",
+      "Principal",
+      "Lead",
+      "Manager",
+      "Head",
+      "Director"
+    ],
+    "_comment": "Written into portals.yml title_filter by setup.mjs. Substring match, case-insensitive; at least one positive and no negative must match."
+  },
+  "support_agent": {
+    "tag": "support-agent",
+    "weight": {
+      "lane": -8,
+      "ranker": -12
+    },
+    "why": [
+      "'Agent' in a title is not always an AI agent. At a marketplace or any consumer",
+      "company it usually means a HUMAN support agent, and the lane bonus then ranks",
+      "customer service above the actual AI work. Sweeping Whatnot put 'Trust & Safety",
+      "Agent' and seven 'Customer Experience Agent' rows above its own AI Tooling Engineer",
+      "and LLM Platform Engineer: 11 of 19 triage rows, 58% of the output, all sitting",
+      "above the roles the sweep existed to find.",
+      "These outweigh the agent bonus deliberately. Ranking the anti-lane FIRST is worse",
+      "than ranking nothing, because the top of the list is the entry a human reads. It",
+      "costs a genuine title now and then, an AI lab's 'Trust & Safety' ML req being the",
+      "likeliest, and both scorers accept that trade.",
+      "The list is open-ended by nature, since a consumer company can put 'Agent' after",
+      "almost any operations noun. Enumerating them is the stopgap that TITLE-ONLY triage",
+      "allows; scoring the body is the real answer wherever a body exists."
+    ],
+    "patterns": [
+      "\\b(trust (and|&) (safety|risk)|customer (experience|support|service)|support agent|fraud|warehouse|dispatch|escalations?|operations agent|chat agent|live agent|claims|collections|onboarding specialist)\\b",
+      "\\bagent,?\\s+(?:\\d{4}\\s+)?(new grad|new college grad|high value|bilingual)"
+    ]
+  },
+  "hw_test": {
+    "tag": "hw-test",
+    "weight": {
+      "lane": -8,
+      "ranker": -5
+    },
+    "why": [
+      "'Test & Evaluation' is a defence-industry discipline, verifying that a weapon system",
+      "meets its spec, not LLM evaluation. It collects the full eval bonus and once put",
+      "a cluster of defence-industry T&E reqs high on a candidate list. The profile's eval",
+      "specialty is agent and model quality, which shares a word with this and nothing else."
+    ],
+    "patterns": [
+      "\\btest (and|&) evaluation\\b|\\bT&E\\b"
+    ]
+  },
+  "early_career": {
+    "tag": "early-career",
+    "weight": {
+      "lane": -8
+    },
+    "why": [
+      "An absolute disqualifier for a senior candidate, and these reqs score WELL on lane",
+      "keywords because the research topics sit right on the profile's subject matter:",
+      "'NVIDIA 2027 Internships: Ph.D. Research Graphics and Simulation' scored 7 and",
+      "reached the top of a large pending-req list.",
+      "Two boundary bugs have already been paid for here and both are pinned by cases.",
+      "`interns?` does not match 'Internships', because there is no word boundary inside",
+      "the word, so the plural form scored POSITIVE. And `new ?grad` does not match 'New",
+      "College Grad', which is the spelling NVIDIA uses."
+    ],
+    "patterns": [
+      "\\b(intern(?:ship)?s?|co-?op|new ?grad|new college grad|new graduate|recent graduate|university (grad|program|recruiting)|student|apprentice|entry[- ]level|early career|residency|fellowship)\\b"
+    ]
+  },
+  "product_program_mgmt": {
+    "tag": "product-mgr",
+    "weight": {
+      "lane": -7,
+      "ranker": -8
+    },
+    "why": [
+      "This profile targets an IC AI/ML ENGINEER title, not product or programme",
+      "leadership, and these reqs surface at the top of triage purely because 'agentic'",
+      "appears in their titles. NVIDIA's 'Technical Program Manager - Local AI Agents' is",
+      "the case that forced programme manager in here: _lane.py had it, the ranker's copy",
+      "covered only product manager, and the req ranked with the engineering roles.",
+      "Manager-of-engineers is deliberately NOT matched. That is a different question from",
+      "product management, and the ranker answers it separately with its own managerial",
+      "rule plus the craft-director exemption, because in games and VFX a 'Technical",
+      "Director' is a senior individual contributor, not a people manager."
+    ],
+    "patterns": [
+      "\\b(product manager|product management|program manager|programme manager|project manager|technical program manager|\\bTPM\\b|\\bPM\\b)\\b"
+    ]
+  },
+  "kernel_compiler": {
+    "tag": "low-level-systems",
+    "weight": {
+      "lane": -4,
+      "ranker": -6
+    },
+    "why": [
+      "GPU kernel and compiler work is a hard anti-lane in this profile, and it wears agentic vocabulary",
+      "at NVIDIA: 'Senior System Software Engineer, Agentic Kernel Development' ranked with",
+      "the real agentic reqs in the 2026-09-20 triage. _lane.py has penalised this since it",
+      "was written and the Node ranker scored it POSITIVELY, which is the same hand-port gap",
+      "the rest of this file exists to close.",
+      "Note a real disagreement that is NOT here: `inference`. _lane.py penalises it as a",
+      "documented gap area and the ranker rewards it. That is a judgement about two",
+      "different jobs (serving infrastructure against applied AI) and it stays local to each",
+      "file rather than being averaged away."
+    ],
+    "patterns": [
+      "\\bkernel|compiler|CUDA tile|matrix multiplication\\b"
+    ]
+  },
+  "silicon_design": {
+    "tag": "low-level-systems",
+    "weight": {
+      "lane": -6,
+      "ranker": -8
+    },
+    "why": [
+      "Chip design, one step further out than kernel work and weighted harder in both",
+      "scorers for the same reason: no amount of lane vocabulary in the title makes a",
+      "physical-design req applicable. Ported verbatim from _lane.py's LANE_DOWN so that",
+      "file's behaviour is unchanged and only the ranker gains the rule."
+    ],
+    "patterns": [
+      "\\bcircuit|mask (layout|design)|ASIC|physical design|interposer|silicon\\b"
+    ]
+  },
+  "customer_facing_ic": {
+    "tag": "customer-facing",
+    "weight": {
+      "lane": -7,
+      "ranker": -8
+    },
+    "why": [
+      "The family whose drift started all of this. This profile de-prioritises customer-",
+      "facing and pre-sales titles in favour of an IC AI/ML ENGINEER title, and both scorers",
+      "agreed on that, separately, in two spellings. _lane.py wrote",
+      "`solutions? (architect|engineer)`; the ranker wrote the PLURAL only. NVIDIA writes",
+      "'Solution Architect' singular, so three of them led a 593-req triage.",
+      "'Technical marketing' is deliberately NOT here, and the two scorers genuinely",
+      "disagree about it: the ranker de-prioritises it while _lane.py scores it POSITIVELY,",
+      "because in this profile Technical Marketing Engineer is a target title rather than a",
+      "customer-facing one. That disagreement is a real judgement, not drift, so it stays",
+      "local to each file rather than being averaged away here."
+    ],
+    "patterns": [
+      "\\b(solutions? (architect|engineer)|sales engineer|customer engineer|field engineer|forward deployed|adoption architect|customer success|account executive|evangelist|developer (advocate|relations)|devrel)\\b"
+    ]
+  },
+  "security_identity": {
+    "tag": "security_identity",
+    "weight": {
+      "lane": -7,
+      "ranker": -8
+    },
+    "why": [
+      "Added from a 593-req inbox backlog. 'Agentic identity' is an infosec specialty and",
+      "the word agent carries the whole lane bonus: NVIDIA's 'Principal Cyber Security",
+      "Engineer - Agentic Identity and Security', 'Staff Security Engineer - PAM and Agentic",
+      "Identity' and Databricks' 'Staff Security Software Engineer, Agentic Security",
+      "Engineering' all tied at the top of triage with the real agentic reqs.",
+      "Matched on security-specific NOUNS rather than on the word 'safety', because AI",
+      "safety is a wanted lane in this profile and _lane.py scores it positively. A",
+      "security-automation req whose title scored 0 is the standing proof that a security",
+      "TITLE can hide real agentic work, which is why this is a weighted penalty and not a",
+      "disqualifier: its body rescued it to 4.64."
+    ],
+    "patterns": [
+      "\\b(cyber ?security|information security|infosec|application security|security operations|\\bSOC\\b|privileged access|\\bPAM\\b|identity and access|\\bIAM\\b|threat (detection|intelligence|modell?ing)|incident response|vulnerability management|penetration test)\\b",
+      "\\bsecurity (software engineer|engineer|engineering|architect)\\b"
+    ]
+  },
+  "reliability_ops": {
+    "tag": "reliability_ops",
+    "weight": {
+      "lane": -4,
+      "ranker": -5
+    },
+    "why": [
+      "Site reliability and network operations are infrastructure duty, not this profile's lane, and",
+      "they attract tooling vocabulary: NVIDIA's 'Senior AI Tools Engineer, SRE Operations",
+      "- GeForce NOW' scored as highly as the agentic reqs on 'AI Tools' plus 'Tools",
+      "Engineer' alone. Weighted lighter than the other families here on purpose. Tooling",
+      "FOR an ops team is still tooling, and the intent is to move it off the top of the",
+      "list rather than bury it. MLOps is untouched, since that is a wanted lane in this profile."
+    ],
+    "patterns": [
+      "\\b(site reliability|\\bSRE\\b|network operations|\\bNOC\\b|IT operations|help ?desk|service desk|on-?call rotation engineer)\\b"
+    ]
+  },
+  "consulting": {
+    "tag": "consulting",
+    "weight": {
+      "lane": -7,
+      "ranker": -8
+    },
+    "why": [
+      "Billable delivery work against someone else's roadmap, and customer-facing, which",
+      "this profile de-prioritises. Salesforce's 'Agentic Operations Consultant' reached the",
+      "top of triage on the agent bonus with nothing in either scorer to answer it."
+    ],
+    "patterns": [
+      "\\b(consultant|consulting|professional services|delivery (manager|lead)|implementation (specialist|consultant))\\b"
+    ]
+  },
+  "policy_affairs": {
+    "tag": "policy_affairs",
+    "weight": {
+      "lane": -7,
+      "ranker": -8
+    },
+    "why": [
+      "Policy and standards-body work reads as agentic vocabulary and is not engineering.",
+      "OpenAI's 'Agent Standards Specialist, Global Affairs' ranked with the engineering",
+      "reqs. 'Standards' on its own is not matched, because standards work on OpenUSD and",
+      "AOUSD is squarely this profile's lane; the government and policy nouns are what separate them."
+    ],
+    "patterns": [
+      "\\b(global affairs|public policy|government affairs|policy (manager|lead|analyst|specialist)|regulatory affairs|trust and safety policy)\\b"
+    ]
+  },
+  "_triage": {
+    "_comment": "Read by scripts/triage-leads.py. [label, Python regex]: a pasted lead whose title matches is set aside with that label (still printed, never silently dropped).",
+    "gates": [
+      [
+        "de-prioritised title",
+        "\\b(forward[- ]deployed|forward[- ]deployment|solutions? engineer|solution engineer|solutions? architect|deployment (strategist|engineer)|consultant|developer advocate|advocate|technical architect|architect lead|ai architect|ai builder|go[- ]to[- ]market|gtm|growth marketing|enterprise solutions|field engineer|customer engineer|sales engineer|account|professional services)\\b"
+      ],
+      [
+        "research ladder",
+        "\\b(research scientist|ai researcher|researcher|applied research|research science)\\b"
+      ],
+      [
+        "anti-lane",
+        "\\b(inference|platform engineer|ml ?ops|mlops|kernels?|compiler|infrastructure engineer|distributed training)\\b"
+      ],
+      [
+        "early-career",
+        "\\b(intern(?:ship)?s?|co-?op|new ?grad|new graduate|entry[- ]level|early career|apprentice|junior|associate)\\b"
+      ]
+    ]
+  },
+  "_sweep": {
+    "_comment": "Read by scripts/nvidia-sweep.py: the search terms it sends to NVIDIA's board. With none, it falls back to the title filter's positives.",
+    "terms": [
+      "agent",
+      "agentic",
+      "evaluation",
+      "harness",
+      "LLM",
+      "applied AI",
+      "developer technology",
+      "technical marketing",
+      "Omniverse",
+      "USD",
+      "simulation",
+      "synthetic data",
+      "tooling",
+      "physics",
+      "digital human",
+      "AI safety",
+      "inference",
+      "graphics",
+      "content",
+      "creative"
+    ]
+  }
+}

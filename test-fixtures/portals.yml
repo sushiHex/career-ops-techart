@@ -1,0 +1,102 @@
+# Test fixture, not an example to copy. The routing selftests in req-resolve.py,
+# inbox-liveness.py and workday-sweep.py resolve URLs against a portals file; they read
+# this one (via CAREER_OPS_PORTALS) so they never depend on the user's portals.yml or on
+# the example template. Only routing fields are kept. Add an entry only when a selftest
+# case needs it.
+tracked_companies:
+  - name: Blizzard Entertainment
+    careers_url: https://xboxgaming.wd1.myworkdayjobs.com/Blizzard_External_Careers
+    provider: workday
+    enabled: true
+
+  - name: NVIDIA
+    careers_url: https://nvidia.wd5.myworkdayjobs.com/en-US/NVIDIAExternalCareerSite
+    provider: workday
+    enabled: true
+
+  - name: Autodesk
+    careers_url: https://autodesk.wd1.myworkdayjobs.com/Ext
+    provider: workday
+    enabled: true
+
+  - name: Adobe
+    careers_url: https://adobe.wd5.myworkdayjobs.com/external_experienced
+    provider: workday
+    enabled: true
+
+  - name: Activision
+    careers_url: https://xboxgaming.wd1.myworkdayjobs.com/External
+    provider: workday
+    enabled: true
+
+  - name: Lightspeed LA
+    careers_url: https://tencent.wd1.myworkdayjobs.com/Lightspeed
+    provider: workday
+    enabled: true
+
+  - name: Cloud Imperium Games
+    careers_url: https://cloudimperiumgames.wd1.myworkdayjobs.com/CIG_Global_Careers
+    scan_method: websearch
+    enabled: true
+
+  - name: Sony Corporation of America
+    careers_url: https://sonyglobal.wd1.myworkdayjobs.com/SonyGlobalCareers
+    provider: workday
+    enabled: true
+
+  - name: AGBO
+    careers_url: https://agbo.breezy.hr
+    provider: breezy
+    enabled: true
+
+  - name: Intel
+    careers_url: https://intel.wd1.myworkdayjobs.com/External
+    provider: workday
+    enabled: true
+
+  - name: Salesforce
+    careers_url: https://salesforce.wd12.myworkdayjobs.com/External_Career_Site
+    provider: workday
+    enabled: true
+
+  - name: Autodesk
+    careers_url: https://autodesk.wd1.myworkdayjobs.com/Ext
+    provider: workday
+    enabled: true
+
+  - name: SentinelOne
+    careers_url: https://job-boards.greenhouse.io/sentinellabs
+    api: https://boards-api.greenhouse.io/v1/boards/sentinellabs/jobs
+    provider: greenhouse
+    enabled: true
+
+  - name: CrowdStrike
+    careers_url: https://crowdstrike.wd5.myworkdayjobs.com/crowdstrikecareers
+    provider: workday
+    enabled: true
+
+  - name: Mazda North America
+    careers_url: https://mazdausa.wd5.myworkdayjobs.com/Mazda
+    provider: workday
+    enabled: true
+
+  - name: Cresta
+    careers_url: https://job-boards.greenhouse.io/cresta
+    api: https://boards-api.greenhouse.io/v1/boards/cresta/jobs
+    provider: greenhouse
+    enabled: true
+
+  - name: Disney Studios
+    careers_url: https://disney.wd5.myworkdayjobs.com/disneycareer
+    provider: workday
+    enabled: true
+
+  - name: Snap
+    careers_url: https://snapchat.wd1.myworkdayjobs.com/snap
+    provider: workday
+    enabled: true
+
+  - name: Pixar Animation Studios
+    careers_url: https://pixar.wd501.myworkdayjobs.com/Pixar_External_Career_Site
+    provider: workday
+    enabled: true

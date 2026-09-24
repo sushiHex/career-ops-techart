@@ -1,0 +1,7 @@
+# Parsers across the toolchain read LF. Keep every text file LF on every platform,
+# so a Windows checkout does not turn reports and shell scripts into CRLF.
+* text=auto eol=lf
+*.woff2 binary
+*.png binary
+*.jpg binary
+*.pdf binary

@@ -1,0 +1,65 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.26'
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      - run: npm install
+      - run: pip install pyyaml certifi
+      - run: node test-all.mjs
+      - run: node score-model-tests.mjs
+      - run: node pipeline-audit.mjs --selftest
+      - run: node location-core.mjs --selftest
+      - run: node tracker-columns-tests.mjs
+      - run: node rederive-red-flags.mjs --selftest
+      - run: node providers/greenhouse.mjs --selftest
+      - run: node test-salary-filter.mjs
+      - name: Python self-tests (offline, fixture-driven)
+        run: |
+          for t in req-resolve inbox-liveness workday-sweep eval-prep eval-blockers _lane \
+                   check-remote triage-leads find-ats verify-report-urls _ashby_embed _candidate \
+                   _location nvidia-liveness nvidia-sweep; do
+            echo "== $t"; python "scripts/$t.py" --selftest || exit 1
+          done
+          python scripts/hooks/rebuild_boards_hook.py --selftest
+
+  # PyYAML is optional. Without it, scripts/_candidate.py reads config/profile.yml with its
+  # own fallback parser, so run the suites that exercise that path with PyYAML absent.
+  no-pyyaml:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      - run: npm install
+      - run: python -c "import yaml" 2>/dev/null && exit 1 || echo "PyYAML absent, as intended"
+      - run: python scripts/_candidate.py --selftest
+      - run: python scripts/eval-prep.py --selftest
+      - run: node test-all.mjs --quick

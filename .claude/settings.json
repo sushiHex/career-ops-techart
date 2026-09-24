@@ -1,0 +1,17 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Bash|PowerShell",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python \"$CLAUDE_PROJECT_DIR/scripts/hooks/rebuild_boards_hook.py\"",
+            "timeout": 90,
+            "statusMessage": "Rebuilding job boards..."
+          }
+        ]
+      }
+    ]
+  }
+}

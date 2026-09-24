@@ -1,0 +1,56 @@
+{
+  "name": "career-ops-techart",
+  "version": "1.0.0",
+  "description": "A fork of career-ops with a deterministic scoring model, a multi-ATS requisition resolver and tri-state liveness, built for senior tech-art and AI-tooling searches",
+  "private": true,
+  "scripts": {
+    "doctor": "node doctor.mjs",
+    "verify": "node verify-pipeline.mjs",
+    "audit:scores": "node audit-scores.mjs",
+    "board:recompute": "node board-recompute.mjs",
+    "model:apply": "node apply-model.mjs",
+    "model:test": "node score-model-tests.mjs",
+    "verify:board": "node verify-board.mjs",
+    "normalize": "node normalize-statuses.mjs",
+    "dedup": "node dedup-tracker.mjs",
+    "merge": "node merge-tracker.mjs",
+    "reconcile": "node reconcile-pipeline.mjs",
+    "pdf": "node generate-pdf.mjs",
+    "sync-check": "node cv-sync-check.mjs",
+    "liveness": "node check-liveness.mjs",
+    "scan": "node scan.mjs",
+    "scan:full": "node scan-ats-full.mjs",
+    "validate:portals": "node validate-portals.mjs",
+    "verify:portals": "node verify-portals.mjs",
+    "tracker": "node tracker.mjs",
+    "patterns": "node analyze-patterns.mjs",
+    "gemini:eval": "node gemini-eval.mjs",
+    "postinstall": "npx playwright install chromium --with-deps || npx playwright install chromium --with-deps"
+  },
+  "keywords": [
+    "ai",
+    "job-search",
+    "claude-code",
+    "opencode",
+    "career",
+    "career-ops",
+    "careerops",
+    "automation"
+  ],
+  "author": "Ken Faiman (https://github.com/sushiHex)",
+  "contributors": [
+    "Santiago Fernández de Valderrama (https://santifer.io), author of the original career-ops"
+  ],
+  "homepage": "https://github.com/sushiHex/career-ops-techart",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/sushiHex/career-ops-techart"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "@google/generative-ai": "^0.24.1",
+    "dotenv": "^17.0.0",
+    "js-yaml": "^4.1.1",
+    "playwright": "1.61.0"
+  }
+}

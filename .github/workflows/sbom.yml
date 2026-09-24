@@ -1,0 +1,27 @@
+name: SBOM Generation
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  sbom:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Generate SBOM (SPDX)
+        # A third-party action running with a write token: pinned to a commit, not a tag.
+        uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
+        with:
+          artifact-name: career-ops-sbom.spdx.json
+          format: spdx-json
+          output-file: career-ops-sbom.spdx.json
+
+      - name: Upload SBOM to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload ${{ github.event.release.tag_name }} career-ops-sbom.spdx.json

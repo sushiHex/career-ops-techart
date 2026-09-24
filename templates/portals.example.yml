@@ -1,0 +1,191 @@
+# Portal scanner configuration: a STARTING POINT, not anyone's search.
+# `node setup.mjs` copies this to ./portals.yml and writes your title filter into it.
+# ./portals.yml is gitignored and never leaves your machine.
+#
+# Scan strategy, cheapest first:
+#   1. HTTP JSON (zero-token): Greenhouse, Ashby, Lever, Workday CXS and others
+#   2. Playwright on careers_url, for boards that need a browser
+#   3. scan_method: websearch, for employers with no public ATS
+#
+# Provider auto-detection (scan.mjs loads providers/*.mjs and matches careers_url):
+#   greenhouse   job-boards(.eu)?.greenhouse.io/<slug>   (+ api: boards-api.greenhouse.io/v1/boards/<slug>/jobs)
+#   ashby        jobs.ashbyhq.com/<slug>
+#   lever        jobs.lever.co/<slug>
+#   workday      <tenant>.<wdN>.myworkdayjobs.com[/<locale>]/<site>   (zero-token CXS endpoint)
+#   custom       no public ATS: scan_method: websearch
+#
+# Board slugs are often NOT derivable from the company name. Find a company's real board
+# with `python scripts/find-ats.py "Company Name"` rather than guessing: a guessed slug
+# can return an empty board that reads exactly like a company with no openings.
+
+# -- Scan history recheck --
+# Each re-scan surfaces NET-NEW jobs by default (URLs are deduped vs scan-history.tsv).
+# recheck_after_days ALSO re-surfaces a previously-added URL after N days, to catch
+# reopened/reposted roles at the same URL on periodic re-scans.
+scan_history:
+  recheck_after_days: 30
+
+# -- Location --
+# Where you can work is NOT configured here. It lives in config/location.json (written by
+# setup.mjs from presets/locations/), which the scanner and every evaluation tool read.
+# A `location_filter:` block here may still OVERRIDE individual lists from that policy,
+# for example `commute_signals:` or `blocked_geo:`; keys you leave out keep the policy's.
+# The older `california_signals`, `socal_signals`, `allow` and `block` keys are ignored,
+# and the scanner says so when it sees them.
+
+# -- Title filter --
+# At least one positive must match AND no negative may match (case-insensitive substring).
+# setup.mjs replaces this block with your preset's filter or the keywords you give it.
+# Seniority is a boost, not a requirement.
+title_filter:
+  positive:
+    - "Engineer"
+  negative:
+    - "Intern"
+    - "Internship"
+  seniority_boost:
+    - "Senior"
+    - "Staff"
+    - "Principal"
+    - "Lead"
+
+# -- Search queries --
+# Broad discovery across job boards. Search is the weak half of discovery: an ATS board
+# polled directly beats any query. Use these to find companies you do not know yet.
+search_queries:
+  - name: Greenhouse boards (example)
+    query: 'site:job-boards.greenhouse.io "Senior Software Engineer" remote'
+    enabled: false
+
+  - name: Ashby boards (example)
+    query: 'site:jobs.ashbyhq.com "Senior Software Engineer" remote'
+    enabled: false
+
+# -- Scan methods and local parsers --
+# scan_method: playwright (default), websearch, local_parser
+# For Greenhouse companies, add api: field for faster structured JSON access.
+#
+# Provider routing (scan.mjs):
+#   By default each entry is auto-detected from `careers_url` against the
+#   loaded providers in providers/*.mjs (local-parser, ashby, greenhouse, lever).
+#   local-parser runs first when parser.command + parser.script are set.
+#
+#   Optional fields on a tracked_companies entry:
+#     provider: <id>     — force a specific provider, skipping detect().
+#     transport: http    — reserved for future transports. Defaults to http.
+#
+# For SSR/static career pages, add parser.command + parser.script. The command
+# can be python3, node, or another local executable. The script must print JSON
+# jobs to stdout: [{ "title": "...", "url": "...", "location": "..." }]
+#
+# Generic local parser examples. Most parser scripts are company-specific and
+# already know their target careers URL. `args` are optional and can help the
+# parser author (reuse across companies, debug flags, JSON snapshots, etc.).
+#
+# JavaScript parser:
+# - name: Example JS Company
+#   careers_url: https://example.com/careers
+#   scan_method: local_parser
+#   parser:
+#     command: node
+#     script: scripts/parsers/example-js-company-jobs.js
+#     format: jobs-json-v1
+#   enabled: true
+#
+# Python parser:
+# - name: Example Python Company
+#   careers_url: https://example.org/jobs
+#   scan_method: local_parser
+#   parser:
+#     command: python3
+#     script: scripts/parsers/example_python_company_jobs.py
+#     format: jobs-json-v1
+#   enabled: true
+
+# -- Tracked companies --
+# Starter examples copied from the upstream career-ops template, so the scanner has
+# something to poll on day one. Replace them with the companies YOU want: this list is
+# the single highest-leverage thing to edit. Boards move; if one returns nothing, check
+# it with `python scripts/find-ats.py "Company"` before concluding it has no jobs.
+tracked_companies:
+
+  - name: Anthropic
+    careers_url: https://job-boards.greenhouse.io/anthropic
+    api: https://boards-api.greenhouse.io/v1/boards/anthropic/jobs
+    enabled: true
+
+  - name: PolyAI
+    careers_url: https://job-boards.eu.greenhouse.io/polyai
+    api: https://boards-api.greenhouse.io/v1/boards/polyai/jobs
+    notes: "UK. Voice AI for enterprise contact centers."
+    enabled: true
+
+  - name: Parloa
+    careers_url: https://job-boards.eu.greenhouse.io/parloa
+    api: https://boards-api.greenhouse.io/v1/boards/parloa/jobs
+    notes: "Berlin EMEA. Voice AI enterprise."
+    enabled: true
+
+  - name: Intercom
+    careers_url: https://job-boards.greenhouse.io/intercom
+    api: https://boards-api.greenhouse.io/v1/boards/intercom/jobs
+    notes: "Dublin EMEA. Fin AI agent."
+    enabled: true
+
+  - name: Hume AI
+    careers_url: https://job-boards.greenhouse.io/humeai
+    api: https://boards-api.greenhouse.io/v1/boards/humeai/jobs
+    notes: "NYC. Empathic voice AI."
+    enabled: true
+
+  - name: Airtable
+    careers_url: https://job-boards.greenhouse.io/airtable
+    api: https://boards-api.greenhouse.io/v1/boards/airtable/jobs
+    notes: "No-code + AI platform."
+    enabled: true
+
+  - name: Vercel
+    careers_url: https://job-boards.greenhouse.io/vercel
+    api: https://boards-api.greenhouse.io/v1/boards/vercel/jobs
+    notes: "AI SDK, v0.dev. Frontend AI tooling."
+    enabled: true
+
+  - name: Cohere
+    careers_url: https://jobs.ashbyhq.com/cohere
+    notes: "AI/LLM provider. Toronto + remote."
+    enabled: true
+
+  - name: LangChain
+    careers_url: https://jobs.ashbyhq.com/langchain
+    notes: "LangChain/LangSmith framework."
+    enabled: true
+
+  - name: Pinecone
+    careers_url: https://jobs.ashbyhq.com/pinecone
+    notes: "Vector database."
+    enabled: true
+
+  - name: Klue
+    careers_url: https://jobs.ashbyhq.com/klue
+    notes: "Vancouver. Competitive intelligence SaaS."
+    enabled: true
+
+  - name: Glacis AI
+    careers_url: https://jobs.ashbyhq.com/glacis-ai
+    notes: "Ho Chi Minh City. AI agents for supply chain and logistics workflows."
+    enabled: true
+
+  - name: Forto
+    careers_url: https://jobs.ashbyhq.com/forto
+    notes: "Berlin DE. Digital freight forwarder, product & data roles, German + English."
+    enabled: true
+
+  - name: Palantir
+    careers_url: https://jobs.lever.co/palantir
+    notes: "FDE roles. Mostly US/London."
+    enabled: true
+
+  - name: Qonto
+    careers_url: https://jobs.lever.co/qonto
+    notes: "Paris / Berlin / Barcelona / Milan. SMB neobank, MLOps for AI Product roles."
+    enabled: true
