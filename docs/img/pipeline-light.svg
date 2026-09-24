@@ -1,0 +1,75 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 964 314" width="964" height="314" role="img" aria-labelledby="t d">
+<title id="t">How career-ops-techart fits together</title>
+<desc id="d">Four stages. Discover: scan.mjs and workday-sweep.py feed pipeline-audit.mjs. Verify: req-resolve.py answers live, unknown or closed; only live continues, unknown is held and never closed. Evaluate: eval-prep.py, eval-assist.py, the agent's judgement, then eval-write.mjs scored by score-model.mjs. Record: merge-tracker.mjs, verify-board.mjs and score-audit.mjs gates, and the rebuild hook.</desc>
+<style>.card{fill:#f6f8fa;stroke:#d0d7de;stroke-width:1}.rail{stroke:#d0d7de;stroke-width:1.5;fill:none}.dot{fill:#59636e}.ring{fill:#f6f8fa;stroke:#59636e;stroke-width:1.5}.live{fill:#0969da}.flow{stroke:#0969da;stroke-width:1.5;fill:none}.head{fill:#0969da}.o,.c,.h{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans',Helvetica,Arial,sans-serif}.t{fill:#1f2328;font-size:13.5px;font-family:ui-monospace,SFMono-Regular,'SF Mono',Menlo,Consolas,monospace}.o{fill:#1f2328;font-size:13.5px;font-weight:600}.c{fill:#59636e;font-size:12.5px}.h{fill:#59636e;font-size:11.5px;font-weight:600;letter-spacing:1.4px}</style>
+<rect class="card" x="20" y="20" width="210" height="274" rx="10"/>
+<text class="h" x="40" y="54">1  DISCOVER</text>
+<line class="rail" x1="40" y1="70" x2="210" y2="70" style="stroke-width:1"/>
+<path class="rail" d="M44 100 V200"/>
+<circle class="dot" cx="44" cy="100" r="4"/>
+<text class="t" x="60" y="104">scan.mjs</text>
+<text class="c" x="60" y="121">ATS APIs, no tokens spent</text>
+<circle class="dot" cx="44" cy="150" r="4"/>
+<text class="t" x="60" y="154">workday-sweep.py</text>
+<text class="c" x="60" y="171">every Workday tenant</text>
+<circle class="dot" cx="44" cy="200" r="4"/>
+<text class="t" x="60" y="204">pipeline-audit.mjs</text>
+<text class="c" x="60" y="221">dedup, then rank the inbox</text>
+<path class="flow" d="M234 150 H247"/>
+<path class="head" d="M254 150 l-8 -4.5 v9 z"/>
+<rect class="card" x="258" y="20" width="210" height="274" rx="10"/>
+<text class="h" x="278" y="54">2  VERIFY</text>
+<line class="rail" x1="278" y1="70" x2="448" y2="70" style="stroke-width:1"/>
+<path class="rail" d="M282 100 V236"/>
+<path class="flow" d="M282 136 Q282 150 296 150"/>
+<circle class="live" cx="300" cy="150" r="4.5"/>
+<text class="o" x="314" y="154">live</text>
+<text class="c" x="314" y="171">goes on to evaluation</text>
+<path class="rail" d="M282 186 Q282 200 296 200"/>
+<circle class="ring" cx="300" cy="200" r="4"/>
+<text class="o" x="314" y="204">unknown</text>
+<text class="c" x="314" y="221">held, never closed</text>
+<path class="rail" d="M282 236 Q282 250 296 250"/>
+<circle class="dot" cx="300" cy="250" r="4"/>
+<text class="o" x="314" y="254">closed</text>
+<text class="c" x="314" y="271">retired, on evidence</text>
+<circle class="dot" cx="282" cy="100" r="4"/>
+<text class="t" x="298" y="104">req-resolve.py</text>
+<text class="c" x="298" y="121">13 ATS families</text>
+<path class="flow" d="M472 150 H485"/>
+<path class="head" d="M492 150 l-8 -4.5 v9 z"/>
+<rect class="card" x="496" y="20" width="210" height="274" rx="10"/>
+<text class="h" x="516" y="54">3  EVALUATE</text>
+<line class="rail" x1="516" y1="70" x2="686" y2="70" style="stroke-width:1"/>
+<path class="rail" d="M520 100 V250"/>
+<circle class="dot" cx="520" cy="100" r="4"/>
+<text class="t" x="536" y="104">eval-prep.py</text>
+<text class="c" x="536" y="121">the mechanical half</text>
+<circle class="dot" cx="520" cy="150" r="4"/>
+<text class="t" x="536" y="154">eval-assist.py</text>
+<text class="c" x="536" y="171">lane, comp, gate signals</text>
+<circle class="dot" cx="520" cy="200" r="4"/>
+<text class="t" x="536" y="204">agent</text>
+<text class="c" x="536" y="221">supplies judgement only</text>
+<circle class="dot" cx="520" cy="250" r="4"/>
+<text class="t" x="536" y="254">eval-write.mjs</text>
+<text class="c" x="536" y="271">scored by score-model.mjs</text>
+<path class="flow" d="M710 150 H723"/>
+<path class="head" d="M730 150 l-8 -4.5 v9 z"/>
+<rect class="card" x="734" y="20" width="210" height="274" rx="10"/>
+<text class="h" x="754" y="54">4  RECORD</text>
+<line class="rail" x1="754" y1="70" x2="924" y2="70" style="stroke-width:1"/>
+<path class="rail" d="M758 100 V250"/>
+<circle class="dot" cx="758" cy="100" r="4"/>
+<text class="t" x="774" y="104">merge-tracker.mjs</text>
+<text class="c" x="774" y="121">one writer for new rows</text>
+<circle class="dot" cx="758" cy="150" r="4"/>
+<text class="t" x="774" y="154">verify-board.mjs</text>
+<text class="c" x="774" y="171">every score reproducible</text>
+<circle class="dot" cx="758" cy="200" r="4"/>
+<text class="t" x="774" y="204">score-audit.mjs</text>
+<text class="c" x="774" y="221">tracker agrees with report</text>
+<circle class="dot" cx="758" cy="250" r="4"/>
+<text class="t" x="774" y="254">rebuild hook</text>
+<text class="c" x="774" y="271">boards follow the data</text>
+</svg>

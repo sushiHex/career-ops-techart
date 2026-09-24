@@ -28,7 +28,7 @@ cut from, and are stated rather than reproducible here.
 
 | | |
 |---|---|
-| Files in this fork that do not exist upstream | **59** |
+| Files in this fork that do not exist upstream | **61** |
 | Fork-original code | **45 files, 18,150 non-blank lines** (Node and Python) |
 | Capabilities with no counterpart in upstream's source | **6** (see the comparison below) |
 | ATS families the requisition resolver recognises | **13**: Amazon, Apple, Ashby, Breezy, Eightfold (including Netflix), GitHub Careers, Greenhouse, iCIMS, Lever, SmartRecruiters, SuccessFactors, Workable, Workday. Twelve are read; amazon.jobs blocks automated clients, so it answers an explicit `unknown` rather than a guess |
@@ -79,31 +79,10 @@ assumed, and the six marked **new** have no counterpart there.
 
 ## How it fits together
 
-```mermaid
-flowchart LR
-    subgraph Discover
-        A[scan.mjs<br/>ATS APIs] --> B[pipeline-audit --rank]
-        W[workday-sweep.py] --> B
-    end
-    subgraph Verify
-        B --> R[req-resolve.py<br/>13 ATS families]
-        R --> L{live?}
-        L -- unknown --> U[held, never closed]
-        L -- closed --> X[retired]
-    end
-    subgraph Evaluate
-        L -- live --> P[eval-prep.py<br/>packet]
-        P --> S[eval-assist.py<br/>lane signals, comp]
-        S --> J[agent fills<br/>judgement]
-        J --> E[eval-write.mjs]
-        M[score-model.mjs] --> E
-    end
-    subgraph Record
-        E --> T[merge-tracker.mjs]
-        T --> V[verify-board.mjs<br/>score-audit.mjs]
-        T --> H[hook: rebuild boards<br/>on content change]
-    end
-```
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/img/pipeline-dark.svg">
+  <img alt="Four stages. Discover: scan.mjs and workday-sweep.py feed pipeline-audit.mjs. Verify: req-resolve.py answers live, unknown or closed; only live continues, unknown is held and never closed. Evaluate: eval-prep.py, eval-assist.py, the agent's judgement, then eval-write.mjs scored by score-model.mjs. Record: merge-tracker.mjs, the verify-board.mjs and score-audit.mjs gates, and the rebuild hook." src="docs/img/pipeline-light.svg" width="100%">
+</picture>
 
 - **Discovery** prefers an ATS API over web search. Measured on the source search: 58% of
   API-polled companies ever produced a lead against 10% of search-only ones.
