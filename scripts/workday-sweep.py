@@ -528,16 +528,16 @@ def _selftest():
     # Requisition-id extraction. The underscore case is the one that shipped broken and
     # made every row look untracked, so it leads.
     req_cases = [
-        ("/job/USA---Remote-CA/Lead-AI-Engineer--GTM-Applications--Remote-_R26710", "R26710"),
+        ("/job/USA---Remote-CA/Example-Role-03-_R26710", "R26710"),
         ("/job/Santa-Clara-CA/Senior-Engineer_JR2620896", "JR2620896"),
-        ("/job/USA---Remote/Data-Scientist--Remote-_R23555-1", "R23555"),
+        ("/job/USA---Remote/Example-Role-02-_R23555-1", "R23555"),
         ("Lead AI Engineer, GTM Applications (Remote) — R26710", "R26710"),
         ("requisition JR2778170 is live", "JR2778170"),
         # Autodesk's year-prefixed format. Matched nothing until it was added, so every
         # Autodesk row reported itself untracked.
-        ("/job/Toronto-ON-CAN/Principal-MCP-AI-Developer_26WD91231-1", "26WD91231"),
-        ("/job/Toronto-ON-CAN/Software-Developer--MCP-AI_26WD93101-1", "26WD93101"),
-        ("/job/Toronto-ON-CAN/Principal-MCP-AI-Developer_26WD161146", "26WD161146"),
+        ("/job/Toronto-ON-CAN/Example-Role-05_26WD91231-1", "26WD91231"),
+        ("/job/Toronto-ON-CAN/Example-Role-12_26WD93101-1", "26WD93101"),
+        ("/job/Toronto-ON-CAN/Example-Role-05_26WD161146", "26WD161146"),
         # Netflix writes five digits after JR. The old JR-?\d{6,} floor here read
         # nothing at all, so every Netflix req reported itself untracked and was
         # re-offered as a new find on every sweep. pipeline-audit.mjs had already
@@ -555,7 +555,7 @@ def _selftest():
         ("/job/Irvine---Blizzard/Senior-Program-Manager_R021430", "R021430"),
         # Sony's hyphenated form. The R-?\d{5,} branch cannot rescue it, because the
         # lookbehind sees the leading "J" and will not begin matching at the "R".
-        ("/job/NA--Culver-City/Sr-Software-Engineer--AI-Native_JR-103209", "JR103209"),
+        ("/job/NA--Culver-City/Example-Role-14_JR-103209", "JR103209"),
         ("no requisition here at all", None),
         # must not match a longer alphanumeric token that merely contains a digit run
         ("/job/x/Some-Role-ABCR123456XYZ", None),

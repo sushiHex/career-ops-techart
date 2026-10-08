@@ -616,7 +616,7 @@ def _selftest():
         # underscore is why the id pattern cannot use \b: there is no word boundary between
         # `_` and `R`, and a \b-anchored pattern extracts nothing from a Workday path.
         ("https://xboxgaming.wd1.myworkdayjobs.com/en-US/Blizzard_External_Careers/job/"
-         "Irvine/Senior-Software-Engineer_R021430",
+         "Irvine/Example-Role-09_R021430",
          ("workday", "xboxgaming/wd1/Blizzard_External_Careers", "R021430")),
         # Not routable by board membership; must return None rather than a wrong guess.
         # This one carries no site segment at all, only a locale. Reading `en` as the site
@@ -626,13 +626,13 @@ def _selftest():
         # Autodesk's Workday site is literally `Ext`. A length floor told a locale from a
         # site until this URL was looked at; eight live Autodesk rows were unroutable.
         ("https://autodesk.wd1.myworkdayjobs.com/Ext/job/Toronto-ON-CAN/"
-         "Software-Developer--Agentic-Evaluation-_26WD95532-1",
+         "Example-Role-11-_26WD95532-1",
          ("workday", "autodesk/wd1/Ext", "26WD95532")),
         # Disney's requisition ids carry no prefix at all: 684 of 684 postings on its board
         # are bare numbers, so the shared pattern finds nothing and twelve live rows sat
         # unroutable. Both spellings, because 132 of those 684 carry the facet suffix.
         ("https://disney.wd5.myworkdayjobs.com/disneycareer/job/San-Francisco-CA-USA/"
-         "Technical-Artist---Expression-of-Interest---ILM-San-Francisco_15203431",
+         "Example-Role-16_15203431",
          ("workday", "disney/wd5/disneycareer", "15203431")),
         ("https://disney.wd5.myworkdayjobs.com/disneycareer/job/Anaheim-CA-USA/"
          "DLR-Ops-Coord_12085041-1",
@@ -643,7 +643,7 @@ def _selftest():
         # Workday spells a posting path both ways. Adobe uses `details`, and an anchor
         # that knows only `job` makes every such site a false unknown.
         ("https://adobe.wd5.myworkdayjobs.com/en-US/external_experienced/details/"
-         "Senior-AI-Systems-Engineer_R170265",
+         "Example-Role-07_R170265",
          ("workday", "adobe/wd5/external_experienced", "R170265")),
         # ...and the anchor has to hold against a greedy site capture. This is the CXS API
         # URL rather than the human one; without the anchor the site reads "wday", which
