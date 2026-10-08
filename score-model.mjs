@@ -364,6 +364,61 @@ export function arrangement(text) {
   return 'unknown';
 }
 
+// The four verdicts arrangement() can return, and so the only values a persisted or
+// passed-in arrangement may hold. Anything else used to be trusted as-is: "on-site" or
+// "Onsite" skipped re-derivation AND took factor 1, so a misspelt onsite role scored as
+// remote (3.77 became 4.00 at base 4).
+const ARRANGEMENTS = new Set(['remote', 'hybrid', 'onsite', 'unknown']);
+
+/**
+ * Canonical arrangement for an explicit value, or null when there is none to trust.
+ * Case, hyphens and spaces fold ("On-site" is onsite). A missing value, an empty one and
+ * the literal `null` that closed reports carry are all absence. Anything else is a typo in
+ * a writer, and throws rather than quietly scoring the row as remote.
+ */
+export function normaliseArrangement(v) {
+  if (v === undefined || v === null) return null;
+  if (typeof v !== 'string') throw new Error(`unrecognised arrangement ${JSON.stringify(v)}`);
+  // Only separators fold. Stripping every non-letter, the first version of this, made
+  // "remote2" read as remote and "123" as absent (review round 2).
+  const s = v.trim().toLowerCase().replace(/[\s_-]+/g, '');
+  if (!s || s === 'null') return null;
+  const a = s === 'inoffice' || s === 'inperson' ? 'onsite' : s;
+  if (!ARRANGEMENTS.has(a)) throw new Error(`unrecognised arrangement ${JSON.stringify(v)}`);
+  return a;
+}
+
+/**
+ * The arrangement a report's Machine Summary persisted, raw, or undefined. One reader for
+ * every consumer that replays a report: apply-model had it, while score-audit and
+ * audit-scores replayed without it and so re-derived from prose the writer had already
+ * decided against. normaliseArrangement() validates it.
+ *
+ * Read from the Machine Summary when the report has one, so a body line that happens to
+ * begin "arrangement:" cannot outvote the key. The value is parsed as YAML would see it:
+ * a trailing `# comment` dropped, then one pair of quotes, then whitespace. A raw value
+ * the regex used to reject (`" onsite "`, `onsite # note`) silently re-derived instead.
+ */
+export function persistedArrangement(text) {
+  const t = text || '';
+  const at = t.search(/^##\s*Machine Summary/im);
+  // Bounded to the summary itself: its first fenced block, else up to the next heading.
+  // Reading on to the end of the file let a later example section's "arrangement:" line
+  // supply a verdict the summary never gave (review, round 3).
+  let scope = t;
+  if (at >= 0) {
+    const body = t.slice(at).replace(/^[^\n]*\n?/, '');      // past the heading line
+    const next = body.search(/^#{1,2}\s/m);
+    const section = next >= 0 ? body.slice(0, next) : body;
+    const fence = section.match(/^```[^\n]*\n([\s\S]*?)^```/m);
+    scope = fence ? fence[1] : section;
+  }
+  const m = scope.match(/^[ \t]*arrangement:[ \t]*(.*)$/m);
+  if (!m) return undefined;
+  const v = m[1].replace(/\s+#.*$/, '').trim().replace(/^(["'])(.*)\1$/, '$2').trim();
+  return v === '' ? undefined : v;
+}
+
 export function arrFactor(arr, o = MODEL) {
   if (arr === 'hybrid') return o.HYBRID_DAMP;
   if (arr === 'onsite') return o.ONSITE_DAMP;
@@ -388,6 +443,13 @@ export function arrFactor(arr, o = MODEL) {
  * silently RAISED every onsite and hybrid row, on 11 rows the day this was found. Nothing
  * in either tool was wrong in isolation; the arrangement simply was never persisted, so
  * the second reader could not see what the first one decided.
+ *
+ * An explicit 'unknown' is trusted too. It is the writer's verdict that the posting does
+ * not say, and it used to be overridden: a report persisting `arrangement: unknown` over
+ * prose saying remote versus office is not stated was re-derived, locationText() stopped at
+ * an embedded quote in that prose, kept only a "City, ST" fragment and derived onsite, so
+ * every apply-model run proposed lowering the row. Rows written before the key existed
+ * carry no key at all and still derive, which is what the old exemption was for.
  */
 export function applyModel(base, ctx, o = MODEL) {
   if (base === null || !Number.isFinite(base)) return null;
@@ -395,9 +457,7 @@ export function applyModel(base, ctx, o = MODEL) {
   const cv = compVerdict(band, o);
   const cf = cv.factor;
   const { factor: pf, pref, damped } = prefFactor(ctx.company || '', ctx.role || '', ctx.prefs || [], o);
-  const arr = ctx.arrangement && ctx.arrangement !== 'unknown'
-    ? ctx.arrangement
-    : arrangement(locationText(ctx.text || ''));
+  const arr = normaliseArrangement(ctx.arrangement) ?? arrangement(locationText(ctx.text || ''));
   const af = arrFactor(arr, o);
   const final = Math.min(5, base * cf * pf * af);
   return {

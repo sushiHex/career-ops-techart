@@ -24,7 +24,7 @@
  */
 import { readFileSync, writeFileSync, readdirSync, existsSync } from 'fs';
 import { join } from 'path';
-import { applyModel, loadPrefs } from './score-model.mjs';
+import { applyModel, loadPrefs, persistedArrangement } from './score-model.mjs';
 
 const CUTOVER = '2026-07-27';   // the day score-model.mjs became the only rubric
 const TOL = 0.051;              // both sides are printed to one decimal
@@ -142,10 +142,17 @@ for (const f of readdirSync('reports').sort()) {
     // behaviour and this change is a no-op on the 565 rows already audited.
     const cpBasis = String(field(t, 'comp_basis') || '').trim().toLowerCase();
     const notTotal = cpBasis === 'base' || cpBasis === 'unknown';
+    // A comp_total_est the report states outright is what eval-write handed the model,
+    // whether it came from a total-basis posting or from the evaluator's own judgement,
+    // so it wins over the reconstruction. The arrangement is replayed the same way: the
+    // persisted verdict, not one re-derived from the bare location.
+    const est = field(t, 'comp_total_est');
+    const compLine = est !== null ? est
+      : (!cpPosted || cpPosted === 'not published' || notTotal) ? '' : cpPosted;
     model = applyModel(Math.round(base * 1000) / 1000, {
-      text: `comp_total_est: "${(!cpPosted || cpPosted === 'not published' || notTotal) ? '' : cpPosted}"\n`
-        + `location: "${locFinal}"\n`,
+      text: `comp_total_est: "${compLine}"\n` + `location: "${locFinal}"\n`,
       company: field(t, 'company'), role: field(t, 'role'), prefs,
+      arrangement: persistedArrangement(t),
     }).final;
   }
 

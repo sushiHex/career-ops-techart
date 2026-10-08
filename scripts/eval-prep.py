@@ -1409,6 +1409,11 @@ if __name__ == "__main__":
         lo = int(sys.argv[sys.argv.index("--min") + 1]) if "--min" in sys.argv else 0
         urls += [x["url"] for x in json.load(open(f, encoding="utf-8"))
                  if x.get("score", 0) >= lo]
+    # A URL list written in Windows text mode and expanded with $(cat ...) carries a
+    # trailing \r on every argument, because shell word splitting does not treat \r as
+    # whitespace. It then rode into the packet and the report's **URL:** line, where it
+    # broke requisition-identity matching, more than once.
+    urls = [u.strip() for u in urls]
     if not urls:
         print(__doc__); sys.exit(1)
     os.makedirs(OUT_DIR, exist_ok=True)

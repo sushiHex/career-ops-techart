@@ -34,6 +34,7 @@ import json
 import os
 import re
 import sys
+import urllib.parse
 
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -260,15 +261,63 @@ def tracked_key(req, company):
     return f"{rid}@{src_co(company)}" if AMBIGUOUS_REQ.match(rid) else rid
 
 
-def tracked_urls(path=None):
+_WD_HOST = re.compile(r"([a-z0-9-]+)\.wd\d+\.myworkdayjobs\.com", re.I)
+
+
+def posting_key(url):
+    """A Workday posting's identity: its tenant and the id that ends its path.
+
+    The path id survives a re-slug, and the tenant host makes even a bare number
+    unambiguous ("10000101" means nothing across employers, "disney:10000101" does), so
+    this keys the Disney-style ids REQ_ID deliberately refuses. None for any other URL.
+
+    Three rules from review. The tenant is the PARSED host, never a host found along the
+    string. Only the PATH is read, because a query such as `?redirect=/job/X/Z_99999999`
+    otherwise supplied the id. And an id REQ_ID recognises is canonicalised the way the
+    rest of this file does it, so `_R-10001` and `_R10001`, or `_JR_100002` and
+    `_JR-100002`, are one posting rather than two.
+    """
+    s = (url or "").strip()
+    try:
+        u = urllib.parse.urlsplit(s if re.match(r"(?i)https?://", s) else "https://" + s)
+    except ValueError:
+        return None
+    host = _WD_HOST.fullmatch(u.hostname or "")
+    if not host or "/job/" not in u.path:
+        return None
+    last = u.path.rstrip("/").rsplit("/", 1)[-1]
+    reqs = list(REQ_ID.finditer(last))
+    if reqs:
+        rid = canon_req(reqs[-1].group(1))
+    else:
+        # A bare number (Disney) or a short letter prefix on digits (Zillow P700202,
+        # REQ-0000808), with a one- or two-digit trailer read as the facet suffix. Never a
+        # WORD: a slug ending "_Engineer" is a title, and keying it would make every such
+        # posting at the tenant one identity, so a tracked one hid the rest.
+        m = re.search(r"_((?:[A-Za-z]{1,4}-?)?\d{5,})(?:-\d{1,2})?$", last)
+        if not m:
+            return None
+        rid = m.group(1).upper().replace("-", "")
+    return f"wd:{host.group(1).lower()}:{rid}"
+
+
+def tracked_urls(path=None, gaps=None):
     """Job ids already on the tracker, so the sweep reports only what is new.
 
     Read ROW BY ROW rather than as one blob of text, because an ambiguous id means
-    nothing without the company cell sitting beside it on the same line. All 147 req ids
-    in the tracker today live inside numbered rows, so nothing is lost by it.
+    nothing without the company cell sitting beside it on the same line. Each row's
+    REPORT is read too, joined by its link: a role cell that does not carry the req id
+    hid the posting from dedup, so a tracked req came back as a new find.
+
+    A row whose report cannot be read, or carries no **URL:** line, contributes no posting
+    key, and that is not the same answer as "not tracked". Pass a list as `gaps` to have
+    each such row named in it, so a caller can say dedup was incomplete rather than let
+    the missing evidence read as absence.
     """
     p = path or os.path.join(ROOT, "data", "applications.md")
     if not os.path.exists(p):
+        if gaps is not None:
+            gaps.append(("-", "tracker missing"))
         return set()
     keys = set()
     for line in open(p, encoding="utf-8", errors="replace"):
@@ -279,6 +328,36 @@ def tracked_urls(path=None):
             continue
         for m in REQ_ID.finditer(line):
             keys.add(tracked_key(m.group(1), cells[2]))
+        link = re.search(r"\]\(((?:\.\./)?reports/[^)]+)\)", line)
+        if not link:
+            if gaps is not None:
+                gaps.append((cells[0], "no report link"))
+            continue
+        try:
+            # ../reports/x is relative to the tracker's own directory; a bare reports/x
+            # is root-relative, as TSV additions write it before merge-tracker rewrites it.
+            rel = link.group(1)
+            anchor = os.path.dirname(p) if rel.startswith("../") else os.path.dirname(os.path.dirname(p))
+            rep = open(os.path.normpath(os.path.join(anchor, rel)),
+                       encoding="utf-8", errors="replace").read()
+        except OSError:
+            if gaps is not None:
+                gaps.append((cells[0], "report unreadable"))
+            continue
+        # Same line only: \s* crossed the newline, so an empty URL field captured the
+        # next heading's "##" and the row vanished with no key and no gap.
+        u = re.search(r"\*\*URL:\*\*[ \t]*(\S*)", rep)
+        if not u:
+            if gaps is not None:
+                gaps.append((cells[0], "report has no URL line"))
+            continue
+        if not re.match(r"(?i)(?:https?://)?[\w-]+(?:\.[\w-]+)+/", u.group(1)):
+            if gaps is not None:
+                gaps.append((cells[0], "report URL unusable"))
+            continue
+        k = posting_key(u.group(1))
+        if k:
+            keys.add(k)
     return keys
 
 
@@ -311,7 +390,15 @@ def sweep(entry, min_lane=2, pages=150, quiet=False, keep_all=False,
     # scored exactly 0 on its title and its body was squarely in lane. A prefilter of +1
     # would have discarded it, which is the original mistake with a cheaper excuse.
     # Titles scoring below the floor are the decisively wrong ones: sales, quota, ASIC.
-    known = tracked_urls()
+    # Printed even under --quiet, which silences progress rather than caveats: it goes to
+    # stderr, so a machine reading stdout is unaffected, and incomplete dedup evidence is
+    # exactly what must not pass for a complete answer.
+    gaps = []
+    known = tracked_urls(gaps=gaps)
+    if gaps:
+        print(f"  note: {len(gaps)} tracker row(s) gave no posting key "
+              f"(e.g. #{gaps[0][0]}, {gaps[0][1]}); a find matching one of them can read "
+              f"as new", file=sys.stderr)
     cands = []
     for p in posts:
         title = p.get("title", "") or ""
@@ -344,15 +431,20 @@ def sweep(entry, min_lane=2, pages=150, quiet=False, keep_all=False,
             " | ".join([loc] + list(extra)), remote_type_says_remote(info.get("remoteType")))
         m = REQ_ID.search(ep) or REQ_ID.search(json.dumps(info)[:2000])
         req = canon_req(m.group(1)) if m else ""
+        url = f"https://{entry['tenant']}.{entry['wd']}.myworkdayjobs.com/{entry['site']}{ep}"
         rows.append(dict(
             company=label, req=req, title=title, lane=lane,
             live=bool(info.get("canApply")), location=loc, additional=list(extra),
             # Scoped by company: a bare R number is one tenant's counter, and matching
-            # it across tenants marked a live posting as already done.
+            # it across tenants marked a live posting as already done. The posting key
+            # (tenant + path id) catches what the req id cannot: a tracked row whose
+            # role cell omits the id, and bare-number tenants such as Disney.
             verdict=verdict, why=why,
-            tracked=bool(req and tracked_key(req, label) in known),
-            url=f"https://{entry['tenant']}.{entry['wd']}.myworkdayjobs.com/"
-                f"{entry['site']}{ep}"))
+            tracked=bool((req and tracked_key(req, label) in known) or posting_key(url) in known),
+            # How many tracker rows yielded no posting key. Non-zero means `tracked: false`
+            # is "not found in what could be read", not "confirmed new".
+            dedup_gaps=len(gaps),
+            url=url))
     return rows, st
 
 
@@ -508,6 +600,72 @@ def _selftest():
     if tracked_key("R26710", "Umbrella Corp") in known:
         bad += 1
         print("  FAIL an Acme req id marks an Umbrella Corp posting as already tracked")
+    # The posting key. A tracked req whose row's role cell does not carry the id came back
+    # as a new find; the Disney form is a bare number the shared REQ_ID refuses by design.
+    D = "https://disney.wd5.myworkdayjobs.com/disneycareer/job/Burbank-CA-USA/Staff-SWE_10000101"
+    for u, want in (
+            ("https://autodesk.wd1.myworkdayjobs.com/Ext/job/California-USA---Remote/"
+             "Senior-Principal-AI-ML-Developer_26WD100505", "wd:autodesk:26WD100505"),
+            (D, "wd:disney:10000101"),
+            ("https://nvidia.wd5.myworkdayjobs.com/en-US/NVIDIAExternalCareerSite/job/X/Y_JR1000101-1",
+             "wd:nvidia:JR1000101"),
+            ("https://zillow.wd5.myworkdayjobs.com/x/job/Remote-USA/Principal-MLE_P700202-2",
+             "wd:zillow:P700202"),
+            # Review findings: one posting, one key, whatever the id's punctuation...
+            ("https://calix.wd1.myworkdayjobs.com/Calix/job/X/Y_R-10001", "wd:calix:R10001"),
+            ("https://calix.wd1.myworkdayjobs.com/Calix/job/X/Y_R10001", "wd:calix:R10001"),
+            ("https://sonyglobal.wd1.myworkdayjobs.com/S/job/X/Y_JR_100002", "wd:sonyglobal:JR100002"),
+            ("https://sonyglobal.wd1.myworkdayjobs.com/S/job/X/Y_JR-100002", "wd:sonyglobal:JR100002"),
+            ("https://acme.wd1.myworkdayjobs.com/S/job/X/Y_REQ-0000808", "wd:acme:REQ0000808"),
+            # ...the query never supplies the id...
+            (D + "?redirect=/job/X/Z_99999999", "wd:disney:10000101"),
+            # ...and the tenant is the URL's own host, never one named along its path.
+            ("https://wrapper.example/r/disney.wd5.myworkdayjobs.com/x/job/Y/Z_10000101", None),
+            ("https://boards.greenhouse.io/x/jobs/123", None),
+            # A word is a title, never an id.
+            ("https://acme.wd1.myworkdayjobs.com/S/job/X/First_Engineer", None)):
+        if posting_key(u) != want:
+            bad += 1
+            print(f"  FAIL posting_key({u[-48:]!r}) = {posting_key(u)!r}, want {want!r}")
+
+    # tracked_urls() reading the posting key out of each row's REPORT, against a fixture
+    # rather than the live tracker, so the case runs in any checkout. Row 2's report is
+    # missing and row 3's URL field is empty: both must be reported as gaps, not dropped.
+    import tempfile
+    with tempfile.TemporaryDirectory() as fx:
+        os.makedirs(os.path.join(fx, "data"))
+        os.makedirs(os.path.join(fx, "reports"))
+        with open(os.path.join(fx, "data", "applications.md"), "w", encoding="utf-8") as f:
+            f.write("| # | Date | Company | Role |\n|---|---|---|---|\n"
+                    "| 1 | 2026-09-29 | Disney | Staff SWE | 4.0/5 | Evaluated | x | [1](../reports/001-a.md) | n |\n"
+                    "| 2 | 2026-09-29 | Disney | Other | 4.0/5 | Evaluated | x | [2](../reports/002-b.md) | n |\n"
+                    "| 3 | 2026-09-29 | Disney | Third | 4.0/5 | Evaluated | x | [3](../reports/003-c.md) | n |\n"
+                    "| 4 | 2026-09-29 | Disney | Fourth | 4.0/5 | Evaluated | x | no link | n |\n"
+                    "| 5 | 2026-09-29 | Acme | Fifth | 4.0/5 | Evaluated | x | [5](reports/005-e.md) | n |\n")
+        with open(os.path.join(fx, "reports", "005-e.md"), "w", encoding="utf-8") as f:
+            f.write("# E\n\n**URL:** https://acme.wd1.myworkdayjobs.com/S/job/X/Y_10000909\n")
+        with open(os.path.join(fx, "reports", "001-a.md"), "w", encoding="utf-8") as f:
+            f.write(f"# A\n\n**URL:** {D}\n")
+        with open(os.path.join(fx, "reports", "003-c.md"), "w", encoding="utf-8") as f:
+            f.write("# C\n\n**URL:**\n\n## Analysis\n")
+        gaps = []
+        fk = tracked_urls(os.path.join(fx, "data", "applications.md"), gaps=gaps)
+        if "wd:disney:10000101" not in fk:
+            bad += 1
+            print("  FAIL tracked_urls did not read the posting key out of a row's report")
+        if "wd:snapchat:10000101" in fk or "10000101" in fk:
+            bad += 1
+            print("  FAIL a bare number keyed without its tenant")
+        if "wd:acme:10000909" not in fk:
+            bad += 1
+            print("  FAIL a root-relative reports/ link was not followed")
+        if sorted(g[0] for g in gaps) != ["2", "3", "4"]:
+            bad += 1
+            print(f"  FAIL unreadable dedup evidence not reported as gaps: {gaps}")
+        g2 = []
+        if tracked_urls(os.path.join(fx, "nope", "applications.md"), gaps=g2) or g2 != [("-", "tracker missing")]:
+            bad += 1
+            print(f"  FAIL a missing tracker must be reported as a gap, got {g2}")
 
     # Requisition keying. The costs are not symmetric: a wrong `tracked` hides a live
     # role for good, while a missed one only re-offers a known req.
@@ -773,7 +931,9 @@ def main():
 
     rows.sort(key=lambda r: (-r["lane"], r["company"]))
     if a.json:
-        print(json.dumps({"count": len(rows), "rows": rows}, indent=1))
+        g = []
+        tracked_urls(gaps=g)
+        print(json.dumps({"count": len(rows), "dedup_gaps": len(g), "rows": rows}, indent=1))
         return 0
 
     actionable, needs_call = partition(rows)

@@ -378,10 +378,21 @@ for (const f of files) {
   // TEXT, so a gate that eval-write applied here and the report did not record
   // would be silently undone on the next recomputation pass.
   const compBasis = p.comp?.posted ? (p.comp.basis || 'unknown') : 'none';
-  const compText = compBasis === 'total' ? `comp_total_est: "${p.comp.posted}"` : '';
+  // An evaluator who reasons to a total-comp judgement records it as the packet's
+  // comp_total_est (it is the only field that can arm the comp gate). This
+  // path did not exist, so every such judgement had to be hand-edited into the report
+  // after the fact or was lost. A posted figure whose basis is total still wins.
+  const judged = p.comp_total_est;
+  const compText = compBasis === 'total' ? `comp_total_est: "${p.comp.posted}"`
+    : judged != null && judged !== ''
+      ? `comp_total_est: ${typeof judged === 'number' ? judged : `"${String(judged).replace(/"/g, "'")}"`}`
+      : '';
+  // A known arrangement (stated in the JD or established for the org) is passed through
+  // rather than re-derived from the location string, which reads "unknown" (x1) for an
+  // office address and so overstated every onsite role it could not parse.
   const m = applyModel(Math.round(base * 1000) / 1000, {
     text: `${compText}\nlocation: "${p.location || ''}"\n`,
-    company: p.company, role: p.title, prefs,
+    company: p.company, role: p.title, prefs, arrangement: p.arrangement,
   });
 
   const file = `reports/${N}-${p.slug}-${DATE}.md`;

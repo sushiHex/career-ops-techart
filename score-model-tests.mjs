@@ -18,7 +18,8 @@ import { fileURLToPath } from 'url';
 // of the profile: a malformed profile would otherwise fail the suite that checks the rules.
 process.env.CAREER_OPS_CONFIG_DIR = mkdtempSync(join(tmpdir(), 'score-model-noconfig-'));
 const M = await import(new URL('./score-model.mjs', import.meta.url).href);
-const { compBand, arrangement, locationText, MODEL } = M;
+const { compBand, arrangement, locationText, MODEL,
+        normaliseArrangement, persistedArrangement } = M;
 
 // Every floor-dependent call runs against FX, a PINNED fixture model. The real floor
 // comes from config/profile.yml, so a test reading it would pass or fail depending on
@@ -378,14 +379,58 @@ t('a persisted arrangement is trusted over re-deriving it from prose', () => {
   return true;
 });
 
-t('an unknown persisted arrangement does not block re-derivation', () => {
-  // 'unknown' is the absence of a decision, not a decision. Treating it as authoritative
-  // would freeze every row written before the arrangement key existed.
+t('an explicit unknown is a verdict; only an ABSENT arrangement re-derives', () => {
+  // A report persists `arrangement: unknown` when the posting does not say remote or
+  // office; re-deriving from its prose read a "City, ST" fragment as onsite and proposed
+  // lowering the row on every run. Rows written before the key existed have no key at
+  // all, so they still derive, which is what the old exemption protected.
   const clean = 'location: "Los Angeles, California"\n';
-  const r = applyModel(3.65, { text: clean, company: 'Vertex', role: 'X', prefs: [],
-                               arrangement: 'unknown' });
-  return r.arrangement === 'onsite' ? true
-    : `should fall back to deriving onsite, got ${r.arrangement}`;
+  const told = applyModel(3.65, { text: clean, company: 'Vertex', role: 'X', prefs: [],
+                                  arrangement: 'unknown' });
+  const absent = applyModel(3.65, { text: clean, company: 'Vertex', role: 'X', prefs: [] });
+  const nul = applyModel(3.65, { text: clean, company: 'Vertex', role: 'X', prefs: [],
+                                 arrangement: 'null' });
+  if (told.arrangement !== 'unknown') return `explicit unknown overridden to ${told.arrangement}`;
+  if (absent.arrangement !== 'onsite') return `absent key should derive onsite, got ${absent.arrangement}`;
+  if (nul.arrangement !== 'onsite') return `a literal null is absence, got ${nul.arrangement}`;
+  return true;
+});
+
+t('an arrangement spelling folds to the canonical value; a typo throws', () => {
+  // "on-site" used to skip re-derivation AND take factor 1, scoring an onsite role as remote.
+  const r = applyModel(4, { text: '', company: 'X', role: 'Y', prefs: [], arrangement: 'On-site' });
+  if (r.arrangement !== 'onsite') return `On-site should fold to onsite, got ${r.arrangement}`;
+  if (!(r.final < 4)) return `onsite must carry its damp, got final ${r.final}`;
+  for (const bad of ['remotish', 'remote2', '123', '!!!']) {
+    try {
+      applyModel(4, { text: '', company: 'X', role: 'Y', prefs: [], arrangement: bad });
+      return `unrecognised arrangement ${JSON.stringify(bad)} was accepted silently`;
+    } catch { /* expected */ }
+  }
+  return true;
+});
+
+t('the persisted arrangement is read from the Machine Summary, YAML-style', () => {
+  // A body line beginning "arrangement:" must not outvote the key, and quoted or commented
+  // values must parse rather than fall through to re-derivation.
+  const rep = (v) => `# R\n\narrangement: remote is discussed below\n\n## Machine Summary\n\n`
+    + '```yaml\n' + `arrangement: ${v}\n` + '```\n';
+  const cases = [['onsite', 'onsite'], ['" onsite "', 'onsite'], ['"onsite" # note', 'onsite'],
+                 ["'hybrid'", 'hybrid']];
+  for (const [raw, want] of cases) {
+    const got = normaliseArrangement(persistedArrangement(rep(raw)));
+    if (got !== want) return `${raw} parsed as ${got}, want ${want}`;
+  }
+  if (persistedArrangement('no key here') !== undefined) return 'absent key should be undefined';
+  // A summary that gives no arrangement must not borrow one from a later section.
+  const later = '## Machine Summary\n\n```yaml\nfinal: 4.0\n```\n\n## Example\n\narrangement: remote\n';
+  if (persistedArrangement(later) !== undefined) return 'read an arrangement from after the summary';
+  // ...and the same bound when the summary has no fenced block, so each guard is tested alone.
+  const unfenced = '## Machine Summary\n\nfinal: 4.0\n\n## Example\n\narrangement: remote\n';
+  if (persistedArrangement(unfenced) !== undefined) return 'an unfenced summary read past its section';
+  const fenced = '## Machine Summary\n\n```yaml\nfinal: 4.0\n```\narrangement: remote\n';
+  if (persistedArrangement(fenced) !== undefined) return 'a fenced summary read past its block';
+  return true;
 });
 
 // ---------------------------------------------------------------- the candidate, from config

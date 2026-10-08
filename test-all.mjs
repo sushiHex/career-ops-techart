@@ -1545,7 +1545,9 @@ try {
   // These two use argparse, which gives usage on --help and exit 2 on an unknown flag,
   // but that is a property of how they parse arguments and a hand-rolled sys.argv scan
   // would silently lose it, which is precisely what happened on the node side.
-  for (const script of ['scripts/eval-blockers.py', 'scripts/inbox-liveness.py']) {
+  // eval-assist.py was the third: it ignored its arguments entirely, so `--help` ran the
+  // default rewrite of every packet and a typo beside --retire could still delete them.
+  for (const script of ['scripts/eval-blockers.py', 'scripts/inbox-liveness.py', 'scripts/eval-assist.py']) {
     let helped = false, refusedCode = null;
     try {
       const h = execFileSync('python', [join(ROOT, script), '--help'],
@@ -5755,6 +5757,24 @@ try {
     pass('extractJobId still reads the P and REQ forms the shared pattern excludes');
   } else {
     fail(`composition dropped a form role-matcher needs: P=${p} REQ=${req}`);
+  }
+  // Disney-style bare numeric ids, keyed by tenant. Without them both rows were null and
+  // the fuzzy title fallback merged two different requisitions with similar titles.
+  const d1 = extractJobId('https://disney.wd5.myworkdayjobs.com/disneycareer/job/Burbank-CA-USA/Manager-ML-Engineering_10000101');
+  const d2 = extractJobId('https://disney.wd5.myworkdayjobs.com/en-US/disneycareer/job/Glendale-CA-USA/Senior-Manager-AI_10000202-1');
+  if (d1 === 'wd:disney:10000101' && d2 === 'wd:disney:10000202') {
+    pass('extractJobId keys a bare Workday id by tenant and folds the facet suffix');
+  } else {
+    fail(`bare Workday ids: d1=${d1} d2=${d2}`);
+  }
+  // Review findings: the tenant must be the URL's own HOST, and the fallback must never
+  // re-key a URL an earlier rule already answered.
+  const wrapped = extractJobId('https://wrapper.example/r/disney.wd5.myworkdayjobs.com/x/job/Y/Z_10000303');
+  const kept = extractJobId('https://disney.wd5.myworkdayjobs.com/Site/job/1234567/Y_10000303');
+  if (wrapped === null && kept === 'id:1234567') {
+    pass('the bare-id fallback reads only a Workday host and never overrides an earlier rule');
+  } else {
+    fail(`bare-id fallback: wrapped=${wrapped} (want null), kept=${kept} (want id:1234567)`);
   }
 } catch (e) {
   fail(`role-matcher tenant-form test crashed: ${e.message}`);

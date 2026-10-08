@@ -197,7 +197,32 @@ export function extractJobId(url) {
   if ((m = pathOnly.match(/\/j(?:ob)?s?\/(\d{5,})/i))) return `id:${m[1]}`;
   // Fallback: a long standalone numeric id segment in the path
   if ((m = pathOnly.match(/\/(\d{7,})(?:\/|$)/))) return `id:${m[1]}`;
-  return null;
+  return workdayBareId(u);
+}
+
+/**
+ * BARE numeric Workday ids, Disney's form: ..._10000101, or ..._10000101-1 with the facet
+ * suffix. The shared pattern excludes bare numbers on purpose, since a bare number is
+ * ambiguous anywhere else. On a myworkdayjobs host the POSITION is fixed by the posting
+ * path, so the number after the slug's last underscore is the requisition, and it is
+ * namespaced by tenant because Workday counters are tenant-local. It is a consumer-side
+ * fallback, tried after the shared pattern, never a loosening of it. Without it both sides
+ * of a comparison returned null, two nulls never conflict, and the fuzzy title fallback
+ * decided alone: it merged two different requisitions of one tenant whose titles were
+ * merely similar.
+ *
+ * Two properties, both from review. It runs LAST, so it can only turn a null into an id
+ * and never re-keys a URL that already had one; a re-keyed URL would silently stop
+ * matching its own tracker row. And the tenant is read from the PARSED host, never
+ * searched for along the string, so a wrapper carrying a Workday address in its path is
+ * not mistaken for the posting (the same anchoring rule req-resolve applies).
+ */
+function workdayBareId(u) {
+  let url;
+  try { url = new URL(/^https?:\/\//i.test(u) ? u : `https://${u}`); } catch { return null; }
+  const host = url.hostname.match(/^([a-z0-9-]+)\.wd\d+\.myworkdayjobs\.com$/i);
+  const id = host && url.pathname.match(/\/job\/.*_(\d{5,})(?:-\d+)?\/?$/);
+  return id ? `wd:${host[1].toLowerCase()}:${id[1]}` : null;
 }
 
 /**
