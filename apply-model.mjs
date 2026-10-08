@@ -27,7 +27,7 @@ import { join } from 'path';
 // data it reads (data/, reports/) stays relative to where it is run.
 const here = (f) => new URL(f, import.meta.url).href;
 const { parseScores, computeGlobal } = await import(here('audit-scores.mjs'));
-const { applyModel, loadPrefs, MODEL } = await import(here('score-model.mjs'));
+const { applyModel, loadPrefs, MODEL, persistedArrangement } = await import(here('score-model.mjs'));
 
 const args = process.argv.slice(2);
 const APPLY = args.includes('--apply');
@@ -53,6 +53,7 @@ const out = [];
 const changes = [];
 const scored = [];
 const malformed = [];
+const invalid = [];
 let live = 0, unparsed = 0;
 
 for (const line of lines) {
@@ -80,10 +81,20 @@ for (const line of lines) {
   // location_final that is often prose. Re-deriving from that prose returns 'unknown',
   // whose factor is 1, so every onsite and hybrid row silently drifted UPWARD on each
   // run. This is what made a single --apply raise 11 rows that were already correct.
-  const persistedArr = (text.match(/^\s*arrangement:\s*["']?([a-z]+)/im) || [])[1];
-  const r = applyModel(base, {
-    text, company: cells[3], role: cells[4], prefs, arrangement: persistedArr,
-  });
+  const persistedArr = persistedArrangement(text);
+  // An unrecognised persisted value throws in the model. Collect every one, finish the
+  // pass so the dry run names them all, and refuse --apply below: aborting at the first
+  // would hide the rest, and writing around them would leave those rows silently stale.
+  let r;
+  try {
+    r = applyModel(base, {
+      text, company: cells[3], role: cells[4], prefs, arrangement: persistedArr,
+    });
+  } catch (e) {
+    invalid.push(`#${cells[1]} ${p}: ${e.message}`);
+    out.push(line);
+    continue;
+  }
   const shown = parseFloat(String(cells[5]).replace('/5', ''));
   const next = r.final.toFixed(1);
 
@@ -174,9 +185,19 @@ console.log(`  biggest falls (${dn.length}):`);
 for (const x of dn.slice(0, 12)) console.log('    ' + fmt(x));
 console.log('');
 
+if (invalid.length) {
+  console.log(`  NOT SCORED, invalid report data (${invalid.length}); fix these before --apply:`);
+  for (const m of invalid) console.log(`    ${m}`);
+  console.log('');
+}
+
 if (!APPLY) {
   console.log('  dry run — pass --apply to write data/applications.md');
-  process.exit(0);
+  process.exit(invalid.length ? 1 : 0);
+}
+if (invalid.length) {
+  console.log('  refusing --apply while any report carries invalid data');
+  process.exit(1);
 }
 
 copyFileSync(TRACKER, TRACKER + '.bak');

@@ -628,17 +628,17 @@ const KEY_CASES = [
   // The exact failure. This URL keyed as itself before the anchors changed.
   ['an underscore-prefixed Workday req id is extracted',
     () => jobKey('https://nvidia.wd5.myworkdayjobs.com/en-US/NVIDIAExternalCareerSite/'
-      + 'job/US-CA-Santa-Clara/Senior-Software-Engineer--Agentic-Engineering_JR2508244')
+      + 'job/US-CA-Santa-Clara/Example-Role-10_JR2508244')
       === 'wd:JR2508244'],
   ['two spellings of one Workday req share a key',
     () => jobKey('https://nvidia.wd5.myworkdayjobs.com/NVIDIAExternalCareerSite/job/'
-      + 'US-CA-Santa-Clara/Senior-Software-Engineer--Agentic-Engineering_JR2508244')
+      + 'US-CA-Santa-Clara/Example-Role-10_JR2508244')
       === jobKey('https://nvidia.wd5.myworkdayjobs.com/en-US/NVIDIAExternalCareerSite/'
       + 'job/Remote/Senior-SWE--Agentic-Engineering_JR2508244?source=jobboard')],
   // The two spellings a JR\d{6,} floor would have read as absent.
   ['a hyphenated Sony req id keys the same as its bare form',
     () => jobKey('https://sonyglobal.wd1.myworkdayjobs.com/SonyGlobalCareers/job/'
-      + 'San-Mateo/Sr-Software-Engineer--AI-Native_JR-103209') === 'wd:JR103209'],
+      + 'San-Mateo/Example-Role-14_JR-103209') === 'wd:JR103209'],
   ['a five-digit Netflix req id is extracted',
     () => jobKey('https://netflix.wd1.myworkdayjobs.com/Netflix/job/USA---Remote/'
       + 'Member-of-Technical-Staff--Agentic-Systems---Games_JR48085') === 'wd:JR48085'],
@@ -647,10 +647,10 @@ const KEY_CASES = [
   // spellings of one req counted as two pending jobs.
   ['an Autodesk year-prefixed req id is extracted',
     () => jobKey('https://autodesk.wd1.myworkdayjobs.com/Ext/job/Toronto-ON-CAN/'
-      + 'Principal-MCP-AI-Developer_26WD161146') === 'wd:26WD161146'],
+      + 'Example-Role-05_26WD161146') === 'wd:26WD161146'],
   ['an Autodesk req id keys the same with and without its trailing sub-number',
     () => jobKey('https://autodesk.wd1.myworkdayjobs.com/Ext/job/Toronto-ON-CAN/'
-      + 'Principal-MCP-AI-Developer_26WD91231-1')
+      + 'Example-Role-05_26WD91231-1')
       === jobKey('https://autodesk.wd1.myworkdayjobs.com/Ext/job/Remote/'
       + 'Principal-MCP-AI-Dev_26WD91231')],
   // The two files cannot import one another, so nothing but this case notices
@@ -681,11 +681,11 @@ const KEY_CASES = [
   // tenant is part of the key because the number alone is not unique.
   ['a bare Workday R id is keyed with its tenant',
     () => jobKey('https://crowdstrike.wd5.myworkdayjobs.com/crowdstrikecareers/job/'
-      + 'USA---Remote-CA/Sr-Data-Pipeline-Engineer--Remote-_R21873')
+      + 'USA---Remote-CA/Example-Role-13-_R21873')
       === 'wd:crowdstrike:R21873'],
   ['a hyphenated R id keys the same as its bare form',
     () => jobKey('https://calix.wd1.myworkdayjobs.com/Calix/job/Remote-US/'
-      + 'Staff-Software-Engineer--AI-ML_R-11295') === 'wd:calix:R11295'],
+      + 'Example-Role-15_R-11295') === 'wd:calix:R11295'],
   // The destructive case. Both URLs carry R11095; they are different jobs, and
   // every consumer of a key here prunes, marks or retires on a match. The
   // assertion names both keys rather than merely comparing them, because two

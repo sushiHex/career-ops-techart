@@ -29,7 +29,7 @@ import { join } from 'path';
 import { fileURLToPath } from 'url';
 
 import { isMain } from './cli-guard.mjs';
-import { applyModel, loadPrefs } from './score-model.mjs';
+import { applyModel, loadPrefs, persistedArrangement } from './score-model.mjs';
 
 const args = process.argv.slice(2);
 const has = (f) => args.includes(f);
@@ -241,6 +241,7 @@ for (const [f, meta] of actionable) {
   if (base === null) continue;
   const modelled = applyModel(base, {
     company: meta?.company || '', role: meta?.role || '', prefs, text,
+    arrangement: persistedArrangement(text),
   });
   const calc = modelled ? modelled.final : base;
   actParsed++;

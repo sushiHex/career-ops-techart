@@ -30,7 +30,7 @@
  */
 import { readFileSync, existsSync, mkdirSync, writeFileSync } from 'fs';
 import { join } from 'path';
-import { applyModel, loadPrefs } from './score-model.mjs';
+import { applyModel, loadPrefs, persistedArrangement } from './score-model.mjs';
 
 const { parseScores, computeGlobal } = await import(
   new URL('./audit-scores.mjs', import.meta.url).href
@@ -87,7 +87,8 @@ for (const r of rows) {
   if (base === null) { unresolved++; continue; }
   // Apply the same modifiers the tracker's score already carries, so the two
   // rankings are comparable. Without this the modifiers read as drift.
-  const modelled = applyModel(base, { company: r.company, role: r.role, prefs, text });
+  const modelled = applyModel(base, { company: r.company, role: r.role, prefs, text,
+                                      arrangement: persistedArrangement(text) });
   const g = modelled ? modelled.final : base;
   r.base = Math.round(base * 100) / 100;
   r.factors = modelled

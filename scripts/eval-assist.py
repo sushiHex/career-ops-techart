@@ -134,15 +134,27 @@ def annotate(p):
 
 
 if __name__ == "__main__":
+    # A writer that ignored its arguments ran its default rewrite on `--help` and on any
+    # typo, and --retire deletes packets, so arguments are parsed, not scanned for.
+    import argparse
+    ap = argparse.ArgumentParser(description=(__doc__ or "").split("\n\n")[0],
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--retire", action="store_true",
+                    help="remove the packets a stated gate already decides")
+    ap.add_argument("--report", action="store_true",
+                    help="print the ranked summary without rewriting any packet")
+    args = ap.parse_args()
     files = sorted(glob.glob(os.path.join(QUEUE, "*.json")))
     rows = []
     for f in files:
         p = json.load(open(f, encoding="utf-8"))
-        if not isinstance(p, dict):
-            # Score dumps (batch/eval-queue/_*-scores.json) are lists, not packets.
+        # Only packets. Score dumps are lists, and a sweep's own JSON left in the queue is
+        # a dict without a url; annotating either rewrites a file that is not a packet.
+        if not isinstance(p, dict) or not p.get("url"):
             continue
         p = annotate(p)
-        json.dump(p, open(f, "w", encoding="utf-8"), indent=1, ensure_ascii=False)
+        if not args.report:
+            json.dump(p, open(f, "w", encoding="utf-8"), indent=1, ensure_ascii=False)
         rows.append((p, f))
 
     auto = [r for r in rows if r[0].get("suggested_disposition")]
@@ -163,6 +175,7 @@ if __name__ == "__main__":
         print(f"\nalready decided by a stated gate:")
         for p, f in auto[:12]:
             print(f"   {p['suggested_disposition']:26s} {(p.get('title') or '')[:52]}")
+    if auto and not args.report:
         # Retire them from the inbox and remove the packets, so a decided req does
         # not sit in the judgement queue and does not come back in the next triage.
         out = os.path.join(ROOT, "dispositions.json")
@@ -172,7 +185,7 @@ if __name__ == "__main__":
             if p["url"] not in seen:
                 prev.append({"url": p["url"], "disposition": p["suggested_disposition"]})
         json.dump(prev, open(out, "w", encoding="utf-8"), indent=1)
-        if "--retire" in sys.argv:
+        if args.retire:
             for _, f in auto:
                 os.remove(f)
             print(f"\nremoved {len(auto)} decided packet(s) from the queue")

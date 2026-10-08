@@ -1545,7 +1545,9 @@ try {
   // These two use argparse, which gives usage on --help and exit 2 on an unknown flag,
   // but that is a property of how they parse arguments and a hand-rolled sys.argv scan
   // would silently lose it, which is precisely what happened on the node side.
-  for (const script of ['scripts/eval-blockers.py', 'scripts/inbox-liveness.py']) {
+  // eval-assist.py was the third: it ignored its arguments entirely, so `--help` ran the
+  // default rewrite of every packet and a typo beside --retire could still delete them.
+  for (const script of ['scripts/eval-blockers.py', 'scripts/inbox-liveness.py', 'scripts/eval-assist.py']) {
     let helped = false, refusedCode = null;
     try {
       const h = execFileSync('python', [join(ROOT, script), '--help'],
@@ -3221,8 +3223,8 @@ try {
   const { extractJobId, roleFuzzyMatch } = await import(pathToFileURL(join(ROOT, 'role-matcher.mjs')).href);
 
   // unit: extractJobId distinguishes the real-world URLs that were mis-merged
-  const zSenior = extractJobId('https://zillow.wd5.myworkdayjobs.com/zillow_group_external/job/remote-usa/senior-machine-learning-engineer_p747039');
-  const zPrincipal = extractJobId('https://zillow.wd5.myworkdayjobs.com/en-US/Zillow_Group_External/job/Remote-USA/Principal-Machine-Learning-Engineer--Agentic-AI_P711740-2');
+  const zSenior = extractJobId('https://zillow.wd5.myworkdayjobs.com/zillow_group_external/job/remote-usa/example-role-08_p747039');
+  const zPrincipal = extractJobId('https://zillow.wd5.myworkdayjobs.com/en-US/Zillow_Group_External/job/Remote-USA/Example-Role-04_P711740-2');
   const aSpace = extractJobId('https://job-boards.greenhouse.io/andurilindustries/jobs/4223404714');
   const aModsim = extractJobId('https://job-boards.greenhouse.io/andurilindustries/jobs/5932781535');
   if (zSenior && zPrincipal && zSenior !== zPrincipal && aSpace && aModsim && aSpace !== aModsim) {
@@ -3270,9 +3272,9 @@ try {
       '|---|------|---------|------|-------|--------|-----|--------|-------|\n' +
       '| 10 | 2026-07-05 | Zillow | Senior Machine Learning Engineer | 3.0/5 | Discarded | ❌ | [10](../reports/010-zillow-senior.md) | existing distinct role |\n');
     writeFileSync(join(jTmp, 'reports', '010-zillow-senior.md'),
-      '**URL:** https://zillow.wd5.myworkdayjobs.com/zillow_group_external/job/remote-usa/senior-machine-learning-engineer_p747039\n');
+      '**URL:** https://zillow.wd5.myworkdayjobs.com/zillow_group_external/job/remote-usa/example-role-08_p747039\n');
     writeFileSync(join(jTmp, 'reports', '011-zillow-principal.md'),
-      '**URL:** https://zillow.wd5.myworkdayjobs.com/en-US/Zillow_Group_External/job/Remote-USA/Principal-Machine-Learning-Engineer--Agentic-AI_P711740-2\n');
+      '**URL:** https://zillow.wd5.myworkdayjobs.com/en-US/Zillow_Group_External/job/Remote-USA/Example-Role-04_P711740-2\n');
     // distinct posting (higher score) whose title fuzzy-matches the existing row
     writeFileSync(join(jAdds, '011-zillow.tsv'),
       '11\t2026-07-16\tZillow\tPrincipal Machine Learning Engineer, Agentic AI\tEvaluated\t3.5/5\t❌\t[11](reports/011-zillow-principal.md)\tdistinct job id\n');
@@ -4826,14 +4828,14 @@ try {
   // fetch the detail record for exactly those rows.
   const listPayload = {
     jobPostings: [
-      { title: 'Applied AI Engineer', externalPath: '/job/US-CA-Remote/Applied-AI-Engineer_JR2391853', locationsText: '6 Locations', postedOn: 'Posted Today' },
+      { title: 'Applied AI Engineer', externalPath: '/job/US-CA-Remote/Example-Role-01_JR2391853', locationsText: '6 Locations', postedOn: 'Posted Today' },
       { title: 'Onsite Only Role', externalPath: '/job/US-CA-Santa-Clara/Onsite_JR1', locationsText: '2 Locations', postedOn: 'Posted 3 Days Ago' },
       { title: 'Single Location Role', externalPath: '/job/US-CA-Remote/Single_JR2', locationsText: 'US, CA, Remote', postedOn: 'Posted 1 Days Ago' },
       { title: 'Detail Fetch Fails', externalPath: '/job/Somewhere/Broken_JR3', locationsText: '3 Locations', postedOn: 'Posted Today' },
     ],
   };
   const detailByPath = {
-    '/job/US-CA-Remote/Applied-AI-Engineer_JR2391853': {
+    '/job/US-CA-Remote/Example-Role-01_JR2391853': {
       jobPostingInfo: { location: 'US, CA, Remote', additionalLocations: ['US, GA, Remote', 'US, CA, Santa Clara'] },
     },
     '/job/US-CA-Santa-Clara/Onsite_JR1': {
@@ -5732,7 +5734,7 @@ try {
   const { extractJobId } = await import(pathToFileURL(join(ROOT, 'role-matcher.mjs')).href);
   // The form this file had no branch for at all. It returned null, and two nulls
   // never conflict, so every Autodesk row lost the job-id dedup guard.
-  const ad = extractJobId('https://autodesk.wd1.myworkdayjobs.com/Ext/job/Toronto-ON-CAN/Principal-MCP-AI-Developer_26WD161146');
+  const ad = extractJobId('https://autodesk.wd1.myworkdayjobs.com/Ext/job/Toronto-ON-CAN/Example-Role-05_26WD161146');
   if (ad === 'wd:26wd161146') {
     pass('extractJobId reads Autodesk\'s year-prefixed req id (26WD161146)');
   } else {
@@ -5741,7 +5743,7 @@ try {
   // Two spellings of ONE Autodesk req. Both null before, which is equal by
   // accident rather than by identity, so assert the value and not just equality.
   const bare = extractJobId('https://autodesk.wd1.myworkdayjobs.com/Ext/job/Remote/Principal-MCP-AI-Dev_26WD91231');
-  const facet = extractJobId('https://autodesk.wd1.myworkdayjobs.com/Ext/job/Toronto-ON-CAN/Principal-MCP-AI-Developer_26WD91231-1');
+  const facet = extractJobId('https://autodesk.wd1.myworkdayjobs.com/Ext/job/Toronto-ON-CAN/Example-Role-05_26WD91231-1');
   if (bare === 'wd:26wd91231' && facet === 'wd:26wd91231') {
     pass('extractJobId folds an Autodesk facet suffix onto the bare req id');
   } else {
@@ -5755,6 +5757,24 @@ try {
     pass('extractJobId still reads the P and REQ forms the shared pattern excludes');
   } else {
     fail(`composition dropped a form role-matcher needs: P=${p} REQ=${req}`);
+  }
+  // Disney-style bare numeric ids, keyed by tenant. Without them both rows were null and
+  // the fuzzy title fallback merged two different requisitions with similar titles.
+  const d1 = extractJobId('https://disney.wd5.myworkdayjobs.com/disneycareer/job/X/Y_10000101');
+  const d2 = extractJobId('https://disney.wd5.myworkdayjobs.com/en-US/disneycareer/job/X/Z_10000202-1');
+  if (d1 === 'wd:disney:10000101' && d2 === 'wd:disney:10000202') {
+    pass('extractJobId keys a bare Workday id by tenant and folds the facet suffix');
+  } else {
+    fail(`bare Workday ids: d1=${d1} d2=${d2}`);
+  }
+  // Review findings: the tenant must be the URL's own HOST, and the fallback must never
+  // re-key a URL an earlier rule already answered.
+  const wrapped = extractJobId('https://wrapper.example/r/disney.wd5.myworkdayjobs.com/x/job/Y/Z_10000303');
+  const kept = extractJobId('https://disney.wd5.myworkdayjobs.com/Site/job/1234567/Y_10000303');
+  if (wrapped === null && kept === 'id:1234567') {
+    pass('the bare-id fallback reads only a Workday host and never overrides an earlier rule');
+  } else {
+    fail(`bare-id fallback: wrapped=${wrapped} (want null), kept=${kept} (want id:1234567)`);
   }
 } catch (e) {
   fail(`role-matcher tenant-form test crashed: ${e.message}`);
@@ -5782,7 +5802,7 @@ try {
     // and over-merges on the fuzzy fallback when it is missing. Autodesk had no
     // branch here either, so every Autodesk row arrived with no id at all.
     const adTsv = runLabel('autodesk.json', { slug: 'label-autodesk',
-      url: 'https://autodesk.wd1.myworkdayjobs.com/Ext/job/Toronto-ON-CAN/Principal-MCP-AI-Developer_26WD161146' });
+      url: 'https://autodesk.wd1.myworkdayjobs.com/Ext/job/Toronto-ON-CAN/Example-Role-05_26WD161146' });
     if (/\(26WD161146\)/.test(adTsv)) {
       pass('eval-write labels an Autodesk 26WD requisition in the role cell');
     } else {

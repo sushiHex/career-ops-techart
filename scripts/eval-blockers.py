@@ -550,9 +550,9 @@ def selftest():
     os.makedirs(reports)
 
     NV_REPORT = ("https://acmecorp.wd5.myworkdayjobs.com/AcmeCorpExternalCareerSite/job/"
-                 "US-CA-Example/Senior-Agentic-AI-Software-Engineer_JR1000001-1")
+                 "US-CA-Example/Example-Role-06_JR1000001-1")
     NV_PACKET = ("https://acmecorp.wd5.myworkdayjobs.com/en-US/AcmeCorpExternalCareerSite/"
-                 "job/US-CA-Example/Senior-Agentic-AI-Software-Engineer_JR1000001")
+                 "job/US-CA-Example/Example-Role-06_JR1000001")
     GH_REPORT = "https://www.globex.example/jobs/1000001?gh_jid=1000001"
     GH_PACKET = "https://job-boards.greenhouse.io/globexlabs/jobs/1000001"
     ASH = "https://jobs.ashbyhq.com/initrode/00000000-cbe0-cbe0-cbe0-000000000000"
