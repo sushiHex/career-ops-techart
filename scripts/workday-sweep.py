@@ -602,10 +602,9 @@ def _selftest():
         print("  FAIL an Acme req id marks an Umbrella Corp posting as already tracked")
     # The posting key. A tracked req whose row's role cell does not carry the id came back
     # as a new find; the Disney form is a bare number the shared REQ_ID refuses by design.
-    D = "https://disney.wd5.myworkdayjobs.com/disneycareer/job/Burbank-CA-USA/Staff-SWE_10000101"
+    D = "https://disney.wd5.myworkdayjobs.com/disneycareer/job/X/Y_10000101"
     for u, want in (
-            ("https://autodesk.wd1.myworkdayjobs.com/Ext/job/California-USA---Remote/"
-             "Senior-Principal-AI-ML-Developer_26WD100505", "wd:autodesk:26WD100505"),
+            ("https://autodesk.wd1.myworkdayjobs.com/Ext/job/X/Y_26WD100505", "wd:autodesk:26WD100505"),
             (D, "wd:disney:10000101"),
             ("https://nvidia.wd5.myworkdayjobs.com/en-US/NVIDIAExternalCareerSite/job/X/Y_JR1000101-1",
              "wd:nvidia:JR1000101"),

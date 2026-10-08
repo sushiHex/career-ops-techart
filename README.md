@@ -142,8 +142,8 @@ running whatever you configure.
 On a fresh clone (these are what CI runs):
 
 ```bash
-node test-all.mjs           # 669 integration checks
-npm run model:test          # 66 scoring-model tests
+node test-all.mjs           # 672 integration checks
+npm run model:test          # 68 scoring-model tests
 python scripts/req-resolve.py --selftest   # 20 routing + 353 behaviour cases
 ```
 

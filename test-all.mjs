@@ -5760,8 +5760,8 @@ try {
   }
   // Disney-style bare numeric ids, keyed by tenant. Without them both rows were null and
   // the fuzzy title fallback merged two different requisitions with similar titles.
-  const d1 = extractJobId('https://disney.wd5.myworkdayjobs.com/disneycareer/job/Burbank-CA-USA/Manager-ML-Engineering_10000101');
-  const d2 = extractJobId('https://disney.wd5.myworkdayjobs.com/en-US/disneycareer/job/Glendale-CA-USA/Senior-Manager-AI_10000202-1');
+  const d1 = extractJobId('https://disney.wd5.myworkdayjobs.com/disneycareer/job/X/Y_10000101');
+  const d2 = extractJobId('https://disney.wd5.myworkdayjobs.com/en-US/disneycareer/job/X/Z_10000202-1');
   if (d1 === 'wd:disney:10000101' && d2 === 'wd:disney:10000202') {
     pass('extractJobId keys a bare Workday id by tenant and folds the facet suffix');
   } else {
