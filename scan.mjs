@@ -38,6 +38,7 @@ import yaml from 'js-yaml';
 import { isMain } from './cli-guard.mjs';
 import { makeHttpCtx } from './providers/_http.mjs';
 import { buildSignals, decideLocations, effectiveLocationFilter } from './location-core.mjs';
+import { REQ_ID_SRC } from './req-id-core.mjs';
 
 const parseYaml = yaml.load;
 
@@ -515,6 +516,10 @@ export function canonicalCompany(value) {
     .trim();
 }
 
+const ROLE_ID_TOKEN = String.raw`(?:(?:${REQ_ID_SRC}|(?<![A-Za-z0-9])(?:REQ[-_ ]?\d{4,}|P\d{5,}|\d{5,})(?![A-Za-z0-9]))(?:-\d{1,2}(?![A-Za-z0-9]))?)`;
+const ROLE_PAREN_WITH_ID = new RegExp(String.raw`\((?=[^)]*${ROLE_ID_TOKEN})[^)]*\)`, 'gi');
+const ROLE_BARE_ID = new RegExp(ROLE_ID_TOKEN, 'gi');
+
 /**
  * Canonical role title for tracker matching.
  *
@@ -526,13 +531,26 @@ export function canonicalCompany(value) {
  * Engineer - AI Agents and Systems". That is why every match is written to
  * data/already-evaluated.tsv rather than dropped silently: an over-merge stays
  * visible and recoverable instead of quietly deleting a live role.
+ *
+ * WHAT COUNTS AS AN ID is the shared Workday pattern from req-id-core.mjs,
+ * composed with the two forms the tracker writes beside it: REQ-#### and a BARE
+ * number of five or more digits, which is how a Greenhouse gh_jid and a Riot or
+ * Disney id are recorded, "(5349405250)". The previous rule recognised an id
+ * only by a JR/R/REQ/GH prefix, so it missed the bare form and 33 roles already
+ * on the tracker came back as new; and because its `r`
+ * branch accepted any word, it also stripped "(Rigging)" and "(Robotics)",
+ * merging titles that differ in exactly the word that tells them apart. A
+ * parenthetical is now dropped whole when it CONTAINS an id, since the tracker
+ * often writes the team beside it, "(Industrial Engineering, JR2878530)", and a
+ * board title carries neither.
  */
+// Zillow's P711740 is the form role-matcher.mjs composes beside the shared pattern, and a
+// trailing "-1" facet suffix belongs to the id before it, or "JR2292444-1" leaves a "1".
 export function canonicalRole(value) {
   return String(value ?? '')
     .toLowerCase()
-    .replace(/\((?:jr|req|r|gh)[- ]?[\w-]+\)/gi, ' ')
-    .replace(/\breq[- ]?\d+\b/gi, ' ')
-    .replace(/\bjr\d{6,}\b/gi, ' ')
+    .replace(ROLE_PAREN_WITH_ID, ' ')
+    .replace(ROLE_BARE_ID, ' ')
     .replace(/&/g, ' and ')
     .replace(/[^a-z0-9]+/g, ' ')
     .trim();

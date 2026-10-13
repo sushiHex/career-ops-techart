@@ -144,14 +144,10 @@ if __name__ == "__main__":
     ap.add_argument("--report", action="store_true",
                     help="print the ranked summary without rewriting any packet")
     args = ap.parse_args()
-    files = sorted(glob.glob(os.path.join(QUEUE, "*.json")))
     rows = []
-    for f in files:
-        p = json.load(open(f, encoding="utf-8"))
-        # Only packets. Score dumps are lists, and a sweep's own JSON left in the queue is
-        # a dict without a url; annotating either rewrites a file that is not a packet.
-        if not isinstance(p, dict) or not p.get("url"):
-            continue
+    # Only packets, by eval-prep's one definition of a packet: annotating a score dump or
+    # a sweep's own JSON would rewrite a file that is not one.
+    for f, p in _prep.queue_packets(QUEUE):
         p = annotate(p)
         if not args.report:
             json.dump(p, open(f, "w", encoding="utf-8"), indent=1, ensure_ascii=False)

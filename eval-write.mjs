@@ -131,6 +131,10 @@ const normUrl = (u) => {
 /** "Fixtureco, Inc." and "Fixtureco" are one employer. */
 const normCo = (c) => String(c).toLowerCase().replace(/[^a-z0-9]+/g, '');
 
+// A UUID is cut out before the bare-number alternative runs: an Ashby or Lever posting
+// id ends in a twelve-hex group that is often all digits, and "...-113241621221" was
+// labelled Prefect's requisition on 2026-10-13.
+const UUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi;
 /**
  * The requisition id that travels in the tracker's role cell, e.g. "... (JR2508244)".
  *
@@ -152,7 +156,7 @@ const normCo = (c) => String(c).toLowerCase().replace(/[^a-z0-9]+/g, '');
  * Last match wins, because the requisition sits at the end of an ATS path.
  */
 const reqLabel = (url) => {
-  const path = String(url || '').trim().replace(/[?#].*$/, '');
+  const path = String(url || '').trim().replace(/[?#].*$/, '').replace(UUID_RE, '');
   let last = null;
   for (const m of path.matchAll(new RegExp(`${REQ_ID_SRC}|[_/-](\\d{7,})(?![0-9])`, 'gi'))) {
     last = m[1] || m[2];

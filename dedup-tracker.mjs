@@ -12,7 +12,7 @@
 import { readFileSync, writeFileSync, copyFileSync, existsSync, mkdirSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
-import { roleFuzzyMatch, jobIdsConflict, jobIdFromReportField } from './role-matcher.mjs';
+import { roleFuzzyMatch, rowIdReader, idSetsConflict } from './role-matcher.mjs';
 
 const CAREER_OPS = dirname(fileURLToPath(import.meta.url));
 // Support both layouts: data/applications.md (boilerplate) and applications.md
@@ -53,27 +53,10 @@ const TRACKER_DIR = dirname(APPS_FILE);
 // Ensure the target tracker directory exists in both normal and fixture mode.
 mkdirSync(TRACKER_DIR, { recursive: true });
 
-// Cache of report-file path → posting URL so dedup reads each report at most
-// once. Shared implementation lives in role-matcher.mjs (also used by
-// merge-tracker.mjs) so the report-read + URL-extraction logic exists in
-// exactly one place.
-const reportUrlCache = new Map();
-
-/**
- * Resolve the authoritative job id for a tracker row via its linked report URL.
- *
- * Two same-company rows may fuzzy-match on title yet be distinct openings. The
- * report's `**URL:**` requisition id disambiguates them: distinct ids prove the
- * rows are different postings that must not be deduplicated. Missing report
- * files / links / URL lines return null, leaving the fuzzy matcher in charge for
- * legacy rows.
- *
- * @param {object} row - Parsed applications.md row with a `.report` cell.
- * @returns {string|null} Namespaced job id, or null when unresolved.
- */
-function jobIdForRow(row) {
-  return jobIdFromReportField(row?.report, TRACKER_DIR, reportUrlCache);
-}
+// A row's identity SET (role-matcher.mjs rowIdReader), memoised for this run. Two
+// same-company rows whose sets are both non-empty and share nothing are different
+// postings and must not be deduplicated, however alike their titles read.
+const jobIdsForRow = rowIdReader(TRACKER_DIR);
 
 // Status advancement order (higher = more advanced in pipeline)
 // Aplicado > Rechazado because active application > terminal state
@@ -239,7 +222,7 @@ function roleMatch(a, b) {
   // are distinct openings and must never be deduplicated, however similar their
   // titles read (e.g. "Modeling & Simulation Engineer, Space" vs "SWE, Modeling
   // & Simulation" at the same company).
-  if (jobIdsConflict(jobIdForRow(a), jobIdForRow(b))) return false;
+  if (idSetsConflict(jobIdsForRow(a), jobIdsForRow(b))) return false;
 
   // Fuzzy title matches are intentionally conservative once either row has
   // entered the real application pipeline. A user may already have applied to

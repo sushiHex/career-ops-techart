@@ -163,6 +163,13 @@ ATS_IN_PATH = re.compile(
 GH_SLUG = re.compile(
     r"boards-api\.greenhouse\.io/v1/boards/([\w-]+)"
     r"|(?:job-boards|boards)\.greenhouse\.io/(?:embed/job_board(?:/js)?\?for=)?([\w-]+)")
+# Any ATS board slug a portals.yml entry declares, one group, for naming an employer by
+# its board: Greenhouse, Ashby, Lever, Workable and SmartRecruiters. (A Workday tenant is
+# recorded separately, in `workday`.)
+BOARD_SLUG = re.compile(
+    r"(?:boards-api\.greenhouse\.io/v1/boards/|(?:job-boards|boards)\.greenhouse\.io/"
+    r"|jobs\.ashbyhq\.com/|jobs\.lever\.co/|apply\.workable\.com/|jobs\.smartrecruiters\.com/)"
+    r"([\w-]+)")
 # The snippet a company-hosted careers page uses to embed its Greenhouse board. BOTH
 # spellings have to be here. The standard loader is
 # `boards.greenhouse.io/embed/job_board/js?for=SLUG`, and a pattern that knew only the
@@ -303,8 +310,11 @@ def portals_index():
         slugs = [a or b for a, b in GH_SLUG.findall(block)]
         wd = WD_TENANT_URL.search(block)
         _PORTALS.append(dict(
-            label=label, keys=keys, loose=loose,
+            label=label, base=base.strip(), keys=keys, loose=loose,
             slugs=list(dict.fromkeys(s for s in slugs if s)),
+            # Every ATS board slug the entry declares, lowercased, so a caller holding a
+            # slug (eval-prep naming a packet's employer) can find the entry's label.
+            boards={m.lower() for m in BOARD_SLUG.findall(block)},
             workday=(wd.group(1), wd.group(2), wd.group(3)) if wd else None))
     return _PORTALS
 
@@ -505,6 +515,29 @@ def unreadable(ats, st, what="the response body"):
 
 
 HTML_ACCEPT = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+
+# Atlassian's whole board is one array (351 postings on 2026-10-08). Below this, an
+# absence from it is not evidence of a closure; see the Atlassian adapter in resolve().
+ATLASSIAN_MIN_BOARD = 50
+
+_BOARDS = {}
+
+
+def board_fetch(url):
+    """fetch() for a whole-board endpoint, kept for the life of the process.
+
+    The GitHub and Atlassian adapters read a 1.5 to 2.4 MB board to answer about ONE
+    posting, and verify-report-urls resolves reports one at a time, so a run re-downloaded
+    the same board once per report (13 GitHub reports cost about 39 MB). Only a 200 with
+    a body is kept, so a failed read is retried; the selftest clears this before every
+    mocked fetch so one case's board cannot answer the next.
+    """
+    if url not in _BOARDS:
+        st, body = fetch(url)
+        if st != 200 or not body:
+            return st, body
+        _BOARDS[url] = (st, body)
+    return _BOARDS[url]
 
 
 def fetch(url, timeout=25, accept=None):
@@ -1150,6 +1183,39 @@ def jsonld_expired(page_html, url=None, today=None):
                 note=f"the page's own schema.org JobPosting gives validThrough "
                      f"{day}, which is past; that is the employer "
                      f"stating the position is no longer open")
+
+
+def google_record(page, jid, st=200):
+    """The resolver record for Google careers job `jid` from its page's `ds:0` block.
+
+    The block is either the posting, an array whose first element is the job id, or an
+    error envelope `[code, null, [details]]`. Only code 5 (NOT_FOUND) closes; any other
+    shape, an id that is not the one asked for, or a block that will not parse is unknown,
+    because a page that changed shape is not evidence about the posting.
+    """
+    unknown = lambda note: dict(ats="google", live=None, status=st, note=note)
+    try:
+        i = page.index("key: 'ds:0'")
+        d, _ = json.JSONDecoder().raw_decode(page, page.index("data:", i) + len("data:"))
+    except ValueError:
+        return unknown("no readable ds:0 block on the page")
+    if isinstance(d, list) and d and isinstance(d[0], int):
+        if d[0] == 5:
+            return dict(ats="google", live=False, status=st,
+                        note="the careers API answered NOT_FOUND for this id")
+        return unknown(f"careers API error code {d[0]}")
+    try:
+        rec = d[0]
+        if str(rec[0]) != jid:
+            return unknown(f"the page's job record is {rec[0]}, not {jid}")
+        part = lambda k: (rec[k][1] if isinstance(rec[k], list) and len(rec[k]) > 1 else "") or ""
+        jd = clean(" ".join(part(k) for k in (10, 3, 4)))
+        locs = [L[0] for L in (rec[9] or []) if isinstance(L, list) and L and L[0]]
+    except (IndexError, TypeError, KeyError):
+        return unknown("ds:0 record not in the known shape")
+    return dict(ats="google", live=True, title=rec[1], org="google",
+                location=" | ".join(dict.fromkeys(locs)) or None, jd=jd, pay=pays(jd),
+                remote_txt=any(re.search(r"\bremote\b", L, re.I) for L in locs))
 
 
 def board_owns_host(listing, url):
@@ -1937,14 +2003,24 @@ def resolve(url):
     m = re.search(OUTER_HOST + r"github\.careers/careers-home/jobs/(\d+)", ou)
     if m:
         want = m.group(1)
+        # An absence closes a row only when the walk READ THE WHOLE BOARD: it ended on its
+        # own, and read as many postings as the board's first page said it holds. It
+        # used to answer "may be closed" even after reading 73 of 73, so two closed
+        # GitHub reqs on 2026-10-09 had to be settled by hand. `totalCount` is latched
+        # from page one only (CrowdStrike's later pages report 0), and a board serving
+        # FEWER than its own count is a response disagreeing with itself, not a closure.
+        total, seen = None, 0
         for page in range(1, 8):
-            st, body = fetch(f"https://www.github.careers/api/jobs?page={page}&limit=50")
+            st, body = board_fetch(f"https://www.github.careers/api/jobs?page={page}&limit=100")
             if st != 200 or not body:
                 break
-            d = jload(body, need=("jobs",))
-            if d is UNREADABLE:
+            env = jload(body, need=("jobs",))
+            if env is UNREADABLE:
                 return unreadable("github", st, f"page {page} of the jobs API")
-            rows = d.get("jobs", []) or []
+            if page == 1 and isinstance(env.get("totalCount"), int):
+                total = env["totalCount"]
+            rows = env.get("jobs", []) or []
+            seen += len(rows)
             for r in rows:
                 d = r.get("data") or {}
                 if str(d.get("req_id") or d.get("slug")) != want:
@@ -1956,10 +2032,87 @@ def resolve(url):
                             jd=txt, pay=pays(txt),
                             remote_txt=bool(re.search(r"\bremote\b",
                                                      " ".join(locs) + " " + str(d.get("location_type") or ""), re.I)))
-            if not rows:
+            if not rows or (total is not None and seen >= total):
                 break
+        # `total` is latched on page one and `seen` only grows, so this holds exactly when
+        # the walk stopped because it had read everything the board said it holds.
+        if seen and total is not None and seen >= total:
+            return dict(ats="github", live=False,
+                        note=f"absent from the full board ({seen} of {total} postings read)")
         return dict(ats="github", live=None, status=0,
-                    note="req id not found in the first 350 postings; may be closed")
+                    note=f"req id not found in {seen} postings read; the board was not read in full")
+
+    # Atlassian. Its posting pages are company-hosted, so no ATS host ever appears in a URL
+    # and both reqs found on 2026-10-08 came back untitled. The whole board is one public
+    # JSON array at /endpoint/careers/listings (349 postings that day), each record carrying
+    # the id from the page URL, the title, EVERY location ("Remote - Remote" beside the
+    # offices, which is where Atlassian's remote eligibility lives) and the description. The
+    # pay zones are not in the JSON, only on the server-rendered page, so that is read too,
+    # for the band alone; a page that fails costs the band and nothing else.
+    m = re.search(OUTER_HOST + r"atlassian\.com/company/careers/details/(\d+)", ou)
+    if m:
+        jid = m.group(1)
+        st, body = board_fetch("https://www.atlassian.com/endpoint/careers/listings")
+        if not (st == 200 and body):
+            return dict(ats="atlassian", live=None, status=st, note="board not retrievable")
+        board = jload(body, want=list)
+        if board is UNREADABLE:
+            return unreadable("atlassian", st, "the listings JSON")
+        # Same rule as Breezy: an absence is evidence only on a board that was read
+        # cleanly, and a list holding no posting record was not.
+        postings = [j for j in board if isinstance(j, dict) and j.get("id") is not None]
+        if not postings:
+            return unreadable("atlassian", st,
+                              "the listings JSON (it parsed, and held no posting)")
+        for j in postings:
+            if str(j.get("id")) != jid:
+                continue
+            # "Remote - Remote" is not a US entry: it sits on 96 postings outside the
+            # Americas. The iCIMS portal each record names IS its region (careers-apac is
+            # India and Australia, globalcareers is the UK and Europe), so a bare remote
+            # entry is renamed for the region the gate can read, and only the Americas
+            # portal keeps it bare.
+            portal = ((j.get("portalJobPost") or {}).get("portalUrl") or "").lower()
+            region = ("APAC" if "-apac-" in portal else
+                      "EMEA" if re.search(r"//(?:globalcareers|globalmobility)", portal) else None)
+            locs = [re.sub(r"\s+", " ", L).strip() for L in (j.get("locations") or [])
+                    if isinstance(L, str) and L.strip()]
+            if region:
+                locs = [f"Remote - {region}" if L == "Remote - Remote" else L for L in locs]
+            jd = clean(" ".join(str(j.get(k) or "")
+                                for k in ("overview", "responsibilities", "qualifications")))
+            pst, page = fetch(f"https://www.atlassian.com/company/careers/details/{jid}",
+                              accept=HTML_ACCEPT)
+            return dict(ats="atlassian", live=True, title=j.get("title"), org="atlassian",
+                        location=" | ".join(dict.fromkeys(locs)) or None, jd=jd,
+                        pay=(pays(clean(page)) if pst == 200 and page else []) or pays(jd),
+                        remote_txt=any(re.search(r"\bremote\b", L, re.I) for L in locs))
+        # The closure needs a board that plausibly IS the whole board. It carried 351
+        # postings on 2026-10-08 in one unpaged array; a stub or a truncated answer that
+        # still parses would otherwise close every row it happens to omit.
+        if len(postings) < ATLASSIAN_MIN_BOARD:
+            return dict(ats="atlassian", live=None, status=st,
+                        note=f"absent from a listings board of only {len(postings)}; "
+                             f"too small to trust as the whole board")
+        return dict(ats="atlassian", live=False, note="absent from the full listings board = closed")
+
+    # Google careers. The page is client-rendered, but it embeds the posting as a JSON array
+    # in its `ds:0` data block: id, title, responsibilities, qualifications, every location
+    # and the description, so no browser is needed. Both DREAM-tier Google finds on
+    # 2026-10-13 came back untitled before this. Google answers HTTP 200 even for an id that
+    # does not exist; the block then carries gRPC status 5, NOT_FOUND, which is the API's
+    # own statement about the requested id and the only error code treated as a closure.
+    m = re.search(OUTER_HOST + r"(?:google\.com/about/careers/applications|careers\.google\.com)"
+                  r"/jobs/results/(\d{6,})", ou)
+    if m:
+        jid = m.group(1)
+        st, page = fetch(f"https://www.google.com/about/careers/applications/jobs/results/{jid}",
+                         accept=HTML_ACCEPT)
+        if st in GONE:
+            return dict(ats="google", live=False, status=st, note=gone_note(st))
+        if st != 200 or not page:
+            return dict(ats="google", live=None, status=st, note="page not retrievable")
+        return google_record(page, jid, st)
 
     # iCIMS. The human page is a single-page app whose job content lives in an IFRAME, so a
     # plain fetch of it returns 471KB of bundle and no title, and the resolver gave up. The
@@ -2056,6 +2209,11 @@ ROUTE_CASES = [
     ("https://apply.workable.com/panorama-education/j/9200125A8B/", "workable"),
     ("https://rootstock-software.breezy.hr/p/fe71c039c890-agent-applied-ai-engineer", "breezy"),
     ("https://www.github.careers/careers-home/jobs/5537?lang=en-us", "github"),
+    # Company-hosted, so no ATS hostname in the URL; the board is a public JSON array.
+    ("https://www.atlassian.com/company/careers/details/26789", "atlassian"),
+    # Google's careers page is client-rendered; the posting is a JSON block inside it.
+    ("https://www.google.com/about/careers/applications/jobs/results/121322999171652885-x", "google"),
+    ("https://careers.google.com/jobs/results/88114351423244330-research-engineer/", "google"),
     # iCIMS, the last host in a 1264-row inbox that nothing could read. Its human
     # page is a single-page app; the `?in_iframe=1` view is server-rendered.
     ("https://careers-githubinc.icims.com/jobs/5640/login", "icims"),
@@ -2195,6 +2353,7 @@ def behaviour_cases():
             print(f"FAIL  {msg}")
 
     def with_fetch(fake, url):
+        _BOARDS.clear()
         with mock.patch.object(sys.modules[__name__], "fetch", fake):
             return resolve(url)
 
@@ -2606,6 +2765,100 @@ def behaviour_cases():
             continue
         check(r.get("live") is None,
               f"breezy: {label} at HTTP 200 must be unknown, got live={r.get('live')}")
+
+    # Atlassian's board is a bare array too, and its closure branch is destructive, so it
+    # gets the same junk, plus the case that matters most: a CLEAN board without the id
+    # is a closure, and an EMPTY one is not.
+    ATL = "https://www.atlassian.com/company/careers/details/26789"
+    for label, junk in [("an HTML interstitial", "<html>WAF</html>"),
+                        ("truncated JSON", '[{"id": 26789, "title": "Sen'),
+                        ("an object where an array belongs", '{"jobs": []}'),
+                        ("an array of scalars", '[26789, null]'),
+                        ("an empty board", "[]")]:
+        try:
+            r = with_fetch(lambda *a, _b=junk, **k: (200, _b), ATL)
+        except Exception as e:
+            check(False, f"atlassian: {label} at HTTP 200 RAISED {type(e).__name__}: {e}")
+            continue
+        check(r.get("live") is None,
+              f"atlassian: {label} at HTTP 200 must be unknown, got live={r.get('live')}")
+    _atl_board = json.dumps([{"id": 26789, "title": "Senior ML Engineer, AI-Native Evaluation",
+                              "locations": ["Seattle - United States -  Seattle, Washington",
+                                            "Remote - Remote"],
+                              "overview": "<p>Build evaluation frameworks.</p>"}])
+    r = with_fetch(lambda *a, **k: (200, _atl_board), ATL)
+    check(r.get("live") is True and r.get("title", "").startswith("Senior ML Engineer")
+          and "Remote - Remote" in (r.get("location") or "") and r.get("remote_txt") is True,
+          f"a listed Atlassian id must resolve with every location: {r.get('live')} / "
+          f"{r.get('location')}")
+    # Absence closes only on a board big enough to be the whole board: a one-record
+    # answer that parses would otherwise close every row it omits.
+    r = with_fetch(lambda *a, **k: (200, _atl_board),
+                   "https://www.atlassian.com/company/careers/details/11111")
+    check(r.get("live") is None,
+          f"absence from a ONE-posting Atlassian board must not close a row: {r.get('live')}")
+    _atl_full = json.loads(_atl_board) + [{"id": 30000 + i, "title": f"Role {i}",
+                                           "locations": ["Remote - Remote"]}
+                                          for i in range(ATLASSIAN_MIN_BOARD)]
+    r = with_fetch(lambda *a, **k: (200, json.dumps(_atl_full)),
+                   "https://www.atlassian.com/company/careers/details/11111")
+    check(r.get("live") is False,
+          f"an id absent from a full Atlassian board is closed: {r.get('live')}")
+    # A bare "Remote - Remote" on a non-Americas portal is that region's remote option.
+    _atl_apac = json.dumps(_atl_full[1:] + [{
+        "id": 26850, "title": "Senior ML Engineer", "locations": ["Remote - Remote"],
+        "portalJobPost": {"portalUrl": "https://careers-apac-atlassian.icims.com/jobs/26850/x/job"}}])
+    r = with_fetch(lambda *a, **k: (200, _atl_apac),
+                   "https://www.atlassian.com/company/careers/details/26850")
+    check(r.get("location") == "Remote - APAC",
+          f"an APAC-portal bare remote entry must name its region: {r.get('location')}")
+
+    # Google careers: the posting lives in the page's ds:0 block, and Google answers 200
+    # for everything, so the block's own status decides.
+    GOOG = "https://www.google.com/about/careers/applications/jobs/results/121322999171652885-x"
+    def _goog_page(data):
+        return f"<html><script>AF_initDataCallback({{key: 'ds:0', hash: '1', data:{json.dumps(data)}, sideChannel: {{}}}});</script></html>"
+    _rec = ["121322999171652885", "Senior Software Engineer, GenAI", "u",
+            [None, "<ul><li>Build agentic prompts.</li></ul>"], [None, "<p>5 years.</p>"],
+            "p", None, "Google", "en-US", [["Irvine, CA, USA", ["addr"], "Irvine", "92612", "CA", "US"]],
+            [None, "<p>The US base salary range for this position is $174,000-$252,000.</p>"]]
+    r = with_fetch(lambda *a, **k: (200, _goog_page([_rec])), GOOG)
+    check(r.get("live") is True and r.get("location") == "Irvine, CA, USA" and r.get("pay"),
+          f"google: a ds:0 posting must resolve with location and pay: {r}")
+    r = with_fetch(lambda *a, **k: (200, _goog_page([5, None, [["ErrorDetails", ["cp.v1.e", 30]]]])), GOOG)
+    check(r.get("live") is False, f"google: API NOT_FOUND (code 5) is a closure: {r.get('live')}")
+    r = with_fetch(lambda *a, **k: (200, _goog_page([8, None, []])), GOOG)
+    check(r.get("live") is None, f"google: any other API error code is unknown: {r.get('live')}")
+    r = with_fetch(lambda *a, **k: (200, _goog_page([["999", "Other job"]])), GOOG)
+    check(r.get("live") is None, f"google: a record for a different id is unknown: {r.get('live')}")
+    r = with_fetch(lambda *a, **k: (200, "<html>WAF</html>"), GOOG)
+    check(r.get("live") is None, f"google: a page with no ds:0 block is unknown: {r.get('live')}")
+
+    # github.careers: absence closes a row only after the WHOLE board was read, measured
+    # against the count the board's first page states.
+    GH_URL = "https://www.github.careers/careers-home/jobs/5742"
+    def _gh_rows(ids):
+        return [{"data": {"req_id": str(i), "title": f"Role {i}"}} for i in ids]
+    def _gh_pages(pages, total):
+        def fake(url, *a, **k):
+            n = int(re.search(r"page=(\d+)", url).group(1))
+            rows = pages[n - 1] if n <= len(pages) else []
+            env = {"jobs": rows}
+            if total is not None:
+                env["totalCount"] = total
+            return 200, json.dumps(env)
+        return fake
+    r = with_fetch(_gh_pages([_gh_rows(range(5600, 5650)), _gh_rows(range(5650, 5673))], 73), GH_URL)
+    check(r.get("live") is False,
+          f"github: an id absent from a 73-of-73 read is closed: {r.get('live')} / {r.get('note')}")
+    r = with_fetch(_gh_pages([_gh_rows(range(5600, 5650))], 73), GH_URL)
+    check(r.get("live") is None,
+          f"github: a board serving 50 of the 73 it claims must not close a row: {r.get('live')}")
+    r = with_fetch(_gh_pages([_gh_rows(range(5600, 5623))], None), GH_URL)
+    check(r.get("live") is None,
+          f"github: with no stated count, an absence is not a closure: {r.get('live')}")
+    r = with_fetch(_gh_pages([_gh_rows([5742, 5743])], 2), GH_URL)
+    check(r.get("live") is True, f"github: a listed id still resolves live: {r.get('live')}")
 
     # ...and a well-formed 200 must still resolve, or the guard above has simply
     # broken every adapter into permanent silence, which no "unknown" verdict shows.

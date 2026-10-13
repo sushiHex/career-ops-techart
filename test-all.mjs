@@ -1773,6 +1773,22 @@ try {
     ['role', 'Senior AI Platform and Tools Engineer', 'senior ai platform and tools engineer'],
     ['role', 'Staff Software Engineer, DevEx - VALORANT (REQ-0645134)', 'staff software engineer devex valorant'],
     ['role', 'Staff Software Engineer, DevEx - VALORANT', 'staff software engineer devex valorant'],
+    // The tracker records a Greenhouse or Riot id as a BARE number; a board title
+    // carries none. Missing this form brought 33 tracked roles back as new.
+    ['role', 'Staff Software Engineer - Test Systems & Tooling (5349405250)', 'staff software engineer test systems and tooling'],
+    ['role', 'Technical Art Lead, Rigging - VALORANT, Agents (8102471)', 'technical art lead rigging valorant agents'],
+    // A parenthetical that CONTAINS an id goes whole, team label included.
+    ['role', 'Senior Technical Marketing Engineer - Content Specialist (Industrial Engineering, JR2878530)', 'senior technical marketing engineer content specialist'],
+    ['role', 'Lead Technical Artist (26WD145751)', 'lead technical artist'],
+    ['role', 'Principal Machine Learning Engineer (P711740)', 'principal machine learning engineer'],
+    // A facet suffix is part of the id, or it survives as a stray "1" in the key.
+    ['role', 'Senior Engineer - JR2292444-1', 'senior engineer'],
+    // A parenthetical WITHOUT an id is part of the title. The old `r` branch
+    // stripped any word starting with r, so these two collapsed into one key.
+    ['role', 'Technical Artist (Rigging)', 'technical artist rigging'],
+    ['role', 'Senior Software Engineer (Robotics)', 'senior software engineer robotics'],
+    // A short number in a title is not an id.
+    ['role', 'Senior Engineer, Team 2026 Launch (Year 3)', 'senior engineer team 2026 launch year 3'],
   ];
   for (const [kind, input, expected] of canonCases) {
     const got = kind === 'company' ? canonicalCompany(input) : canonicalRole(input);
@@ -3220,7 +3236,7 @@ try {
 // across a report-number/title change.
 console.log('\n🧪 Testing job-id authoritative dedup (merge + dedup)...');
 try {
-  const { extractJobId, roleFuzzyMatch } = await import(pathToFileURL(join(ROOT, 'role-matcher.mjs')).href);
+  const { extractJobId, roleFuzzyMatch, idSetsOverlap, idSetsConflict } = await import(pathToFileURL(join(ROOT, 'role-matcher.mjs')).href);
 
   // unit: extractJobId distinguishes the real-world URLs that were mis-merged
   const zSenior = extractJobId('https://zillow.wd5.myworkdayjobs.com/zillow_group_external/job/remote-usa/example-role-08_p747039');
@@ -3245,6 +3261,53 @@ try {
   } else {
     fail(`extractJobId mangled the separator form: staff=${sonyStaff} senior=${sonySenior}`);
   }
+  // Company-hosted boards whose ids the generic rules missed. github.careers writes a
+  // FOUR-digit id, so the Senior (5742) and Staff (5708) reqs of one team both came back
+  // null and dedup-tracker proposed deleting one as the other's duplicate.
+  const hosted = [
+    // github.careers and atlassian.com are front ends over iCIMS whose page id IS the
+    // iCIMS id, so all three spellings of one posting share one key.
+    ['https://www.github.careers/careers-home/jobs/5742', 'icims:5742'],
+    ['https://www.github.careers/careers-home/jobs/5742?lang=en-us', 'icims:5742'],
+    ['https://www.github.careers/careers-home/jobs/5708', 'icims:5708'],
+    ['https://careers-githubinc.icims.com/jobs/5708/login', 'icims:5708'],
+    ['https://globalcareers-githubinc.icims.com/jobs/15816/x/job', 'icims:15816'],
+    ['https://jobs.apple.com/en-us/details/275158197-0670/lead-developer-ai-workflows', 'apple:275158197'],
+    ['https://www.google.com/about/careers/applications/jobs/results/72710505838017443-software-engineer-iii', 'google:72710505838017443'],
+    // the same Google posting WITHOUT its title slug: the generic 7+ digit rule used to
+    // claim this spelling first and key it as id:, a different key for one posting.
+    ['https://www.google.com/about/careers/applications/jobs/results/72710505838017443', 'google:72710505838017443'],
+    ['https://jobs.ea.com/en_US/careers/JobDetail/Senior-Tools-Engineer-Apex-Legends/212777', 'ea:212777'],
+    ['https://www.atlassian.com/company/careers/details/26789', 'icims:26789'],
+    ['https://agbo.breezy.hr/p/f90b2472f4e5-expression-of-interest', 'breezy:f90b2472f4e5'],
+  ];
+  const hostedBad = hosted.filter(([u, want]) => extractJobId(u) !== want)
+    .map(([u, want]) => `${u} -> ${extractJobId(u)} (want ${want})`);
+  if (!hostedBad.length) pass(`extractJobId reads ${hosted.length} company-hosted id forms, query strings ignored`);
+  else fail(`extractJobId missed hosted ids: ${hostedBad.join('; ')}`);
+  // A host-anchored rule must not fire on a host it does not own: an Apple-shaped path on
+  // a tracker would otherwise hand two postings one id, and equal ids MERGE.
+  if (extractJobId('https://tracker.example.com/r/jobs.apple.com/en-us/details/275158197-0670/x') !== 'apple:275158197') {
+    pass('a hosted id rule does not fire on a URL that only mentions the host');
+  } else {
+    fail('a hosted id rule fired on a wrapper URL that merely mentions jobs.apple.com');
+  }
+
+  // A row's identity is a SET: one posting is recorded under different numbering systems
+  // (an Eightfold id in its URL, a JR id in its role cell). Rows sharing ANY
+  // id are one posting; rows conflict only when both have ids and share none.
+  {
+    const both = new Set(['id:790310000001', 'wd:jr10001']);
+    const jrOnly = new Set(['wd:jr10001']);
+    const other = new Set(['wd:jr10002']);
+    const none = new Set();
+    const ok = idSetsOverlap(both, jrOnly) && !idSetsConflict(both, jrOnly)
+      && idSetsConflict(both, other) && !idSetsOverlap(both, other)
+      && !idSetsConflict(both, none) && !idSetsConflict(none, none) && !idSetsOverlap(none, none);
+    if (ok) pass('identity sets: any shared id is one posting; disjoint non-empty sets conflict; empty is inconclusive');
+    else fail('identity set semantics wrong (overlap / conflict / empty)');
+  }
+
   // the facet suffix must still be stripped where it really is a facet
   if (extractJobId('https://zillow.wd5.myworkdayjobs.com/x/job/Remote-USA/Principal-MLE_P711740-2') === 'wd:p711740') {
     pass('extractJobId still strips a genuine Workday facet suffix (-2)');
@@ -3258,65 +3321,102 @@ try {
     pass('fuzzy no longer matches the distinct pair (extra safety layer)');
   }
 
-  // integration: merge-tracker must ADD a distinct-job-id role, not clobber the existing one
-  const jTmp = mkdtempSync(join(tmpdir(), 'career-ops-jobid-'));
-  try {
-    mkdirSync(join(jTmp, 'data'));
-    mkdirSync(join(jTmp, 'reports'));
-    const jAdds = join(jTmp, 'additions');
-    mkdirSync(jAdds);
-    const jTracker = join(jTmp, 'data', 'applications.md');
-    writeFileSync(jTracker,
-      '# Applications Tracker\n\n' +
-      '| # | Date | Company | Role | Score | Status | PDF | Report | Notes |\n' +
-      '|---|------|---------|------|-------|--------|-----|--------|-------|\n' +
-      '| 10 | 2026-07-05 | Zillow | Senior Machine Learning Engineer | 3.0/5 | Discarded | ❌ | [10](../reports/010-zillow-senior.md) | existing distinct role |\n');
-    writeFileSync(join(jTmp, 'reports', '010-zillow-senior.md'),
-      '**URL:** https://zillow.wd5.myworkdayjobs.com/zillow_group_external/job/remote-usa/example-role-08_p747039\n');
-    writeFileSync(join(jTmp, 'reports', '011-zillow-principal.md'),
-      '**URL:** https://zillow.wd5.myworkdayjobs.com/en-US/Zillow_Group_External/job/Remote-USA/Example-Role-04_P711740-2\n');
-    // distinct posting (higher score) whose title fuzzy-matches the existing row
-    writeFileSync(join(jAdds, '011-zillow.tsv'),
-      '11\t2026-07-16\tZillow\tPrincipal Machine Learning Engineer, Agentic AI\tEvaluated\t3.5/5\t❌\t[11](reports/011-zillow-principal.md)\tdistinct job id\n');
-
-    const jMerge = run(NODE, ['merge-tracker.mjs'], { env: { ...process.env, CAREER_OPS_TRACKER: jTracker, CAREER_OPS_ADDITIONS: jAdds } });
-    if (jMerge === null) {
-      fail('merge-tracker crashed during job-id dedup test');
-    } else {
-      const m = readFileSync(jTracker, 'utf-8');
-      if (m.includes('Senior Machine Learning Engineer') && m.includes('Principal Machine Learning Engineer, Agentic AI')) {
-        pass('merge-tracker keeps distinct-job-id roles separate (no clobber)');
-      } else {
-        fail('merge-tracker clobbered a distinct-job-id role via fuzzy title match');
-      }
+  // One merge-tracker fixture: a tracker holding `rows`, report files and TSV additions,
+  // merged in a temp dir. Returns the merged tracker text, or null if merge-tracker crashed.
+  const TRACKER_HEAD = '# Applications Tracker\n\n' +
+    '| # | Date | Company | Role | Score | Status | PDF | Report | Notes |\n' +
+    '|---|------|---------|------|-------|--------|-----|--------|-------|\n';
+  const mergeFixture = (prefix, { rows, reports = {}, tsvs = {} }) => {
+    const dir = mkdtempSync(join(tmpdir(), prefix));
+    try {
+      for (const d of ['data', 'reports', 'additions']) mkdirSync(join(dir, d));
+      const tracker = join(dir, 'data', 'applications.md');
+      writeFileSync(tracker, TRACKER_HEAD + rows.map(r => `${r}\n`).join(''));
+      for (const [f, body] of Object.entries(reports)) writeFileSync(join(dir, 'reports', f), `${body}\n`);
+      for (const [f, body] of Object.entries(tsvs)) writeFileSync(join(dir, 'additions', f), `${body}\n`);
+      const r = run(NODE, ['merge-tracker.mjs'], {
+        env: { ...process.env, CAREER_OPS_TRACKER: tracker, CAREER_OPS_ADDITIONS: join(dir, 'additions') },
+      });
+      return r === null ? null : readFileSync(tracker, 'utf-8');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
     }
-  } finally {
-    rmSync(jTmp, { recursive: true, force: true });
+  };
+
+  // integration: merge-tracker must ADD a distinct-job-id role, not clobber the existing one
+  {
+    const m = mergeFixture('career-ops-jobid-', {
+      rows: ['| 10 | 2026-07-05 | Zillow | Senior Machine Learning Engineer | 3.0/5 | Discarded | ❌ | [10](../reports/010-zillow-senior.md) | existing distinct role |'],
+      reports: {
+        '010-zillow-senior.md': '**URL:** https://zillow.wd5.myworkdayjobs.com/zillow_group_external/job/remote-usa/example-role-08_p747039',
+        '011-zillow-principal.md': '**URL:** https://zillow.wd5.myworkdayjobs.com/en-US/Zillow_Group_External/job/Remote-USA/Example-Role-04_P711740-2',
+      },
+      // distinct posting (higher score) whose title fuzzy-matches the existing row
+      tsvs: { '011-zillow.tsv': '11\t2026-07-16\tZillow\tPrincipal Machine Learning Engineer, Agentic AI\tEvaluated\t3.5/5\t❌\t[11](reports/011-zillow-principal.md)\tdistinct job id' },
+    });
+    if (m === null) fail('merge-tracker crashed during job-id dedup test');
+    else if (m.includes('Senior Machine Learning Engineer') && m.includes('Principal Machine Learning Engineer, Agentic AI')) {
+      pass('merge-tracker keeps distinct-job-id roles separate (no clobber)');
+    } else fail('merge-tracker clobbered a distinct-job-id role via fuzzy title match');
+  }
+
+  // integration: an id the report states BESIDE a bare careers host, or only in the
+  // row's role cell, is still an id. On 2026-10-08 a report reading "**URL:**
+  // https://<tenant>.wd5.myworkdayjobs.com/<site> (JR...)" yielded no id because only
+  // the first token of the line was read; with no id the row conflicted with nothing,
+  // and a new requisition whose title fuzzy-matched was merged over it.
+  for (const [label, existingUrlLine, existingRole] of [
+    ['an id beside a bare host on the URL line',
+     '**URL:** https://acme.wd5.myworkdayjobs.com/AcmeExternal (JR1000101)',
+     'Senior Machine Learning Engineer'],
+    ['an id only in the role cell',
+     '**URL:** https://acme.wd5.myworkdayjobs.com/AcmeExternal',
+     'Senior Machine Learning Engineer (JR1000101)'],
+  ]) {
+    const m = mergeFixture('career-ops-jobid-line-', {
+      rows: [`| 20 | 2026-07-08 | Acme | ${existingRole} | 2.0/5 | Discarded | ❌ | [20](../reports/020-acme-senior.md) | existing distinct req |`],
+      reports: {
+        '020-acme-senior.md': existingUrlLine,
+        '021-acme-mle.md': '**URL:** https://acme.wd5.myworkdayjobs.com/AcmeExternal/job/US-CA-Remote/Example-Role-21_JR1000202',
+      },
+      tsvs: { '021-acme.tsv': '21\t2026-10-08\tAcme\tMachine Learning Engineer (JR1000202)\tSKIP\t4.0/5\t❌\t[21](reports/021-acme-mle.md)\tdistinct req' },
+    }) || '';
+    if (m.includes('existing distinct req') && m.includes('Machine Learning Engineer (JR1000202)')) {
+      pass(`merge-tracker keeps a distinct req separate when the existing row's id is ${label}`);
+    } else fail(`merge-tracker merged a distinct req over a row whose id is ${label}`);
+  }
+
+  // integration: an addition whose REPORT number equals an existing row's ROW number at
+  // the same employer is not that row. The two sequences are independent, and a
+  // number-plus-company match that ran before the id guard would have folded the next
+  // evaluation into whichever row of that employer carried the number.
+  {
+    const m = mergeFixture('career-ops-rownum-', {
+      rows: ['| 31 | 2026-10-08 | Acme | Example Role Alpha (JR1000303) | 3.0/5 | SKIP | ❌ | [29](../reports/029-acme-alpha.md) | row 31, report 29 |'],
+      reports: {
+        '029-acme-alpha.md': '**URL:** https://acme.wd5.myworkdayjobs.com/AcmeExternal/job/US-CA-Remote/Example-Role-29_JR1000303',
+        '031-acme-beta.md': '**URL:** https://acme.wd5.myworkdayjobs.com/AcmeExternal/job/US-CA-Remote/Example-Role-31_JR1000404',
+      },
+      tsvs: { '031-acme.tsv': '31\t2026-10-09\tAcme\tExample Role Beta (JR1000404)\tEvaluated\t4.2/5\t❌\t[31](reports/031-acme-beta.md)\tnew req, report 31' },
+    }) || '';
+    if (m.includes('row 31, report 29') && m.includes('Example Role Beta (JR1000404)')) {
+      pass('merge-tracker does not pair an addition with a row by row number');
+    } else fail('merge-tracker folded a new req into the row that shares its number');
   }
 
   // integration: SAME job-id across a report-number + title change must UPDATE in place
-  const rTmp = mkdtempSync(join(tmpdir(), 'career-ops-jobid-repost-'));
-  try {
-    mkdirSync(join(rTmp, 'data'));
-    mkdirSync(join(rTmp, 'reports'));
-    const rAdds = join(rTmp, 'additions');
-    mkdirSync(rAdds);
-    const rTracker = join(rTmp, 'data', 'applications.md');
-    writeFileSync(rTracker,
-      '# Applications Tracker\n\n' +
-      '| # | Date | Company | Role | Score | Status | PDF | Report | Notes |\n' +
-      '|---|------|---------|------|-------|--------|-----|--------|-------|\n' +
-      '| 40 | 2026-07-05 | Acme | Data Engineer, Search | 3.2/5 | Evaluated | ❌ | [40](../reports/040-acme.md) | original |\n');
-    writeFileSync(join(rTmp, 'reports', '040-acme.md'), '**URL:** https://boards.greenhouse.io/acme/jobs/1194374\n');
-    writeFileSync(join(rTmp, 'reports', '041-acme.md'), '**URL:** https://boards.greenhouse.io/acme/jobs/1194374\n');
-    // same greenhouse job id, different report number and a retitle → should UPDATE #40, not add
-    writeFileSync(join(rAdds, '041-acme.tsv'),
-      '41\t2026-07-16\tAcme\tSenior Data Engineer, Discovery Search\tEvaluated\t4.0/5\t❌\t[41](reports/041-acme.md)\tsame job reposted\n');
-    const rMerge = run(NODE, ['merge-tracker.mjs'], { env: { ...process.env, CAREER_OPS_TRACKER: rTracker, CAREER_OPS_ADDITIONS: rAdds } });
-    if (rMerge === null) {
-      fail('merge-tracker crashed during same-job-id repost test');
-    } else {
-      const m = readFileSync(rTracker, 'utf-8');
+  {
+    const m = mergeFixture('career-ops-jobid-repost-', {
+      rows: ['| 40 | 2026-07-05 | Acme | Data Engineer, Search | 3.2/5 | Evaluated | ❌ | [40](../reports/040-acme.md) | original |'],
+      reports: {
+        '040-acme.md': '**URL:** https://boards.greenhouse.io/acme/jobs/1194374',
+        '041-acme.md': '**URL:** https://boards.greenhouse.io/acme/jobs/1194374',
+      },
+      // same greenhouse job id, different report number and a retitle -> should UPDATE #40, not add
+      tsvs: { '041-acme.tsv': '41\t2026-07-16\tAcme\tSenior Data Engineer, Discovery Search\tEvaluated\t4.0/5\t❌\t[41](reports/041-acme.md)\tsame job reposted' },
+    });
+    if (m === null) fail('merge-tracker crashed during same-job-id repost test');
+    else {
       const rows = m.split('\n').filter(l => /^\|\s*\d+\s*\|/.test(l) && l.includes('Acme'));
       if (rows.length === 1 && rows[0].includes('4.0/5')) {
         pass('merge-tracker updates same-job-id repost in place across a report-number change');
@@ -3324,8 +3424,6 @@ try {
         fail(`same-job-id repost handling broken: ${rows.length} Acme rows (expected 1 at 4.0/5)`);
       }
     }
-  } finally {
-    rmSync(rTmp, { recursive: true, force: true });
   }
 } catch (e) {
   fail(`job-id authoritative dedup tests crashed: ${e.message}`);
@@ -5220,6 +5318,19 @@ try {
       pass('eval-write: a confirmed-live packet still writes its report');
     } else {
       fail(`eval-write refused a live:true packet (exit ${ok.code}): ${ok.out.trim().slice(0, 250)}`);
+    }
+
+    // An Ashby posting id is a UUID whose last group is often all digits; it is not a
+    // requisition, and labelling the role cell with it put a fake id in the tracker.
+    mkdirSync(join(liveTmp, 'batch', 'tracker-additions'), { recursive: true });
+    runWrite([packet('uuid.json', { slug: 'gate-uuid', title: 'Staff Platform Engineer',
+      url: 'https://jobs.ashbyhq.com/acme/a8581363-d348-ab0a-17b6-ee50cfa58aee' }), '--date=2026-09-19']);
+    const tsvDir = join(liveTmp, 'batch', 'tracker-additions');
+    const tsv = readdirSync(tsvDir).map(f => readFileSync(join(tsvDir, f), 'utf-8')).join('\n');
+    if (tsv.includes('Staff Platform Engineer') && !tsv.includes('113241621221')) {
+      pass('eval-write: an Ashby UUID does not become a requisition label in the role cell');
+    } else {
+      fail(`eval-write labelled a role with a UUID fragment: ${tsv.slice(0, 250)}`);
     }
   } finally {
     rmSync(liveTmp, { recursive: true, force: true });

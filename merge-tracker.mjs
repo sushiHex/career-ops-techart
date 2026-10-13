@@ -21,7 +21,7 @@ import { execFileSync } from 'child_process';
 import { createHash, randomUUID } from 'crypto';
 import { tmpdir } from 'os';
 import { normalizeReportLink as normalizeLink } from './tracker-links.mjs';
-import { roleFuzzyMatch, jobIdsConflict, jobIdFromReportField } from './role-matcher.mjs';
+import { roleFuzzyMatch, rowIdReader, idSetsOverlap, idSetsConflict } from './role-matcher.mjs';
 import { guardArgs } from './cli-guard.mjs';
 
 const CAREER_OPS = dirname(fileURLToPath(import.meta.url));
@@ -417,21 +417,8 @@ function extractReportNum(reportStr) {
   return m ? parseInt(m[1]) : null;
 }
 
-// Cache of report-file path → posting URL so the merge loop reads each report
-// at most once while resolving job ids for dedup. Shared implementation lives
-// in role-matcher.mjs (also used by dedup-tracker.mjs) so the report-read +
-// URL-extraction logic exists in exactly one place.
-const reportUrlCache = new Map();
-
-/**
- * Resolve the authoritative job id for a tracker row/addition via its report.
- *
- * @param {string} reportField - Markdown report cell.
- * @returns {string|null} Namespaced job id, or null when it cannot be resolved.
- */
-function jobIdForReport(reportField) {
-  return jobIdFromReportField(reportField, TRACKER_DIR, reportUrlCache);
-}
+// A row's identity SET (role-matcher.mjs rowIdReader), memoised for this run.
+const jobIdsForRow = rowIdReader(TRACKER_DIR);
 
 /**
  * Parse a score cell into a numeric value for score-upgrade decisions.
@@ -724,9 +711,13 @@ for (const file of tsvFiles) {
   addition.report = normalizeReportLink(addition.report);
 
   // Check for duplicate by:
-  // 1. Exact report number match
-  // 2. Company + role fuzzy match
+  // 1. The same report link, at the same company
+  // 2. Posting identity (shared requisition ids), at the same company
+  // 3. A fuzzy title match, never across conflicting ids
+  // Deliberately NOT by row number: the TSV num is the report number, an independent
+  // sequence, so that match folded unrelated reqs together (test-all pins it).
   const reportNum = extractReportNum(addition.report);
+  const normCompany = normalizeCompany(addition.company);
   let duplicate = null;
 
   if (reportNum) {
@@ -735,7 +726,6 @@ for (const file of tsvFiles) {
     // appearing for two different companies is sequence drift, not a duplicate.
     // Without the company guard, a NewCo TSV with report [1] silently overwrites
     // the existing tracker row [1] belonging to an unrelated company.
-    const normCompany = normalizeCompany(addition.company);
     duplicate = existingApps.find(app => {
       const existingReportNum = extractReportNum(app.report);
       return existingReportNum === reportNum && normalizeCompany(app.company) === normCompany;
@@ -743,37 +733,22 @@ for (const file of tsvFiles) {
   }
 
   if (!duplicate) {
-    // Exact entry number match — but only when the company also matches.
-    // The TSV `num` doubles as the tracker row id, yet report-file numbering
-    // and tracker-row numbering can drift out of sync (e.g. reports maxed at
-    // 067 while the tracker was already at #69). A bare num collision across
-    // *different* companies is that drift, not a duplicate — matching on num
-    // alone silently merges a brand-new role into an unrelated existing row.
-    const normCompany = normalizeCompany(addition.company);
-    duplicate = existingApps.find(app =>
-      app.num === addition.num && normalizeCompany(app.company) === normCompany
-    );
-  }
-
-  if (!duplicate) {
-    // Company match, then posting identity. The report URL's job id is the
-    // authoritative signal: two rows are the same opening iff their job ids
-    // match (regardless of title wording), and are provably DISTINCT when their
-    // ids differ. Fuzzy title matching collapses sibling roles that share a
+    // Company match, then posting identity. Rows sharing a requisition id are the same
+    // opening whatever their titles say, and rows whose ids are all different are
+    // provably DISTINCT. Fuzzy title matching collapses sibling roles that share a
     // domain but differ in specialty/seniority (e.g. "Principal ML Engineer,
     // Agentic AI" vs "Senior ML Engineer"), so it is used only as a fallback and
-    // is never allowed to merge a pair whose job ids conflict.
-    const normCompany = normalizeCompany(addition.company);
+    // is never allowed to merge a pair whose ids conflict.
     const sameCompany = existingApps.filter(app => normalizeCompany(app.company) === normCompany);
-    const additionJobId = jobIdForReport(addition.report);
+    const additionIds = jobIdsForRow(addition);
 
-    if (additionJobId) {
-      duplicate = sameCompany.find(app => jobIdForReport(app.report) === additionJobId) || null;
+    if (additionIds.size) {
+      duplicate = sameCompany.find(app => idSetsOverlap(jobIdsForRow(app), additionIds)) || null;
     }
     if (!duplicate) {
       duplicate = sameCompany.find(app =>
         roleFuzzyMatch(addition.role, app.role) &&
-        !jobIdsConflict(additionJobId, jobIdForReport(app.report))
+        !idSetsConflict(additionIds, jobIdsForRow(app))
       ) || null;
     }
   }
