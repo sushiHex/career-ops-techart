@@ -24,6 +24,8 @@ import { readFileSync, writeFileSync, existsSync, copyFileSync } from 'fs';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 import { REQ_ID_SRC, REQ_ID, canonId, reqIdGlobal } from './req-id-core.mjs';
+import { trackerRows } from './tracker-rows.mjs';
+import { guardArgs } from './cli-guard.mjs';
 
 // WHAT this ranker rewards and penalises is DATA: config/lane-vocab.json, written by
 // `node setup.mjs` from a preset in presets/lanes/, and read by scripts/_lane.py too. With
@@ -89,19 +91,27 @@ export function configureRanker(v) {
 configureRanker(loadLaneVocab(process.argv.includes('--selftest')
   ? join(LANE_PRESETS, 'general.json') : undefined));
 
-const args = new Set(process.argv.slice(2));
+const args = guardArgs({
+  name: 'pipeline-audit.mjs',
+  summary: 'report what is genuinely pending in data/pipeline.md',
+  flags: [
+    ['--prune', 'mark duplicate and already-evaluated rows as [x] (backs up first)'],
+    ['--dispositions <file>', 'with --prune, also retire the rows a JSON dispositions file names'],
+    ['--verbose', 'list every duplicate group and evaluated match'],
+    ['--rank', 'rank the pending rows by title for triage'],
+    ['--min <score>', 'with --rank, lowest score shown (default 6, or 0 with no positive lanes)'],
+    ['--max <score>', 'with --rank, show only scores below this'],
+    ['--json', 'with --rank, print the ranked rows as JSON'],
+    ['--print-config', 'print the config directory and lane preset in use, then exit'],
+    ['--selftest', 'run the built-in checks and exit'],
+  ],
+  notes: 'Reports only by default. Nothing is written without --prune.',
+  writesByDefault: false,
+});
 // Where this run reads its vocabulary from, and which preset that is. The rest of the
 // file runs on import, so a test asks here rather than importing the module.
 if (args.has('--print-config')) {
   console.log(`${CONFIG_DIR}\n${LANE_VOCAB._preset?.name ?? ''}`);
-  process.exit(0);
-}
-if (args.has('--help') || args.has('-h')) {
-  console.log(`pipeline-audit.mjs — report what is genuinely pending in data/pipeline.md
-
-  (no flags)   report only, writes nothing
-  --prune      mark duplicate and already-evaluated rows as [x] (backs up first)
-  --verbose    list every duplicate group and evaluated match`);
   process.exit(0);
 }
 const PRUNE = args.has('--prune');
@@ -555,17 +565,14 @@ const TRACKER = 'data/applications.md';
  */
 export function parsePrior(lines) {
   const m = new Map();
-  for (const line of lines) {
-    if (!line.startsWith('|')) continue;
-    const c = line.split('|').map((x) => x.trim());
-    if (c.length < 7) continue;
-    const score = parseFloat(c[5]);
-    const key = normCo(c[3]);
+  for (const row of trackerRows(lines)) {
+    const score = parseFloat(row.score);
+    const key = normCo(row.company);
     if (!Number.isFinite(score) || !key) continue;
     const e = m.get(key) || { n: 0, best: 0, skips: 0 };
     e.n += 1;
     e.best = Math.max(e.best, score);
-    if (/SKIP|Discarded/i.test(c[6])) e.skips += 1;
+    if (/SKIP|Discarded/i.test(row.status)) e.skips += 1;
     m.set(key, e);
   }
   return m;
@@ -786,7 +793,6 @@ for (const f of [PIPE, APPS]) {
 }
 
 // --- what is already evaluated ---------------------------------------------
-const appLines = readFileSync(APPS, 'utf8').split('\n').filter(l => l.startsWith('|'));
 const evaluatedKeys = new Set();
 /** "<id>@<company>" for ids that need a company to mean anything. See AMBIGUOUS_ID. */
 const evaluatedAmbig = new Set();
@@ -822,16 +828,13 @@ function tokenMatch(co, role) {
   }
   return false;
 }
-for (const l of appLines) {
-  const cells = l.split('|').map(s => s.trim());
-  if (cells.length < 5) continue;
-  const [, , , company, role] = cells;
-  if (!company || company === 'Company') continue;
+for (const { company, role, raw } of trackerRows(readFileSync(APPS, 'utf8').split('\n'))) {
+  if (!company) continue;
   // The whole line is scanned on purpose: the req id lives in the role cell for
   // some rows and in the report-link slug for others. A tracker row names no
   // Workday tenant, so an ambiguous id is joined on the COMPANY instead, which
   // is the only disambiguator this side has.
-  for (const m of l.matchAll(reqIdGlobal())) {
+  for (const m of raw.matchAll(reqIdGlobal())) {
     const id = canonId(m[1]);
     if (AMBIGUOUS_ID.test(id)) evaluatedAmbig.add(`${id}@${normCo(company)}`);
     else evaluatedKeys.add(`wd:${id}`);
@@ -932,11 +935,8 @@ if (RANK) {
   // Threshold is a knob, not a truth. 6 is where the obvious lane matches sit;
   // lowering it trades precision for recall, which is the right trade once the
   // top tier is worked. --max lets a tier be worked without re-doing the one above.
-  const argOf = (flag, dflt) => {
-    const a = process.argv.find(x => x.startsWith(flag + '='));
-    return a ? Number(a.split('=')[1]) : dflt;
-  };
-  const MIN = argOf('--min', defaultRankMin()), MAX = argOf('--max', Infinity);
+  const MIN = Number(args.value('--min') ?? defaultRankMin());
+  const MAX = Number(args.value('--max') ?? Infinity);
   const worth = ranked.filter(r => r.score >= MIN && r.score < MAX);
   if (args.has('--json')) {
     console.log(JSON.stringify(worth.map(r => ({
@@ -980,9 +980,8 @@ for (const [r, why] of done) resolve.set(r.i, why);
 // to record that, so every future triage resolved and rejected it again. Feeding
 // dispositions back in is what stops the queue from being permanent.
 // Format: [{"url": "...", "disposition": "closed | non-US | Bay Area | ..."}]
-const dispArg = process.argv.find(a => a.startsWith('--dispositions='));
-if (dispArg) {
-  const path = dispArg.split('=').slice(1).join('=');
+const path = args.value('--dispositions');
+if (path !== undefined) {
   if (!existsSync(path)) {
     console.error(`dispositions file not found: ${path}`);
     process.exit(1);

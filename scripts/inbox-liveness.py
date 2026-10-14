@@ -22,6 +22,7 @@ prune is destructive in the direction that hides work.
 """
 import argparse
 import collections
+import concurrent.futures
 import importlib.util
 import io
 import json
@@ -29,6 +30,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -38,6 +40,11 @@ if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
 _MODULES = {}
+_MODULES_LOCK = threading.Lock()
+# Boards and unsettled rows are read on a pool this size, results kept in input order. Small
+# on purpose: most boards are different hosts, and a cap keeps any one ATS from seeing more
+# than a handful of requests at once.
+WORKERS = 8
 
 
 def module(name, filename):
@@ -45,15 +52,23 @@ def module(name, filename):
     identifier, so these cannot be plain imports; `scripts/` is already on sys.path above,
     which the loaded modules need for their own `from _httpctx import ...` lines.
 
-    Lazy on purpose: a run that is greenhouse and lever only needs neither of them, and
-    each pulls in three further modules.
+    Locked, because the first call can come from a worker thread, and two threads loading
+    one module would each get their own copy of its caches.
     """
-    if name not in _MODULES:
-        spec = importlib.util.spec_from_file_location(name, os.path.join(HERE, filename))
-        m = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(m)
-        _MODULES[name] = m
-    return _MODULES[name]
+    with _MODULES_LOCK:
+        if name not in _MODULES:
+            spec = importlib.util.spec_from_file_location(name, os.path.join(HERE, filename))
+            m = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(m)
+            _MODULES[name] = m
+        return _MODULES[name]
+
+
+def in_order(fn, items):
+    """fn over items on the worker pool, yielded in INPUT order as each becomes ready, so
+    what is printed and returned is the same as a one-at-a-time run."""
+    with concurrent.futures.ThreadPoolExecutor(max_workers=WORKERS) as pool:
+        yield from pool.map(fn, items)
 
 
 def workday():
@@ -160,15 +175,6 @@ def locale_only():
     copy of it survives here.
     """
     return resolver().WD_LOCALE_ONLY
-# Workday requisition ids the SHARED pattern does not cover, because they carry no prefix
-# at all. Disney's are bare 8-digit numbers (`..._10414222`) and 684 of 684 postings on its
-# board use that form, 132 of them with the trailing facet suffix Autodesk also writes.
-#
-# A bare number is not a requisition id anywhere else in this toolchain, deliberately: it
-# is ambiguous. It is unambiguous HERE because its position is fixed by the Workday posting
-# path and the comparison is scoped to one tenant's board, which is the same rule that lets
-# a bare `R#####` be a key once a tenant pins it down.
-WD_BARE_ID = re.compile(r"_(\d{6,})(?:-\d+)?(?:[?/#]|$)")
 # The requisition pattern is NOT restated here. It was, for about twenty minutes, and that
 # would have been the fifth spelling of it in this repo: the four previous ones each drifted
 # silently and each cost live rows (Autodesk's 26WD form missing here, six digits demanded
@@ -201,8 +207,14 @@ READABLE_HOST = re.compile(
 
 
 def resolver():
-    """scripts/req-resolve.py, for its portals.yml lookup and its per-row resolve()."""
-    return module("reqresolve", "req-resolve.py")
+    """scripts/req-resolve.py, for its portals.yml lookup and its per-row resolve().
+
+    The instance eval-prep already loaded for workday-sweep, not a second one. Loading it
+    again here gave the process two resolvers with two board caches and two portals.yml
+    parses, so a board one read had downloaded was downloaded again by the other, and a
+    selftest patch on one never reached the other.
+    """
+    return workday()._prep.rr
 
 
 def portal_slugs(url):
@@ -236,12 +248,8 @@ def workday_req(path):
     membership test go through here, which is the point: the inbox URL and the board's
     externalPath have to be read by the same rule or the comparison is meaningless.
     """
-    w = workday()
-    m = w.REQ_ID.search(path or "")
-    if m:
-        return w.canon_req(m.group(0))
-    m = WD_BARE_ID.search(path or "")
-    return m.group(1) if m else None
+    rid = resolver().workday_req(path)
+    return workday().canon_req(rid) if rid else None
 
 
 def wraps_another_url(url):
@@ -447,8 +455,9 @@ def sweep(quiet=False):
         r["why"] = ("no requisition id in the url" if READABLE_HOST.search(r["url"] or "")
                     else "no board reader for this host")
     live, closed, unknown = [], [], list(unroutable)
-    for (prov, slug), group in sorted(by_board.items()):
-        ids, ok = fetch_board(prov, slug)
+    boards = sorted(by_board.items())
+    reads = in_order(lambda board: fetch_board(*board[0]), boards)
+    for ((prov, slug), group), (ids, ok) in zip(boards, reads):
         if not ok:
             for r in group:
                 r["why"] = f"board {prov}/{slug} would not load"
@@ -458,10 +467,11 @@ def sweep(quiet=False):
                 print(f"  {prov}/{slug[:26]:28s} BOARD NOT READ, {len(group)} row(s) "
                       f"stay unknown", file=sys.stderr)
             continue
-        if not ids:
-            # A board that parsed but holds nothing would mark every one of its rows
-            # closed in a single step. That is exactly the shape of a silent false
-            # negative, so it is reported and never auto-marked.
+        # The resolver's one absence rule decides whether a missing id here is evidence. A
+        # board that parsed but holds nothing would mark every one of its rows closed in a
+        # single step, which is exactly the shape of a silent false negative, so it is
+        # reported and never auto-marked.
+        if resolver().board_absence(prov, len(ids))["live"] is None:
             for r in group:
                 r["why"] = f"board {prov}/{slug} parsed but is empty"
                 r["held"] = True
@@ -524,7 +534,10 @@ def settle_unknowns(unknown, quiet=False):
         return unknown, [], []
     rr = resolver()
     still, alive, closed = [], [], []
-    for r in unknown:
+
+    def settle(r):
+        """(bucket, why) for one row, `why` None to keep the reason it arrived with. Pure,
+        so rows can be asked on the pool and applied in order below."""
         # classify() above routes on the outer url; this did not, and handed the raw
         # wrapper straight to resolve(), whose adapter patterns search the whole string.
         # An Ashby or Lever posting sitting in a redirect parameter would then be resolved
@@ -533,28 +546,26 @@ def settle_unknowns(unknown, quiet=False):
         # unwrapped: the embedded row is somebody else's and guessing which is not this
         # tool's job.
         if wraps_another_url(r["url"]):
-            r["why"] = "the url wraps another posting's url, so it cannot be resolved here"
-            still.append(r)
-            continue
+            return still, "the url wraps another posting's url, so it cannot be resolved here"
         # A board read this file already refused to trust. Re-asking it here reaches the
         # same board by a route that can close, which is the guard being undone by its own
         # fallback. The `why` it arrived with is kept, since it is the more specific
         # reason and the one a human needs.
         if r.get("held"):
-            still.append(r)
-            continue
+            return still, None
         try:
             verdict = rr.resolve(r["url"]) or {}
         except Exception:
             verdict = {}
         live = verdict.get("live")
         if live is False:
-            r["why"] = verdict.get("note") or "the posting URL itself reports it is gone"
-            closed.append(r)
-        elif live is True:
-            alive.append(r)
-        else:
-            still.append(r)
+            return closed, verdict.get("note") or "the posting URL itself reports it is gone"
+        return (alive if live is True else still), None
+
+    for r, (bucket, why) in zip(unknown, in_order(settle, unknown)):
+        if why:
+            r["why"] = why
+        bucket.append(r)
     if not quiet:
         print(f"  last resort: {len(closed)} closed and {len(alive)} live of "
               f"{len(unknown)} unsettled row(s), asked one at a time", file=sys.stderr)

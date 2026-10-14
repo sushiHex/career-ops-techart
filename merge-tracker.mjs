@@ -23,7 +23,7 @@ import { createHash, randomUUID } from 'crypto';
 import { tmpdir } from 'os';
 import { normalizeReportLink as normalizeLink } from './tracker-links.mjs';
 import { roleFuzzyMatch, rowIdReader, idSetsOverlap, idSetsConflict, companyKey } from './role-matcher.mjs';
-import { columnsOf, isSeparatorRow, parseRow, parseScore, reportNumOf, SCORE_CELL, trackerPath } from './tracker-rows.mjs';
+import { buildRow, columnsOf, isSeparatorRow, parseRow, parseScore, reportNumOf, SCORE_CELL, trackerPath, trackerRows } from './tracker-rows.mjs';
 import { guardArgs } from './cli-guard.mjs';
 
 const CAREER_OPS = dirname(fileURLToPath(import.meta.url));
@@ -42,7 +42,6 @@ const args = guardArgs({
     ['--verify', 'check the tracker without merging'],
     ['--migrate', 'rewrite existing report links relative to the tracker file'],
   ],
-  positional: false,
   notes: 'Without --dry-run this REWRITES data/applications.md. A backup is written to applications.md.bak.',
 });
 const DRY_RUN = args.has('--dry-run');
@@ -386,21 +385,6 @@ function validateStatus(status) {
 // A row's identity SET (role-matcher.mjs rowIdReader), memoised for this run.
 const jobIdsForRow = rowIdReader(TRACKER_DIR);
 
-// Build a tracker row string matching the detected layout (with or without the
-// optional Location column) so writes round-trip through the same schema.
-function buildRow(o) {
-  if (COLMAP.location != null) {
-    return `| ${o.num} | ${o.date} | ${o.company} | ${o.role} | ${o.location || '—'} | ${o.score} | ${o.status} | ${o.pdf} | ${o.report} | ${o.notes} |`;
-  }
-  return `| ${o.num} | ${o.date} | ${o.company} | ${o.role} | ${o.score} | ${o.status} | ${o.pdf} | ${o.report} | ${o.notes} |`;
-}
-
-/** A tracker data row, or null; row #0 is never an application. */
-function parseAppLine(line) {
-  const row = parseRow(line, COLMAP);
-  return row && row.num !== 0 ? row : null;
-}
-
 const TSV_STATUS = /^(evaluated|applied|responded|interview|offer|rejected|discarded|skip|evaluada|aplicado|respondido|entrevista|oferta|rechazado|descartado|no aplicar|cerrada|duplicado|repost|condicional|hold|monitor)/i;
 
 /**
@@ -521,20 +505,12 @@ const appLines = appContent.split('\n');
 // parses and writes as correctly as the original layout.
 const COLMAP = columnsOf(appLines);
 if (COLMAP.location != null) console.log('🧭 Detected Location column.');
-const existingApps = [];
+// Each row carries its line index (row.line): rows are only rewritten in place
+// during the loop below, and new rows are inserted after it, so the index stays
+// valid for the whole run. Row #0 is never an application.
+const existingApps = trackerRows(appLines, COLMAP).filter(app => app.num !== 0);
 let maxNum = 0;
-
-// A separator row parses as null (its number cell is dashes), so only the header
-// test is needed here; tracker-rows.isSeparatorRow says why `includes('---')` was wrong.
-for (const line of appLines) {
-  if (line.startsWith('|')) {
-    const app = parseAppLine(line);
-    if (app) {
-      existingApps.push(app);
-      if (app.num > maxNum) maxNum = app.num;
-    }
-  }
-}
+for (const app of existingApps) if (app.num > maxNum) maxNum = app.num;
 
 console.log(`📊 Existing: ${existingApps.length} entries, max #${maxNum}`);
 
@@ -629,18 +605,20 @@ for (const file of tsvFiles) {
 
     if (newScore > oldScore) {
       console.log(`🔄 Update: #${duplicate.num} ${addition.company} — ${addition.role} (${oldScore}→${newScore})`);
-      const lineIdx = appLines.indexOf(duplicate.raw);
-      if (lineIdx >= 0) {
-        const updatedLine = buildRow({
-          num: duplicate.num, date: addition.date, company: addition.company, role: addition.role,
-          location: addition.location || duplicate.location || '—',
-          score: addition.score, status: duplicate.status, pdf: duplicate.pdf,
-          report: addition.report,
-          notes: `Re-eval ${addition.date} (${oldScore}→${newScore}). ${addition.notes}`,
-        });
-        appLines[lineIdx] = updatedLine;
-        updated++;
-      }
+      const updatedLine = buildRow({
+        num: duplicate.num, date: addition.date, company: addition.company, role: addition.role,
+        location: addition.location || duplicate.location || '—',
+        score: addition.score, status: duplicate.status, pdf: duplicate.pdf,
+        report: addition.report,
+        notes: `Re-eval ${addition.date} (${oldScore}→${newScore}). ${addition.notes}`,
+      }, COLMAP);
+      appLines[duplicate.line] = updatedLine;
+      // Refresh the stored row, so a later addition in this run compares against
+      // (and rewrites) what is now on that line rather than what was read at start.
+      // Looking the line up by its old raw text found nothing after the first write,
+      // and the second update was logged and silently dropped.
+      Object.assign(duplicate, parseRow(updatedLine, COLMAP));
+      updated++;
     } else {
       console.log(`⏭️  Skip: ${addition.company} — ${addition.role} (existing #${duplicate.num} ${oldScore} >= new ${newScore})`);
       skipped++;
@@ -655,7 +633,7 @@ for (const file of tsvFiles) {
       location: addition.location || '—',
       score: addition.score, status: addition.status, pdf: addition.pdf,
       report: addition.report, notes: addition.notes,
-    });
+    }, COLMAP);
     newLines.push(newLine);
     added++;
     console.log(`➕ Add #${entryNum}: ${addition.company} — ${addition.role} (${addition.score})`);

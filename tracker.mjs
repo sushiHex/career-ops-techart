@@ -39,7 +39,7 @@ import { dirname, resolve } from 'path';
 import { pathToFileURL } from 'url';
 import yaml from 'js-yaml';
 
-import { isMain } from './cli-guard.mjs';
+import { guardArgs, isMain } from './cli-guard.mjs';
 
 const MD_PATH = process.env.CAREER_OPS_TRACKER || 'data/applications.md';
 const DB_PATH = process.env.CAREER_OPS_TRACKER_DB
@@ -293,7 +293,7 @@ async function sync(args) {
   }
   const states = loadStates();
 
-  if (args.includes('--check')) {
+  if (args.has('--check')) {
     const { apps, diag } = parseTracker(states);
     console.error(`Parsed ${apps.length} data rows from ${MD_PATH}`);
     const issues = reportDiagnostics(diag);
@@ -323,13 +323,6 @@ function ensureFresh(db, states) {
 
 // ── Query helpers ───────────────────────────────────────────────────
 
-function flagValue(args, flag) {
-  const idx = args.indexOf(flag);
-  if (idx !== -1 && args[idx + 1] !== undefined && !args[idx + 1].startsWith('--')) return args[idx + 1];
-  const kv = args.find(a => a.startsWith(flag + '='));
-  return kv ? kv.split('=').slice(1).join('=') : null;
-}
-
 function rowToMarkdown(r) {
   const clean = (v) => String(v ?? '').replace(/\|/g, '│').replace(/\r?\n/g, ' ');
   return `| ${r.id} | ${clean(r.date)} | ${clean(r.company)} | ${clean(r.role)} | ${clean(r.score)} | ${clean(r.status)} | ${clean(r.pdf)} | ${clean(r.report)} | ${clean(r.notes)} |`;
@@ -343,31 +336,31 @@ async function query(args) {
 
   const where = [];
   const params = [];
-  const status = flagValue(args, '--status');
+  const status = args.value('--status');
   if (status) {
     const canonical = normalizeStatus(status, states);
     if (!canonical) { console.error(`Error: unknown status "${status}". Canonical: ${states.labels.join(', ')}`); process.exit(1); }
     where.push('status = ?'); params.push(canonical);
   }
-  const company = flagValue(args, '--company');
+  const company = args.value('--company');
   if (company) { where.push('company LIKE ?'); params.push(`%${company}%`); }
-  const role = flagValue(args, '--role');
+  const role = args.value('--role');
   if (role) { where.push('role LIKE ?'); params.push(`%${role}%`); }
-  const since = flagValue(args, '--since');
+  const since = args.value('--since');
   if (since) {
     if (!DATE_RE.test(since)) { console.error('Error: --since must be YYYY-MM-DD'); process.exit(1); }
     where.push('date >= ?'); params.push(since);
   }
-  const id = flagValue(args, '--id');
+  const id = args.value('--id');
   if (id) { where.push('id = ?'); params.push(parseInt(id, 10)); }
 
   let sql = 'SELECT id, date, company, role, score, status, pdf, report, notes FROM applications'
     + (where.length ? ' WHERE ' + where.join(' AND ') : '') + ' ORDER BY id DESC';
-  const limit = parseInt(flagValue(args, '--limit') || '0', 10);
+  const limit = parseInt(args.value('--limit') || '0', 10);
   if (limit > 0) { sql += ' LIMIT ?'; params.push(limit); }
 
   const rows = db.prepare(sql).all(...params);
-  if (args.includes('--json')) {
+  if (args.has('--json')) {
     console.log(JSON.stringify(rows, null, 2));
   } else {
     console.log(HEADER);
@@ -381,7 +374,7 @@ async function history(args) {
   const DatabaseSync = await loadSqlite();
   const db = openDb(DatabaseSync);
   ensureFresh(db, loadStates());
-  const id = parseInt(flagValue(args, '--id') || '', 10);
+  const id = parseInt(args.value('--id') || '', 10);
   if (!Number.isInteger(id)) { console.error('Error: history requires --id N'); process.exit(1); }
   const app = db.prepare('SELECT * FROM applications WHERE id = ?').get(id);
   if (!app) { console.error(`Error: no application with id ${id}`); process.exit(1); }
@@ -411,7 +404,7 @@ async function exportMd(args) {
     '',
   ].join('\n');
 
-  const outPath = flagValue(args, '--out');
+  const outPath = args.value('--out');
   if (!outPath) {
     process.stdout.write(out);
     return;
@@ -432,17 +425,32 @@ async function exportMd(args) {
 
 // ── Main ────────────────────────────────────────────────────────────
 
-const COMMANDS = { sync, query, history, export: exportMd };
+const COMMANDS = {
+  sync: [sync, '(re)build applications.db from applications.md', [
+    ['--check', 'diagnose only, write no index; exit 1 if issues are found']]],
+  query: [query, 'read rows through the index (resyncs it first when stale)', [
+    ['--status <status>', 'canonical status, e.g. Applied'],
+    ['--company <text>', 'company contains this'],
+    ['--role <text>', 'role contains this'],
+    ['--since <YYYY-MM-DD>', 'dated on or after this'],
+    ['--id <N>', 'one row by number'],
+    ['--limit <N>', 'at most N rows'],
+    ['--json', 'print JSON instead of a markdown table']]],
+  history: [history, 'status transitions observed across syncs for one row', [
+    ['--id <N>', 'the row (required)']]],
+  export: [exportMd, 'render the index back to canonical markdown (stdout by default)', [
+    ['--out <file>', 'write to this file instead, backing up any existing one']]],
+};
 
 async function main() {
-  const [command, ...args] = process.argv.slice(2);
-  const fn = COMMANDS[command];
-  if (!fn) {
+  const [command, ...argv] = process.argv.slice(2);
+  if (!Object.hasOwn(COMMANDS, command ?? '')) {
     console.log('Usage: node tracker.mjs <sync|query|history|export> [flags]');
     console.log('See the header comment of this file for examples, or docs/SCRIPTS.md.');
     process.exit(command ? 1 : 0);
   }
-  await fn(args);
+  const [fn, summary, flags] = COMMANDS[command];
+  await fn(guardArgs({ name: `tracker.mjs ${command}`, summary, flags, argv }));
 }
 
 if (isMain(import.meta.url)) {

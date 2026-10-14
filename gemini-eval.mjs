@@ -33,6 +33,7 @@ import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { execFileSync } from 'child_process';
 import { scrubCodenames } from './redactions-core.mjs';
+import { guardArgs } from './cli-guard.mjs';
 
 // ---------------------------------------------------------------------------
 // Bootstrap: load .env before anything else
@@ -68,60 +69,34 @@ const PATHS = {
 // ---------------------------------------------------------------------------
 // CLI argument parsing
 // ---------------------------------------------------------------------------
-const args = process.argv.slice(2);
+const argv = process.argv.slice(2);
+const args = guardArgs({
+  name: 'gemini-eval.mjs',
+  summary: 'evaluate a job offer using Google Gemini instead of Claude',
+  positional: '"<JD text>"',
+  flags: [
+    ['--file <path>', 'read the JD from a file instead of inline text'],
+    ['--model <name>', 'Gemini model to use (default: gemini-2.5-flash)'],
+    ['--no-save', 'do not save the report to reports/'],
+  ],
+  notes: 'Setup: get a free API key at https://aistudio.google.com/apikey, add\n'
+    + 'GEMINI_API_KEY=<your-key> to .env, then run npm install.\n\n'
+    + 'Examples:\n'
+    + '  node gemini-eval.mjs "We are looking for a Senior AI Engineer..."\n'
+    + '  node gemini-eval.mjs --file ./jds/openai-swe.txt',
+  // Run bare, it has nothing to evaluate, so it explains itself instead.
+  argv: argv.length ? argv : ['--help'],
+});
 
-if (args.length === 0 || args[0] === '--help' || args[0] === '-h') {
-  console.log(`
-╔══════════════════════════════════════════════════════════════════╗
-║           career-ops — Gemini Evaluator (free-tier)             ║
-╚══════════════════════════════════════════════════════════════════╝
-
-  Evaluate a job offer using Google Gemini instead of Claude.
-
-  USAGE
-    node gemini-eval.mjs "<JD text>"
-    node gemini-eval.mjs --file ./jds/my-job.txt
-    node gemini-eval.mjs --model gemini-2.5-flash "<JD text>"
-
-  OPTIONS
-    --file <path>    Read JD from a file instead of inline text
-    --model <name>   Gemini model to use (default: gemini-2.5-flash)
-    --no-save        Do not save report to reports/ directory
-    --help           Show this help
-
-  SETUP
-    1. Get a free API key at https://aistudio.google.com/apikey
-    2. Add GEMINI_API_KEY=<your-key> to .env
-    3. Run: npm install   (installs @google/generative-ai + dotenv)
-
-  EXAMPLES
-    node gemini-eval.mjs "We are looking for a Senior AI Engineer..."
-    node gemini-eval.mjs --file ./jds/openai-swe.txt
-`);
-  process.exit(0);
+const filePath = args.value('--file');
+if (filePath !== undefined && !existsSync(filePath)) {
+  console.error(`❌  File not found: ${filePath}`);
+  process.exit(1);
 }
-
-// Parse flags
-let jdText = '';
-let modelName = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
-let saveReport = true;
-
-for (let i = 0; i < args.length; i++) {
-  if (args[i] === '--file' && args[i + 1]) {
-    const filePath = args[++i];
-    if (!existsSync(filePath)) {
-      console.error(`❌  File not found: ${filePath}`);
-      process.exit(1);
-    }
-    jdText = readFileSync(filePath, 'utf-8').trim();
-  } else if (args[i] === '--model' && args[i + 1]) {
-    modelName = args[++i];
-  } else if (args[i] === '--no-save') {
-    saveReport = false;
-  } else if (!args[i].startsWith('--')) {
-    jdText += (jdText ? '\n' : '') + args[i];
-  }
-}
+const jdText = [filePath === undefined ? '' : readFileSync(filePath, 'utf-8').trim(), ...args.positional]
+  .filter(Boolean).join('\n');
+const modelName = args.value('--model', process.env.GEMINI_MODEL || 'gemini-2.5-flash');
+const saveReport = !args.has('--no-save');
 
 if (!jdText) {
   console.error('❌  No Job Description provided. Run with --help for usage.');

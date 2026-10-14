@@ -18,7 +18,7 @@
 import { readFileSync, readdirSync, existsSync, mkdirSync, unlinkSync, statSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
-import { CANONICAL_STATUSES, columnsOf, isSeparatorRow, normalizeStatus, parseRow, SCORE_CELL, trackerPath } from './tracker-rows.mjs';
+import { CANONICAL_STATUSES, columnsOf, isSeparatorRow, normalizeStatus, SCORE_CELL, trackerPath, trackerRows } from './tracker-rows.mjs';
 import { companyKey } from './role-matcher.mjs';
 
 const CAREER_OPS = dirname(fileURLToPath(import.meta.url));
@@ -52,7 +52,7 @@ const lines = content.split('\n');
 // extra Location column is checked as correctly as the original 9-column one.
 const COLMAP = columnsOf(lines);
 const MAX_IDX = Math.max(...Object.values(COLMAP));
-const entries = lines.filter(l => l.startsWith('|')).map(l => parseRow(l, COLMAP)).filter(Boolean);
+const entries = trackerRows(lines, COLMAP);
 
 console.log(`\n📊 Checking ${entries.length} entries in applications.md\n`);
 

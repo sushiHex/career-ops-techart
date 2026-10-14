@@ -22,7 +22,7 @@
  */
 import { readFileSync, existsSync } from 'fs';
 import { join } from 'path';
-import { reportFileOf } from './tracker-rows.mjs';
+import { reportFileOf, trackerRows } from './tracker-rows.mjs';
 
 // Sibling modules resolve beside this file, so it runs from any directory; the
 // data it reads (data/, reports/) stays relative to where it is run.
@@ -62,12 +62,9 @@ if (args.includes('--list')) {
 
 const DEAD = new Set(['Rejected', 'Discarded', 'SKIP']);
 const rows = [];
-for (const line of readFileSync(join('data', 'applications.md'), 'utf-8').split('\n')) {
-  if (!line.startsWith('|')) continue;
-  const c = line.split('|').map((x) => x.trim());
-  if (c.length < 8 || !/^\d+$/.test(c[1] || '')) continue;
-  if (DEAD.has(c[6])) continue;
-  const reportFile = reportFileOf(line);
+for (const row of trackerRows(readFileSync(join('data', 'applications.md'), 'utf-8').split('\n'))) {
+  if (DEAD.has(row.status)) continue;
+  const reportFile = reportFileOf(row.raw);
   if (!reportFile) continue;
   const p = join('reports', reportFile);
   if (!existsSync(p)) continue;
@@ -76,8 +73,8 @@ for (const line of readFileSync(join('data', 'applications.md'), 'utf-8').split(
   const g = s ? computeGlobal(s) : null;
   if (g === null || g > 5 || g < 0) continue;
 
-  let pref = preference(c[3], PREFS);
-  const damped = GATE && pref > 0 && !!DEPRIORITISED && DEPRIORITISED.test(c[4] || '');
+  let pref = preference(row.company, PREFS);
+  const damped = GATE && pref > 0 && !!DEPRIORITISED && DEPRIORITISED.test(row.role || '');
   if (damped) pref = Math.round(pref * DAMP * 10) / 10;
 
   const arr = arrangement(locationText(text));
@@ -93,7 +90,7 @@ for (const line of readFileSync(join('data', 'applications.md'), 'utf-8').split(
   }
 
   const mult = (1 + pref * STEP) * arrMult;
-  rows.push({ num: c[1], co: c[3], role: c[4], pref, mult, cur: g, boosted: Math.min(5, g * mult), damped, arr });
+  rows.push({ num: String(row.num), co: row.company, role: row.role, pref, mult, cur: g, boosted: Math.min(5, g * mult), damped, arr });
 }
 
 const cur4 = rows.filter((r) => r.cur >= 4).length;

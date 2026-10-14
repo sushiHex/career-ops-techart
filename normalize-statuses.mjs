@@ -16,7 +16,7 @@ import { readFileSync, writeFileSync, copyFileSync, existsSync, mkdirSync } from
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { guardArgs } from './cli-guard.mjs';
-import { rebuildRow, trackerPath } from './tracker-rows.mjs';
+import { columnsOf, rebuildRow, trackerPath, trackerRows } from './tracker-rows.mjs';
 
 const CAREER_OPS = dirname(fileURLToPath(import.meta.url));
 // CAREER_OPS_TRACKER lets tests point the script at an isolated fixture.
@@ -25,7 +25,6 @@ const args = guardArgs({
   name: 'normalize-statuses.mjs',
   summary: 'rewrite non-canonical status values in the applications tracker',
   flags: [['--dry-run', 'report what would change, write nothing']],
-  positional: false,
   notes: 'Without --dry-run this REWRITES data/applications.md. A backup is written to applications.md.bak.',
 });
 const DRY_RUN = args.has('--dry-run');
@@ -105,41 +104,33 @@ const lines = content.split('\n');
 let changes = 0;
 const unknowns = [];
 
-for (let i = 0; i < lines.length; i++) {
-  const line = lines[i];
-  if (!line.startsWith('|')) continue;
-
-  const parts = line.split('|').map(s => s.trim());
-  // Format: ['', '#', 'fecha', 'empresa', 'rol', 'score', 'STATUS', 'pdf', 'report', 'notas', '']
-  if (parts.length < 9) continue;
-
-  const num = parseInt(parts[1]);
-  if (isNaN(num)) continue;
-
-  const rawStatus = parts[6];
+const colmap = columnsOf(lines);
+for (const row of trackerRows(lines, colmap)) {
+  const { num, status: rawStatus } = row;
   const result = normalizeStatus(rawStatus);
 
   if (result.unknown) {
-    unknowns.push({ num, rawStatus, line: i + 1 });
+    unknowns.push({ num, rawStatus, line: row.line + 1 });
     continue;
   }
 
   if (result.status === rawStatus) continue; // Already canonical
 
-  parts[6] = result.status;
+  const parts = row.raw.split('|').map(s => s.trim());
+  parts[colmap.status] = result.status;
 
   // Move DUPLICADO info to notes if needed
   const moved = result.moveToNotes;
-  if (moved && !(parts[9] || '').includes(moved)) {
-    parts[9] = parts[9] ? `${moved}. ${parts[9]}` : moved;
+  if (moved && colmap.notes != null && !row.notes.includes(moved)) {
+    parts[colmap.notes] = row.notes ? `${moved}. ${row.notes}` : moved;
   }
 
   // Also strip bold from score field
-  if (parts[5]) {
-    parts[5] = parts[5].replace(/\*\*/g, '');
+  if (row.score) {
+    parts[colmap.score] = row.score.replace(/\*\*/g, '');
   }
 
-  lines[i] = rebuildRow(parts);
+  lines[row.line] = rebuildRow(parts);
   changes++;
 
   console.log(`#${num}: "${rawStatus}" → "${result.status}"`);

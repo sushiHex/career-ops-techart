@@ -15,8 +15,8 @@
 import { readFileSync, writeFileSync, copyFileSync, existsSync, mkdirSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
-import { roleFuzzyMatch, rowIdReader, idSetsConflict } from './role-matcher.mjs';
-import { parseScore, rebuildRow, reportNumOf, trackerPath } from './tracker-rows.mjs';
+import { companyKey, roleFuzzyMatch, rowIdReader, idSetsConflict } from './role-matcher.mjs';
+import { columnsOf, parseScore, rebuildRow, reportNumOf, trackerPath, trackerRows } from './tracker-rows.mjs';
 import { guardArgs } from './cli-guard.mjs';
 
 const CAREER_OPS = dirname(fileURLToPath(import.meta.url));
@@ -30,7 +30,6 @@ const DRY_RUN = guardArgs({
   name: 'dedup-tracker.mjs',
   summary: 'remove duplicate rows from the applications tracker; with no flags it REWRITES the tracker',
   flags: [['--dry-run', 'report what would change, write nothing']],
-  positional: false,
   notes: 'Rows are grouped by company. Requisition ids from the report URL and the role cell are\n'
     + 'authoritative and keep two distinct reqs that share a title apart. A backup is written\n'
     + 'to applications.md.bak.',
@@ -70,25 +69,6 @@ const STATUS_RANK = {
   'entrevista': 5,
   'oferta': 6,
 };
-
-/**
- * Normalize a company name into the grouping key used by deduplication.
- *
- * The tracker may contain punctuation, parenthetical branding, or spacing
- * differences for the same employer. This function removes those presentation
- * differences while keeping the alphanumeric company identity that determines
- * which rows are safe to compare for duplicate roles.
- *
- * @param {string} name - Company name from an applications.md row.
- * @returns {string} Lowercase company key used for same-company grouping.
- */
-function normalizeCompany(name) {
-  return name.toLowerCase()
-    .replace(/[()]/g, '')
-    .replace(/\s+/g, ' ')
-    .replace(/[^a-z0-9 ]/g, '')
-    .trim();
-}
 
 /**
  * Normalize tracker status text before ranking or comparing it.
@@ -212,36 +192,6 @@ function roleMatch(a, b) {
   return true;
 }
 
-/**
- * Parse one Markdown table row from applications.md into a tracker object.
- *
- * Header and separator rows return null because they either lack enough cells
- * or do not have a numeric tracker id. Valid data rows keep the raw line; the
- * caller attaches the physical line index after parsing so later updates and
- * removals never depend on tracker numbers being globally unique.
- *
- * @param {string} line - One line from applications.md.
- * @returns {object|null} Parsed tracker row, or null for non-application lines.
- */
-function parseAppLine(line) {
-  const parts = line.split('|').map(s => s.trim());
-  if (parts.length < 9) return null;
-  const num = parseInt(parts[1]);
-  if (isNaN(num)) return null;
-  return {
-    num,
-    date: parts[2],
-    company: parts[3],
-    role: parts[4],
-    score: parts[5],
-    status: parts[6],
-    pdf: parts[7],
-    report: parts[8],
-    notes: parts[9] || '',
-    raw: line,
-  };
-}
-
 // Read
 if (!existsSync(APPS_FILE)) {
   console.log('No applications.md found. Nothing to dedup.');
@@ -249,25 +199,20 @@ if (!existsSync(APPS_FILE)) {
 }
 const content = readFileSync(APPS_FILE, 'utf-8');
 const lines = content.split('\n');
+const colmap = columnsOf(lines);
 
-// Parse all entries
-const entries = [];
-
-for (let i = 0; i < lines.length; i++) {
-  if (!lines[i].startsWith('|')) continue;
-  const app = parseAppLine(lines[i]);
-  if (app && app.num > 0) {
-    app.lineIdx = i;
-    entries.push(app);
-  }
-}
+// Every row keeps its physical line index (row.line), so updates and removals
+// never depend on tracker numbers being globally unique. Row #0 is never an
+// application.
+const entries = trackerRows(lines, colmap).filter(app => app.num > 0);
 
 console.log(`📊 ${entries.length} entries loaded`);
 
-// Group by company
+// Group by company, keyed exactly as merge-tracker keys it, so the two never
+// disagree about whether "Riot Games" and "RiotGames" are one employer.
 const groups = new Map();
 for (const entry of entries) {
-  const key = normalizeCompany(entry.company);
+  const key = companyKey(entry.company);
   if (!groups.has(key)) groups.set(key, []);
   groups.get(key).push(entry);
 }
@@ -303,15 +248,15 @@ for (const companyEntries of groups.values()) {
     // The first row with the most advanced status; promote it onto the keeper.
     const best = cluster.reduce((b, e) => (statusRank(e.status) > statusRank(b.status) ? e : b));
     if (best !== keeper) {
-      const parts = lines[keeper.lineIdx].split('|').map(s => s.trim());
-      parts[6] = best.status;
-      lines[keeper.lineIdx] = rebuildRow(parts);
+      const parts = lines[keeper.line].split('|').map(s => s.trim());
+      parts[colmap.status] = best.status;
+      lines[keeper.line] = rebuildRow(parts);
       console.log(`  📝 #${keeper.num}: status promoted to "${best.status}" (from #${best.num})`);
     }
 
     // Remove duplicates
     for (const dup of cluster.slice(1)) {
-      linesToRemove.add(dup.lineIdx);
+      linesToRemove.add(dup.line);
       removed++;
       console.log(`🗑️  Remove #${dup.num} (${dup.company} — ${dup.role}, ${dup.score}) → kept #${keeper.num} (${keeper.score})`);
     }

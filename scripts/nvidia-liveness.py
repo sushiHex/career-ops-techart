@@ -15,13 +15,23 @@ Design notes (learned the hard way):
 
 Usage:  python scripts/nvidia-liveness.py JR2231011 JR2508244 [--json]
 """
-import sys, json, time, random, os, re, urllib.request, urllib.error
+import sys, json, time, random, os, re, importlib.util, urllib.request, urllib.error
 from _httpctx import tls_context, is_tls_failure
 
 # Repo root, so the stored-slug fallback works from any working directory.
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "scripts"))
 import _location  # noqa: E402  (the home state comes from config/location.json)
+
+# req-resolve owns the Workday search walker (canonical id comparison, walk to the end of
+# the result set, total latched from page one). This file used to walk one page of twenty
+# with a substring test, which could close a live req that ranked twenty-first. Loaded by
+# path because the name is hyphenated; measured at about 25ms on top of the 55ms this
+# module's own imports cost (2026-10-13).
+_spec = importlib.util.spec_from_file_location(
+    "reqresolve", os.path.join(ROOT, "scripts", "req-resolve.py"))
+_rr = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_rr)
 
 BASE = "https://nvidia.wd5.myworkdayjobs.com/wday/cxs/nvidia/NVIDIAExternalCareerSite"
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36"
@@ -93,17 +103,17 @@ def _req_curl(url, data=None):
                 pass
 
 
+def _post(url, payload):
+    """_req() in req-resolve post()'s shape, (status, text), for the shared walker."""
+    ok, status, body = _req(url, data=payload)
+    return status, (json.dumps(body) if ok else "")
+
+
 def resolve(jr):
-    """Return (externalPath, title, search_ok). search_ok=False => the search API failed (UNKNOWN)."""
-    ok, status, body = _req(BASE + "/jobs",
-                            data={"appliedFacets": {}, "limit": 20, "offset": 0, "searchText": jr})
-    if not ok or body is None:
-        return None, None, False
-    j = jr.lower()
-    for p in body.get("jobPostings", []):
-        if j in (p.get("externalPath", "") or "").lower() or j in json.dumps(p).lower():
-            return p.get("externalPath", ""), p.get("title", ""), True
-    return None, None, True  # search worked, req genuinely absent => closed
+    """Return (externalPath, search_ok). search_ok=False => the search was not read to its
+    end cleanly (UNKNOWN); (None, True) is a clean absence (CLOSED)."""
+    ep, searched = _rr.workday_search(BASE, jr, send=_post)
+    return ("/" + ep if ep else None), searched
 
 
 def home_remote_ok(locs, policy=None):
@@ -181,14 +191,16 @@ def local_path(jr):
 
 
 def check(jr):
-    ep, title, search_ok = resolve(jr)
+    ep, search_ok = resolve(jr)
     if not search_ok:
         # Fall back to a slug this repo already recorded, rather than reporting blind.
         ep2 = local_path(jr)
         if ep2:
             ok, status, body = _req(BASE + ep2)
             info = (body or {}).get("jobPostingInfo", {}) if ok else {}
-            if ok and info:
+            # The verdict is bool(canApply), so canApply has to be THERE: a record without
+            # it was never read, and reading its absence as False closed the req.
+            if ok and isinstance(info, dict) and info.get("canApply") is not None:
                 al = info.get("additionalLocations", []) or []
                 home_remote = home_remote_ok([info.get("location", "")] + al)
                 return {"req": jr, "state": "LIVE" if info.get("canApply") else "CLOSED",
@@ -219,7 +231,7 @@ def check(jr):
     # California resident can work it fully remote; its absence means the CA entry is Santa
     # Clara onsite. The same holds for whichever home state is configured.
     home_remote = home_remote_ok([info.get("location", "")] + al)
-    return {"req": jr, "state": "LIVE", "live": True, "title": info.get("title", title),
+    return {"req": jr, "state": "LIVE", "live": True, "title": info.get("title", ""),
             "location": info.get("location", "?"), "additionalLocations": al,
             "home_remote": home_remote, "remote": info.get("remoteType", "?"),
             "endDate": info.get("endDate", "(none)"),
@@ -227,7 +239,8 @@ def check(jr):
 
 
 def _selftest():
-    """home_remote_ok against fixed policies, never the user's. No network."""
+    """home_remote_ok against fixed policies, never the user's, and the search walk. No network."""
+    global _req, resolve, local_path
     ca = _location.preset("california-socal")
     tx = _location.Policy({"home_state": {"code": "TX", "name": "Texas"}}, "fixture:texas")
     none = _location.preset("remote-us")
@@ -261,7 +274,48 @@ def _selftest():
         if got != want:
             bad += 1
             print(f"  FAIL {locs} under {pol.name}: got {got}, want {want} ({why})")
-    print(f"nvidia-liveness selftest: {len(cases)} home-remote cases, {bad} failure(s)")
+
+    # resolve() goes through req-resolve's walker: a req ranked onto page two is found, and
+    # a longer id on page one is not taken for it. The old one-page substring test closed
+    # the first and matched the second.
+    def board(pages):
+        def fake(url, data=None, tries=5):
+            page = data["offset"] // 20
+            return True, 200, {"jobPostings": pages[page] if page < len(pages) else []}
+        return fake
+    filler = [{"externalPath": f"/job/US-CA-Santa-Clara/Role_JR90{i:05d}"} for i in range(20)]
+    walks = [
+        ([filler, [{"externalPath": "/job/US-CA-Remote/Agent_JR2620896"}]],
+         ("/job/US-CA-Remote/Agent_JR2620896", True), "a req on page two is found"),
+        ([[{"externalPath": "/job/US-CA-Remote/Other_JR26208960"}]],
+         (None, True), "a longer req id is a different req"),
+    ]
+    real = _req
+    try:
+        for pages, want, why in walks:
+            _req = board(pages)
+            got = resolve("JR2620896")
+            if got != want:
+                bad += 1
+                print(f"  FAIL resolve: got {got}, want {want} ({why})")
+        # Search unreadable, stored slug answers 200 with an empty record: never read, so
+        # unknown. Reading canApply's absence as False closed the req.
+        real_resolve, real_local = resolve, local_path
+        resolve, local_path = (lambda jr: (None, False)), (lambda jr: "/job/X/Y_JR2620896")
+        try:
+            for body, want in (({"jobPostingInfo": {"title": "Senior Engineer"}}, "UNKNOWN"),
+                               ({"jobPostingInfo": {"canApply": False}}, "CLOSED")):
+                _req = lambda url, data=None, tries=5, _b=body: (True, 200, _b)
+                got = check("JR2620896")["state"]
+                if got != want:
+                    bad += 1
+                    print(f"  FAIL stored-slug record {body} read as {got}, want {want}")
+        finally:
+            resolve, local_path = real_resolve, real_local
+    finally:
+        _req = real
+    print(f"nvidia-liveness selftest: {len(cases)} home-remote cases + {len(walks) + 2} search "
+          f"cases, {bad} failure(s)")
     return 1 if bad else 0
 
 

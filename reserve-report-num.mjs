@@ -39,6 +39,7 @@
 import { readdirSync, writeFileSync, unlinkSync, statSync, existsSync, mkdirSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
+import { guardArgs } from './cli-guard.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const REPORTS_DIR = join(__dirname, 'reports');
@@ -121,10 +122,19 @@ function gc() {
 
 // ── CLI ──────────────────────────────────────────────────────────────────────
 
-const [,, cmd, arg] = process.argv;
+const args = guardArgs({
+  name: 'reserve-report-num.mjs',
+  summary: 'atomically reserve the next report number; prints it zero-padded',
+  flags: [
+    ['--release <NNN>', 'delete the sentinel for NNN once the real report is written'],
+    ['--gc', 'remove stale sentinels'],
+  ],
+  notes: 'With no flags this creates a reports/NNN-RESERVED.md sentinel.',
+});
 
-if (cmd === '--release') {
-  if (!arg || !/^\d{1,3}$/.test(arg)) {
+if (args.has('--release')) {
+  const arg = args.value('--release');
+  if (!/^\d{1,3}$/.test(arg)) {
     process.stderr.write('Usage: node reserve-report-num.mjs --release <NNN>\n');
     process.exit(1);
   }
@@ -132,7 +142,7 @@ if (cmd === '--release') {
   process.exit(0);
 }
 
-if (cmd === '--gc') {
+if (args.has('--gc')) {
   gc();
   process.exit(0);
 }

@@ -24,20 +24,20 @@
 import { readFileSync, writeFileSync, existsSync, readdirSync, copyFileSync, realpathSync, statSync } from 'fs';
 import { join, dirname, resolve, relative, isAbsolute } from 'path';
 import { fileURLToPath } from 'url';
+import { guardArgs } from './cli-guard.mjs';
 
 const CAREER_OPS = dirname(fileURLToPath(import.meta.url));
-const DRY_RUN = process.argv.includes('--dry-run');
-
-if (process.argv.includes('-h') || process.argv.includes('--help')) {
-  console.log('Usage: node reconcile-pipeline.mjs [--dry-run] [--state <path>] [--pipeline <path>]');
-  console.log('  Moves batch-processed offers out of pipeline.md "Pendientes" into "Procesadas".');
-  process.exit(0);
-}
-
-function argValue(flag) {
-  const i = process.argv.indexOf(flag);
-  return i >= 0 && i + 1 < process.argv.length ? process.argv[i + 1] : null;
-}
+const args = guardArgs({
+  name: 'reconcile-pipeline.mjs',
+  summary: 'move batch-processed offers out of pipeline.md "Pendientes" into "Procesadas"',
+  flags: [
+    ['--dry-run', 'report what would move, write nothing'],
+    ['--state <path>', 'batch state file (default batch/batch-state.tsv)'],
+    ['--pipeline <path>', 'pipeline file (default data/pipeline.md)'],
+  ],
+  notes: 'Without --dry-run this REWRITES the pipeline file. A backup is written beside it.',
+});
+const DRY_RUN = args.has('--dry-run');
 
 // Constrain user-supplied --state/--pipeline paths to the repository tree, so a
 // crafted path cannot read from or overwrite files outside the project.
@@ -72,8 +72,8 @@ function resolveInsideRepo(inputPath, fallbackPath, flag) {
 const defaultPipeline = existsSync(join(CAREER_OPS, 'data/pipeline.md'))
   ? join(CAREER_OPS, 'data/pipeline.md')
   : join(CAREER_OPS, 'pipeline.md');
-const PIPELINE_FILE = resolveInsideRepo(argValue('--pipeline'), defaultPipeline, '--pipeline');
-const STATE_FILE = resolveInsideRepo(argValue('--state'), join(CAREER_OPS, 'batch/batch-state.tsv'), '--state');
+const PIPELINE_FILE = resolveInsideRepo(args.value('--pipeline'), defaultPipeline, '--pipeline');
+const STATE_FILE = resolveInsideRepo(args.value('--state'), join(CAREER_OPS, 'batch/batch-state.tsv'), '--state');
 const REPORTS_DIR = join(CAREER_OPS, 'reports');
 
 // ---- guards ----

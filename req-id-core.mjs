@@ -33,8 +33,8 @@
  * neither. Five digits is the floor rather than four because four also matches
  * the date in a report filename slug. The bare numeric Workday id
  * ("..._17372837") is deliberately NOT here: no inbox row needs it and a bare
- * \d{7,} would swallow ids from other boards. eval-write composes that one
- * alternative on top for its own label, which is the sanctioned way to need
+ * \d{7,} would swallow ids from other boards. reqLabel() below composes that one
+ * alternative on top for the role-cell LABEL, which is the sanctioned way to need
  * more than this pattern gives.
  *
  * WHY IT IS ANCHORED ON A NON-ALPHANUMERIC RATHER THAN \b. A Workday path ends
@@ -47,9 +47,9 @@
  * 26WD91231-1.
  *
  * A CONSUMER THAT NEEDS MORE MUST COMPOSE, NEVER REDEFINE. role-matcher keeps
- * its own extra alternatives for the P###### and REQ-#### forms and eval-write
- * keeps the bare numeric one; both sit BESIDE this pattern rather than replacing
- * it. What must never happen again is a copy silently omitting a form another
+ * its own extra alternatives for the P###### and REQ-#### forms, and the role-cell
+ * definitions at the end of this file add the bare numeric one; all of them sit
+ * BESIDE this pattern rather than replacing it. What must never happen again is a copy silently omitting a form another
  * copy has, and test-all.mjs asserts no Node consumer holds a literal
  * requisition alternation of its own.
  */
@@ -67,3 +67,55 @@ export const reqIdGlobal = () => new RegExp(REQ_ID_SRC, 'gi');
 
 /** One req, one id: JR-103209, JR_103209 and jr103209 are the same requisition. */
 export const canonId = (id) => String(id).toUpperCase().replace(/[-_]/g, '');
+
+/*
+ * THE TRACKER ROLE CELL. A requisition id travels beside the title, "Senior
+ * Engineer (JR2508244)", and three tools touch it, each with a different job:
+ *
+ *   - eval-write WRITES it, with reqLabel() below.
+ *   - role-matcher READS it as IDENTITY, with REQ_ID_SRC alone. A bare number
+ *     stays a label and never becomes identity: as a dedup key a loose \d{7,}
+ *     would swallow ids from other boards.
+ *   - scan.mjs STRIPS it to compare titles, with ROLE_ID_TOKEN_SRC below.
+ *
+ * The stripper must cover everything the writer puts there and everything the
+ * reader finds there, or a role already on the tracker comes back as new on
+ * every scan. Both definitions live here, beside the pattern they compose, and
+ * test-all.mjs asserts both inclusions over the real tracker and reports.
+ */
+
+// A UUID is cut out before the bare-number alternative runs: an Ashby or Lever posting
+// id ends in a twelve-hex group that is often all digits, and "...-113241621221" was
+// labelled Prefect's requisition on 2026-10-13.
+const UUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi;
+const REQ_LABEL_RE = new RegExp(`${REQ_ID_SRC}|[_/-](\\d{7,})(?![0-9])`, 'gi');
+
+/**
+ * The requisition label eval-write puts in the role cell, e.g. "... (JR2508244)".
+ *
+ * The shared pattern, plus a bare number of seven or more digits after a separator,
+ * which is the only thing that labels a "..._17372837" Workday row. As a label the
+ * looser form costs nothing. Query and fragment are cut first, the rule jobKey()
+ * follows: a tracking parameter carrying a req-shaped token is not this posting's
+ * requisition. Last match wins, because the requisition sits at the end of an ATS path.
+ *
+ * @param {string} url - The posting URL.
+ * @returns {string|null}
+ */
+export const reqLabel = (url) => {
+  const path = String(url || '').trim().replace(/[?#].*$/, '').replace(UUID_RE, '');
+  let last = null;
+  for (const m of path.matchAll(REQ_LABEL_RE)) {
+    last = m[1] || m[2];
+  }
+  return last;
+};
+
+/**
+ * One requisition token as scan.mjs canonicalRole() strips it from a role cell:
+ * the shared pattern, plus REQ-####, Zillow's P###### and a bare number of five
+ * or more digits (how a Greenhouse gh_jid or a Riot or Disney id is recorded,
+ * "(5349405250)"). A trailing "-1" facet suffix belongs to the id before it, or
+ * "JR2292444-1" leaves a "1". Exported as a STRING, to be composed.
+ */
+export const ROLE_ID_TOKEN_SRC = String.raw`(?:(?:${REQ_ID_SRC}|(?<![A-Za-z0-9])(?:REQ[-_ ]?\d{4,}|P\d{5,}|\d{5,})(?![A-Za-z0-9]))(?:-\d{1,2}(?![A-Za-z0-9]))?)`;

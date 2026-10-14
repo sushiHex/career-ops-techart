@@ -31,7 +31,8 @@
 import { readFileSync, existsSync, mkdirSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { applyModel, loadPrefs, persistedArrangement } from './score-model.mjs';
-import { reportFileOf } from './tracker-rows.mjs';
+import { reportFileOf, trackerRows } from './tracker-rows.mjs';
+import { guardArgs } from './cli-guard.mjs';
 
 const { parseScores, computeGlobal } = await import(
   new URL('./audit-scores.mjs', import.meta.url).href
@@ -41,9 +42,15 @@ const { parseScores, computeGlobal } = await import(
   throw new Error('audit-scores.mjs must be importable from the repo root');
 });
 
-const args = process.argv.slice(2);
-const has = (f) => args.includes(f);
-const val = (f, d) => { const i = args.indexOf(f); return i === -1 ? d : args[i + 1]; };
+const { has, value: val } = guardArgs({
+  name: 'board-recompute.mjs',
+  summary: 'shadow board built from computed scores',
+  flags: [
+    ['--stdout', 'print the summary only, write no file'],
+    ['--threshold <score>', 'actionable cutoff (default 4.0)'],
+  ],
+  notes: 'Without --stdout this writes output/board-recomputed-<date>.md. It never writes the tracker.',
+});
 
 const TRACKER = join('data', 'applications.md');
 const REPORTS = 'reports';
@@ -56,22 +63,17 @@ if (!existsSync(TRACKER)) {
 }
 
 const rows = [];
-for (const line of readFileSync(TRACKER, 'utf-8').split('\n')) {
-  if (!line.startsWith('|')) continue;
-  const c = line.split('|').map((x) => x.trim());
-  if (c.length < 8) continue;
-  if (!/^\d+$/.test(c[1] || '')) continue;
-  const sm = (c[5] || '').match(/([\d.]+)\/5/);
+for (const row of trackerRows(readFileSync(TRACKER, 'utf-8').split('\n'))) {
+  const sm = (row.score || '').match(/([\d.]+)\/5/);
   if (!sm) continue;
-  const reportFile = reportFileOf(line);
   rows.push({
-    num: parseInt(c[1], 10),
-    date: c[2],
-    company: c[3],
-    role: c[4],
+    num: row.num,
+    date: row.date,
+    company: row.company,
+    role: row.role,
     stated: parseFloat(sm[1]),
-    status: c[6],
-    report: reportFile || null,
+    status: row.status,
+    report: reportFileOf(row.raw) || null,
   });
 }
 

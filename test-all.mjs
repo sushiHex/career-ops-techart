@@ -202,20 +202,48 @@ function readFile(path) {
   return content;
 }
 
+/**
+ * Drop block comments and whole-line `//` comments, for scans that must read code
+ * and not the prose explaining it.
+ *
+ * @param {string} s - JavaScript source.
+ * @returns {string} The source without those comments.
+ */
+const codeOnly = (s) => s.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^[ \t]*\/\/.*$/gm, '');
+
 console.log('\n🧪 career-ops test suite\n');
 
 // ── 1. SYNTAX CHECKS ────────────────────────────────────────────
 
 console.log('1. Syntax checks');
 
+// One child parses every file, because a `node --check` per file spent ~10s of this
+// suite on process spawns alone. vm.SourceTextModule compiles a module without linking
+// or running it, which is what --check does for an .mjs (hashbang, top-level await and
+// the module-only early errors included). The child needs --experimental-vm-modules,
+// which is why this is a child at all rather than in-process.
+const SYNTAX_CHECKER = `
+const { SourceTextModule } = require('vm');
+const { readFileSync } = require('fs');
+const out = process.argv.slice(1).map((f) => {
+  try { new SourceTextModule(readFileSync(f, 'utf8'), { identifier: f }); return null; }
+  catch (e) { return String(e && e.message || e); }
+});
+process.stdout.write(JSON.stringify(out));`;
 const mjsFiles = readdirSync(ROOT).filter(f => f.endsWith('.mjs'));
-for (const f of mjsFiles) {
-  const result = run(NODE, ['--check', f]);
-  if (result !== null) {
-    pass(`${f} syntax OK`);
-  } else {
-    fail(`${f} has syntax errors`);
-  }
+let syntaxErrors = null;
+try {
+  syntaxErrors = JSON.parse(run(NODE,
+    ['--experimental-vm-modules', '--no-warnings', '-e', SYNTAX_CHECKER, ...mjsFiles]) ?? 'null');
+} catch { /* reported below */ }
+if (!Array.isArray(syntaxErrors) || syntaxErrors.length !== mjsFiles.length) {
+  // A checker that answers for nothing must not read as every file passing.
+  fail(`syntax checker did not return one result per file (${mjsFiles.length} files)`);
+} else {
+  mjsFiles.forEach((f, i) => {
+    if (syntaxErrors[i] === null) pass(`${f} syntax OK`);
+    else fail(`${f} has syntax errors`);
+  });
 }
 
 // ── 2. SCRIPT EXECUTION ─────────────────────────────────────────
@@ -1405,33 +1433,130 @@ try {
   // flags, no factors, no min) via audit-scores.mjs and wrote that into the tracker's FINAL
   // column, which would have moved 234 rows while apply-model and score-audit both called
   // the same tracker clean.
-  // The three tracker writers read CAREER_OPS_TRACKER, so for them a broken guard here
-  // would rewrite a scratch tracker, not the real one; the other two preview by default.
-  // Those three take nothing but their flags, so a bare word or a "-1" (which the generic
-  // guard lets through as a flag value) must be refused as well.
+  //
+  // Which scripts must be guarded is SCANNED, not listed: a hand-kept list is one that
+  // falls behind the code without saying so, and seven writers had been added outside it.
+  // Every repo-root script that both writes files and reads its arguments imports
+  // cli-guard.mjs and calls it, or is named below with the reason it does not.
+  const GUARD_EXEMPT = {
+    'test-all.mjs': 'the test suite; it writes only under its own RUN_TMP',
+    'validate-portals.mjs': 'its only writes are a mkdtemp scratch directory inside --self-test',
+  };
+  try {
+    const WRITES = /\b(?:writeFileSync|appendFileSync|renameSync|unlinkSync|rmSync)\s*\(/;
+    const scanned = readdirSync(ROOT).filter((f) => f.endsWith('.mjs') && f !== 'cli-guard.mjs')
+      .map((f) => [f, codeOnly(readFileSync(join(ROOT, f), 'utf8'))])
+      .filter(([, src]) => WRITES.test(src)
+        && (/process\.argv/.test(src) || /from '\.\/cli-guard\.mjs'/.test(src)));
+    const unguarded = scanned.filter(([f, src]) => !GUARD_EXEMPT[f]
+      && !(/from '\.\/cli-guard\.mjs'/.test(src) && /\bguardArgs\(/.test(src))).map(([f]) => f);
+    const stale = Object.keys(GUARD_EXEMPT).filter((f) => !scanned.some(([s]) => s === f));
+    // A scanner that matches nothing passes everything.
+    if (scanned.length < 15) {
+      fail(`cli-guard scan found only ${scanned.length} writers that read their arguments; the scan is broken`);
+    } else if (unguarded.length || stale.length) {
+      fail(`writers that read argv without cli-guard: ${unguarded.join(', ') || 'none'}; `
+        + `exemptions matching no writer: ${stale.join(', ') || 'none'}`);
+    } else {
+      pass(`all ${scanned.length - Object.keys(GUARD_EXEMPT).length} argument-reading writers go through `
+        + `cli-guard (${Object.keys(GUARD_EXEMPT).length} exempt, each with a reason)`);
+    }
+  } catch (e) {
+    fail(`cli-guard scan crashed: ${e.message}`);
+  }
+
+  // The parser itself, in-process, on the accepting side (a refusal exits the process,
+  // so those cases run as children below). A flag that declares a value takes it in
+  // either spelling, and the value is consumed rather than mistaken for a stray argument.
+  try {
+    const { guardArgs } = await import(pathToFileURL(join(ROOT, 'cli-guard.mjs')).href);
+    const spec = (argv) => guardArgs({ name: 'probe', summary: 'probe', argv, flags: [
+      ['--dry-run', ''], ['--company <name>', ''], ['--throttle[=<ms>]', ''], ['--min <n>', '']] });
+    const spaced = spec(['--company', 'Acme', '--dry-run']);
+    const joined = spec(['--company=Acme Corp', '--throttle']);
+    const tuned = spec(['--throttle=8000', '--min', '-1']);
+    const cases = [
+      ['--company X', spaced.value('--company') === 'Acme' && spaced.has('--dry-run')
+        && spaced.positional.length === 0],
+      ['--company=X', joined.value('--company') === 'Acme Corp'],
+      ['bare optional --throttle', joined.has('--throttle') && joined.value('--throttle', 'dflt') === 'dflt'],
+      ['--throttle=N', tuned.value('--throttle') === '8000'],
+      ['a "-1" value', tuned.value('--min') === '-1'],
+      ['an absent flag', !spaced.has('--min') && spaced.value('--min', '6') === '6'],
+    ];
+    for (const [what, ok] of cases) {
+      if (ok) pass(`cli-guard parses ${what}`); else fail(`cli-guard mis-parses ${what}`);
+    }
+  } catch (e) {
+    fail(`cli-guard parser probe crashed: ${e.message}`);
+  }
+
+  // Behavioural probes run only where a broken guard is harmless: from an empty scratch
+  // directory, so a script reading reports/ or data/ relative to its cwd finds nothing,
+  // and with the three tracker writers pointed at a scratch tracker by CAREER_OPS_TRACKER.
+  // rederive-red-flags imports audit-scores.mjs before it parses arguments, so it runs
+  // from the repo; it previews by default, so a broken guard there writes nothing. None of the five takes a bare argument, so a bare word and a "-1" are
+  // refused as well.
   const guardDir = join(RUN_TMP, 'guard');
+  mkdirSync(guardDir, { recursive: true });
   const guardEnv = { ...process.env, CAREER_OPS_TRACKER: join(guardDir, 'applications.md'),
     CAREER_OPS_ADDITIONS: join(guardDir, 'additions') };
-  const FLAGS_ONLY = new Set(['dedup-tracker.mjs', 'normalize-statuses.mjs', 'merge-tracker.mjs']);
+  const guarded = (script, argv, cwd = guardDir) => {
+    try {
+      return { code: 0, out: execFileSync(NODE, [join(ROOT, script), ...argv],
+        { cwd, env: guardEnv, encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] }) };
+    } catch (e) { return { code: e.status, out: `${e.stdout || ''}${e.stderr || ''}` }; }
+  };
   for (const script of ['dedup-tracker.mjs', 'normalize-statuses.mjs',
     'merge-tracker.mjs', 'refresh-job-links.mjs',
     'rederive-red-flags.mjs']) {
-    const helpOut = run('node', [join(ROOT, script), '--help'], { cwd: ROOT, env: guardEnv });
-    const helped = typeof helpOut === 'string' && /--help/.test(helpOut);
-
-    const bad = ['--definitely-not-a-flag', ...(FLAGS_ONLY.has(script) ? ['-1', 'dry-run'] : [])];
-    const codes = bad.map((arg) => {
-      try {
-        execFileSync('node', [join(ROOT, script), arg],
-          { cwd: ROOT, env: guardEnv, stdio: ['pipe', 'pipe', 'pipe'] });
-        return 0;
-      } catch (e) { return e.status; }
-    });
+    const cwd = script === 'rederive-red-flags.mjs' ? ROOT : guardDir;
+    const helped = /--help/.test(guarded(script, ['--help'], cwd).out);
+    const bad = ['--definitely-not-a-flag', '-1', 'dry-run'];
+    const codes = bad.map((arg) => guarded(script, [arg], cwd).code);
 
     if (helped && codes.every((c) => c === 2)) {
       pass(`${script}: --help prints usage, ${bad.join(' / ')} exit 2`);
     } else {
       fail(`${script}: help=${helped}, exits ${codes.join('/')} for ${bad.join(' / ')} (want usage + exit 2)`);
+    }
+  }
+
+  // A typo of the one flag that writes, on a script that previews by default. From the
+  // empty directory, a guard that let it through would fail to import and exit 1.
+  {
+    const r = guarded('apply-model.mjs', ['--aply']);
+    if (r.code === 2 && /would silently preview/.test(r.out)) {
+      pass('apply-model.mjs: a mistyped --apply exits 2 and says it would have silently previewed');
+    } else {
+      fail(`apply-model.mjs --aply: exit ${r.code}, ${r.out.trim().slice(0, 160)}`);
+    }
+  }
+
+  // A declared value flag, in both spellings, reaches the script. doctor --json only reads.
+  // The two targets differ in whether cv.md exists, so a value dropped on the floor would
+  // read the repo root for both and the two answers could not both hold.
+  {
+    const bare = join(guardDir, 'doctor-bare');
+    const withCv = join(guardDir, 'doctor-cv');
+    mkdirSync(bare, { recursive: true });
+    mkdirSync(withCv, { recursive: true });
+    writeFileSync(join(withCv, 'cv.md'), '# CV\n');
+    const missing = (argv) => {
+      try { return JSON.parse(guarded('doctor.mjs', argv).out).missing; } catch { return null; }
+    };
+    const spaced = missing(['--json', '--target', bare]);
+    const joined = missing(['--json', `--target=${withCv}`]);
+    if (spaced?.includes('cv.md') && Array.isArray(joined) && !joined.includes('cv.md')) {
+      pass('doctor.mjs: --target <dir> and --target=<dir> both reach the script');
+    } else {
+      fail(`doctor.mjs --target: missing ${JSON.stringify(spaced)} / ${JSON.stringify(joined)}`);
+    }
+    const valueless = guarded('doctor.mjs', ['--json', '--target']);
+    if (valueless.code === 2 && /--target needs a value/.test(valueless.out)) {
+      pass('doctor.mjs: a value flag given no value exits 2');
+    } else {
+      fail(`doctor.mjs --target with no value: exit ${valueless.code}, ${valueless.out.trim().slice(0, 160)}`);
     }
   }
 
@@ -1545,7 +1670,11 @@ try {
     // The location policy loader every Python gate reads, and NVIDIA's per-req remote
     // check, which used to hard-code California and now asks the policy.
     ['scripts/_location.py', /_location selftest: \d+ checks, 0 failure\(s\)/],
-    ['scripts/nvidia-liveness.py', /nvidia-liveness selftest: \d+ home-remote cases, 0 failure\(s\)/],
+    // Both also read Workday liveness, and each closed live reqs on a one-page search or a
+    // response with no canApply until it moved onto req-resolve's walker and reader.
+    ['scripts/nvidia-liveness.py',
+      /nvidia-liveness selftest: \d+ home-remote cases \+ \d+ search cases, 0 failure\(s\)/],
+    ['scripts/workday-peek.py', /0 failure\(s\)/],
     // select()'s own filters (live, home_remote, tracked, the floor boundary, and a
     // zero-scoring title rescued by an in-lane body) used to be pinned only by test 23's
     // two-row fixture, which never exercised most of them.
@@ -3425,6 +3554,27 @@ try {
       } else {
         fail(`same-job-id repost handling broken: ${rows.length} Acme rows (expected 1 at 4.0/5)`);
       }
+    }
+  }
+
+  // integration: TWO additions updating ONE row in a single run must both land. The row
+  // was found by its raw text as read at start, which the first write had replaced, so
+  // the second update was logged and silently dropped.
+  {
+    const url = '**URL:** https://boards.greenhouse.io/acme/jobs/7654321';
+    const m = mergeFixture('career-ops-twice-', {
+      rows: ['| 50 | 2026-07-05 | Acme | Data Engineer, Search | 3.2/5 | Evaluated | ❌ | [50](../reports/050-acme.md) | original |'],
+      reports: { '050-acme.md': url, '051-acme.md': url, '052-acme.md': url },
+      tsvs: {
+        '051-acme.tsv': '51\t2026-07-16\tAcme\tData Engineer, Search\tEvaluated\t4.0/5\t❌\t[51](reports/051-acme.md)\tfirst re-eval',
+        '052-acme.tsv': '52\t2026-07-17\tAcme\tData Engineer, Search\tEvaluated\t4.3/5\t❌\t[52](reports/052-acme.md)\tsecond re-eval',
+      },
+    });
+    const rows = (m || '').split('\n').filter(l => /^\|\s*\d+\s*\|/.test(l) && l.includes('Acme'));
+    if (rows.length === 1 && rows[0].includes('4.3/5') && rows[0].includes('(4→4.3)')) {
+      pass('merge-tracker applies two updates to one row in a single run');
+    } else {
+      fail(`second update to one row in a run was dropped: ${rows.join(' / ') || 'merge crashed'}`);
     }
   }
 } catch (e) {
@@ -5745,7 +5895,6 @@ try {
   // Comments are stripped before the literal scan: naming the old broken pattern
   // in a comment is exactly how this stays understandable, and a scan that
   // punished it would push the explanation out of the file.
-  const codeOnly = (s) => s.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^[ \t]*\/\/.*$/gm, '');
   for (const f of ['pipeline-audit.mjs', 'role-matcher.mjs', 'eval-write.mjs']) {
     const src = readFileSync(join(ROOT, f), 'utf8');
     if (/from '\.\/req-id-core\.mjs'/.test(src)) {
@@ -5987,6 +6136,196 @@ try {
   }
 } catch (e) {
   fail(`eval-write prior-report test crashed: ${e.message}`);
+}
+
+// ── ONE HOST-ID TABLE, ONE ROLE-CELL ID DEFINITION ──────────────
+// Host-anchored requisition ids (Apple, Google, iCIMS and its front ends, EA, Breezy)
+// lived only in role-matcher.mjs, so eval-blockers.py could not recognise a packet on
+// those hosts as already reported unless its url matched a report's exactly. They are
+// DATA in host-ids.json now. Each rule carries its own example and key, which
+// role-matcher is held to here and eval-blockers --selftest holds itself to, so a rule
+// added to the file is tested in both with nothing else to edit.
+//
+// The role cell had three definitions of "an id": eval-write's label (writer),
+// role-matcher's identity (reader) and scan.mjs's canonicalRole (stripper), kept in
+// step by a comment. The writer and stripper now live in req-id-core.mjs beside the
+// reader's pattern, and the inclusions that matter are asserted: whatever the writer
+// puts in a role cell, and whatever the reader finds there, the stripper removes, or a
+// tracked role comes back as new on every scan. Fixtures always run; the real tracker
+// and the reports it links are read too whenever they are on disk.
+console.log('\n🧪 Testing one host-id table and one role-cell id definition...');
+try {
+  const hostIds = JSON.parse(readFileSync(join(ROOT, 'host-ids.json'), 'utf-8'));
+  const { extractJobId, rowIdReader } = await import(pathToFileURL(join(ROOT, 'role-matcher.mjs')).href);
+
+  for (const r of hostIds.rules) {
+    const got = extractJobId(r.example);
+    if (got === r.key) pass(`role-matcher keys the ${r.ns} example as ${r.key}`);
+    else fail(`role-matcher keyed host-ids.json's ${r.ns} example ${r.example} as ${got}, want ${r.key}`);
+  }
+  // An example proves a rule matches; only the anchor proves it matches nothing ELSE.
+  // Two equal ids merge two rows, so an unanchored rule is the damage the id prevents.
+  const loose = hostIds.rules.filter(r => !r.re.startsWith('^(?:https?://)?'));
+  if (!loose.length) pass(`every host-ids.json rule is anchored at the url's own host (${hostIds.rules.length})`);
+  else fail(`host-ids.json rules not anchored at the host: ${loose.map(r => r.ns).join(', ')}`);
+
+  // role-matcher consumes the TABLE beside it, not a private copy: run it against a
+  // planted table holding a rule nobody else has.
+  const probeDir = mkdtempSync(join(tmpdir(), 'career-ops-host-ids-'));
+  try {
+    for (const f of ['role-matcher.mjs', 'req-id-core.mjs']) {
+      writeFileSync(join(probeDir, f), readFileSync(join(ROOT, f)));
+    }
+    writeFileSync(join(probeDir, 'host-ids.json'), JSON.stringify({ rules: [
+      { ns: 'probe', re: String.raw`^(?:https?://)?jobs\.probe\.invalid/(\d+)` }] }));
+    const probed = await import(pathToFileURL(join(probeDir, 'role-matcher.mjs')).href);
+    const got = probed.extractJobId('https://jobs.probe.invalid/123');
+    if (got === 'probe:123') pass('role-matcher reads its host rules from host-ids.json');
+    else fail(`role-matcher ignored a planted host-ids.json rule (got ${got})`);
+  } finally {
+    rmSync(probeDir, { recursive: true, force: true });
+  }
+  // eval-blockers proves the same with a planted table in its own --selftest.
+  if (readFileSync(join(ROOT, 'scripts/eval-blockers.py'), 'utf-8').includes('"host-ids.json"')) {
+    pass('scripts/eval-blockers.py names host-ids.json as its table');
+  } else {
+    fail('scripts/eval-blockers.py no longer names host-ids.json');
+  }
+
+  // No literal copy. A copy is recognisable by a rule's host written as a REGEX would
+  // write it, "jobs\.apple\.com" or "jobs[.]apple[.]com"; the plain spelling may appear
+  // in prose and fixtures.
+  const hostsOf = (re) => re.match(/[a-z0-9-]+(?:\\\.[a-z0-9-]+)+/gi) || [];
+  const copyOf = (h) => new RegExp(h.split('\\.').join(String.raw`(?:\\\.|\[\.\])`), 'i');
+  const hosts = [...new Set(hostIds.rules.flatMap(r => hostsOf(r.re)))];
+  if (hostIds.rules.every(r => hostsOf(r.re).length)) {
+    pass(`the literal scan found an escaped host in every rule (${hosts.length} hosts)`);
+  } else {
+    fail('a host-ids.json rule yields no escaped host, so the literal scan cannot see a copy of it');
+  }
+  const planted = ['const R = /^jobs\\.apple\\.com\\/x/i;', "R = re.compile(r'jobs[.]apple[.]com')"];
+  if (planted.every(s => hosts.some(h => copyOf(h).test(s)))) {
+    pass('the literal scan detects a planted copy in either spelling');
+  } else {
+    fail('the literal scan cannot detect a planted copy, so it proves nothing');
+  }
+  for (const f of ['role-matcher.mjs', 'scripts/eval-blockers.py']) {
+    const src = readFileSync(join(ROOT, f), 'utf-8');
+    const copies = hosts.filter(h => copyOf(h).test(src));
+    if (!copies.length) pass(`${f} holds no literal copy of a host rule`);
+    else fail(`${f} holds its own copy of a host rule: ${copies.join(', ')}`);
+  }
+
+  // The writer and the stripper are imported, never redefined.
+  const core = await import(pathToFileURL(join(ROOT, 'req-id-core.mjs')).href);
+  const { canonicalRole } = await import(pathToFileURL(join(ROOT, 'scan.mjs')).href);
+  for (const [f, name, def] of [
+    ['eval-write.mjs', 'reqLabel', /(?:const|let|function)\s+reqLabel\b/],
+    ['scan.mjs', 'ROLE_ID_TOKEN_SRC', /(?:const|let)\s+ROLE_ID_TOKEN\w*\s*=/],
+  ]) {
+    const src = readFileSync(join(ROOT, f), 'utf-8');
+    const imports = new RegExp(`import \\{[^}]*\\b${name}\\b[^}]*\\} from '\\./req-id-core\\.mjs'`).test(src);
+    if (imports && !def.test(src)) pass(`${f} imports ${name} from req-id-core.mjs and defines none of its own`);
+    else fail(`${f} must import ${name} from req-id-core.mjs rather than define it`);
+  }
+
+  // An id token is stripped when the title comes back WHOLE and nothing else: once in
+  // the parenthesis eval-write writes and once bare, as hand-written cells carry it.
+  const T = 'Example Role';
+  const strippedBy = (strip) => (tok) =>
+    strip(`${T} (${tok})`) === 'example role' && strip(`${T} ${tok}`) === 'example role';
+  const strips = strippedBy(canonicalRole);
+  // A fake reader-side token list: every raw span the shared pattern finds, which is
+  // role-matcher's reqIdsIn(). Checked below to account for every id rowIdReader reports.
+  const rawIds = (cell) => [...String(cell).matchAll(core.reqIdGlobal())].map(m => m[1]);
+  const keyOf = (raw) => `wd:${core.canonId(raw).toLowerCase()}`;
+  const noStrip = (s) => String(s).toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+  const digitsOnly = (s) => noStrip(String(s).replace(/\d+/g, ' '));
+  if (canonicalRole(T) === 'example role' && strips('JR1000001')
+      && !strippedBy(noStrip)('JR1000001') && !strippedBy(digitsOnly)('JR1000001')
+      && !strippedBy(() => '')('JR1000001')) {
+    pass('the inclusion check goes red against a stripper that strips nothing, keeps a prefix or erases the title');
+  } else {
+    fail('the inclusion check cannot fail, so it proves nothing');
+  }
+
+  // Fixtures: one url per writer branch and one cell per reader form.
+  const writerFixtures = [
+    'https://fixture.wd5.myworkdayjobs.com/Site/job/US/Role_JR1000001',
+    'https://fixture.wd5.myworkdayjobs.com/Site/job/US/Role_JR-100001',
+    'https://fixture.wd5.myworkdayjobs.com/Site/job/US/Role_R23555-1',
+    'https://fixture.wd1.myworkdayjobs.com/Ext/job/CA/Role_26WD100001-1',
+    'https://fixture.wd5.myworkdayjobs.com/Site/job/US/Role_10000101',
+    'https://job-boards.greenhouse.io/fixture/jobs/1000001',
+  ];
+  const readerFixtures = ['Senior Engineer (Team, JR1000001)', 'Staff Engineer JR-100001',
+    'Engineer (R23555-1)', 'Engineer - 26WD100001'];
+  const read = rowIdReader(ROOT);
+  const checkWriter = (urls) => {
+    const out = { labels: 0, misses: [] };
+    for (const u of urls) {
+      const label = core.reqLabel(u);
+      if (!label) continue;
+      out.labels++;
+      if (!strips(label)) out.misses.push(`${label} from ${u}`);
+    }
+    return out;
+  };
+  const checkReader = (cells) => {
+    const out = { ids: 0, misses: [] };
+    for (const cell of cells) {
+      const raws = rawIds(cell);
+      const located = new Set(raws.map(keyOf));
+      for (const id of read({ role: cell, report: '' })) {
+        out.ids++;
+        if (!located.has(id)) out.misses.push(`${cell} [${id}: not a span this check can locate]`);
+      }
+      for (const raw of raws) if (!strips(raw)) out.misses.push(`${cell} [${raw}]`);
+    }
+    return out;
+  };
+  const wf = checkWriter(writerFixtures), rf = checkReader(readerFixtures);
+  if (wf.labels === writerFixtures.length && !wf.misses.length) pass(`every writer fixture label is stripped (${wf.labels})`);
+  else fail(`writer fixtures: ${wf.labels}/${writerFixtures.length} labelled, kept: ${wf.misses.join('; ')}`);
+  if (rf.ids === readerFixtures.length && !rf.misses.length) pass(`every reader fixture id is stripped (${rf.ids})`);
+  else fail(`reader fixtures: ${rf.ids}/${readerFixtures.length} read, kept: ${rf.misses.join('; ')}`);
+
+  const { trackerPath, columnsOf, parseRow } = await import(pathToFileURL(join(ROOT, 'tracker-rows.mjs')).href);
+  const tracker = trackerPath(ROOT);
+  if (!existsSync(tracker)) {
+    console.log(`  (no tracker at ${tracker}: the fixtures above are the whole check here)`);
+  } else {
+    const trackerDir = dirname(tracker);
+    const lines = readFileSync(tracker, 'utf-8').split('\n');
+    const cols = columnsOf(lines);
+    const cells = [], urls = new Set();
+    let links = 0, readable = 0;
+    for (const line of lines) {
+      const row = line.startsWith('|') ? parseRow(line, cols) : null;
+      if (!row) continue;
+      cells.push(row.role);
+      const link = String(row.report).match(/\]\(([^)]+)\)/);
+      if (!link) continue;
+      links++;
+      const path = join(trackerDir, link[1]);
+      if (!existsSync(path)) continue;
+      readable++;
+      const m = readFileSync(path, 'utf-8').match(/^[ \t]*\*\*URL:\*\*[ \t]*(\S+)/im);
+      if (m) urls.add(m[1]);
+    }
+    const r = checkReader(cells);
+    if (!r.misses.length) pass(`every role-cell id role-matcher reads is stripped by canonicalRole (${r.ids} ids in ${cells.length} rows)`);
+    else fail(`canonicalRole keeps ${r.misses.length} role-cell ids: ${r.misses.slice(0, 3).join('; ')}`);
+    if (!readable) {
+      console.log(`  (none of the tracker's ${links} report links is on disk: the writer corpus check has nothing to read)`);
+    } else {
+      const w = checkWriter(urls);
+      if (!w.misses.length) pass(`every label eval-write would write is stripped by canonicalRole (${w.labels} labels, ${readable}/${links} linked reports read)`);
+      else fail(`canonicalRole keeps ${w.misses.length} of ${w.labels} writer labels: ${w.misses.slice(0, 3).join('; ')}`);
+    }
+  }
+} catch (e) {
+  fail(`host-id table / role-cell definition test crashed: ${e.message}`);
 }
 
 // ── SETUP HARNESS ───────────────────────────────────────────────

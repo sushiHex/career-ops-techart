@@ -30,15 +30,16 @@
  *   node scan.mjs --verify --throttle=8000     # custom base gap in ms (waits base..2*base)
  */
 
+import { trackerRows } from './tracker-rows.mjs';
 import { readFileSync, writeFileSync, appendFileSync, existsSync, mkdirSync, readdirSync } from 'fs';
 import { pathToFileURL, fileURLToPath } from 'url';
 import path from 'path';
 import yaml from 'js-yaml';
 
-import { isMain } from './cli-guard.mjs';
+import { guardArgs, isMain } from './cli-guard.mjs';
 import { makeHttpCtx } from './providers/_http.mjs';
 import { buildSignals, decideLocations, effectiveLocationFilter } from './location-core.mjs';
-import { REQ_ID_SRC } from './req-id-core.mjs';
+import { ROLE_ID_TOKEN_SRC } from './req-id-core.mjs';
 
 const parseYaml = yaml.load;
 
@@ -506,11 +507,11 @@ export function canonicalCompany(value) {
     .trim();
 }
 
-// Zillow's P711740 is the form role-matcher.mjs composes beside the shared pattern, and a
-// trailing "-1" facet suffix belongs to the id before it, or "JR2292444-1" leaves a "1".
-const ROLE_ID_TOKEN = String.raw`(?:(?:${REQ_ID_SRC}|(?<![A-Za-z0-9])(?:REQ[-_ ]?\d{4,}|P\d{5,}|\d{5,})(?![A-Za-z0-9]))(?:-\d{1,2}(?![A-Za-z0-9]))?)`;
-const ROLE_PAREN_WITH_ID = new RegExp(String.raw`\((?=[^)]*${ROLE_ID_TOKEN})[^)]*\)`, 'gi');
-const ROLE_BARE_ID = new RegExp(ROLE_ID_TOKEN, 'gi');
+// The token is defined in req-id-core.mjs beside the label eval-write writes into a role
+// cell and the pattern role-matcher reads out of it; test-all asserts this stripper covers
+// both over the real tracker and reports.
+const ROLE_PAREN_WITH_ID = new RegExp(String.raw`\((?=[^)]*${ROLE_ID_TOKEN_SRC})[^)]*\)`, 'gi');
+const ROLE_BARE_ID = new RegExp(ROLE_ID_TOKEN_SRC, 'gi');
 
 /**
  * Canonical role title for tracker matching.
@@ -524,10 +525,10 @@ const ROLE_BARE_ID = new RegExp(ROLE_ID_TOKEN, 'gi');
  * data/already-evaluated.tsv rather than dropped silently: an over-merge stays
  * visible and recoverable instead of quietly deleting a live role.
  *
- * WHAT COUNTS AS AN ID is the shared Workday pattern from req-id-core.mjs,
- * composed with the two forms the tracker writes beside it: REQ-#### and a BARE
- * number of five or more digits, which is how a Greenhouse gh_jid and a Riot or
- * Disney id are recorded, "(5349405250)". The previous rule recognised an id
+ * WHAT COUNTS AS AN ID is ROLE_ID_TOKEN_SRC from req-id-core.mjs: the shared
+ * Workday pattern composed with the forms the tracker writes beside it, among them
+ * a BARE number of five or more digits, which is how a Greenhouse gh_jid and a
+ * Riot or Disney id are recorded, "(5349405250)". The previous rule recognised an id
  * only by a JR/R/REQ/GH prefix, so it missed the bare form and 33 roles already
  * on the tracker came back as new; and because its `r`
  * branch accepted any word, it also stripped "(Rigging)" and "(Robotics)",
@@ -550,14 +551,10 @@ function loadSeenCompanyRoles() {
   const seen = new Map();
   if (existsSync(APPLICATIONS_PATH)) {
     const text = readFileSync(APPLICATIONS_PATH, 'utf-8');
-    for (const line of text.split('\n')) {
-      if (!line.trim().startsWith('|')) continue;
-      const cells = line.split('|').map(s => s.trim());
-      // | # | Date | Company | Role | Score | Status | ...
-      const [, num, , company, role, score, status] = cells;
-      if (!/^\d+$/.test(num || '') || !company || !role) continue;
+    for (const { num, company, role, score, status } of trackerRows(text.split('\n'))) {
+      if (!company || !role) continue;
       const key = `${canonicalCompany(company)}::${canonicalRole(role)}`;
-      if (!seen.has(key)) seen.set(key, { num, company, role, score, status });
+      if (!seen.has(key)) seen.set(key, { num: String(num), company, role, score, status });
     }
   }
   return seen;
@@ -834,23 +831,33 @@ function guardStatusFor(code) {
 }
 
 async function main() {
-  const args = process.argv.slice(2);
-  const dryRun = args.includes('--dry-run');
-  const verify = args.includes('--verify');
+  const args = guardArgs({
+    name: 'scan.mjs',
+    summary: 'zero-token portal scan into data/pipeline.md',
+    flags: [
+      ['--dry-run', 'report what would be added, write nothing'],
+      ['--company <name>', 'scan only companies whose name contains this'],
+      ['--verify', 'check each new posting is live before adding it'],
+      ['--headed-fallback', 'with --verify, retry an anti-bot challenge in a headed browser'],
+      ['--throttle[=<ms>]', 'with --verify, jittered gap between checks (default 5000ms)'],
+      ['--rediscover-404', 'with --verify, look for a moved role before marking it expired'],
+    ],
+    notes: 'Without --dry-run this writes data/pipeline.md, data/scan-history.tsv and its veto logs in data/.',
+  });
+  const dryRun = args.has('--dry-run');
+  const verify = args.has('--verify');
   // Opt-in: on an anti-bot challenge (e.g. pracuj.pl Cloudflare wall), retry the
   // URL in a headed browser. Off by default — headed Chromium needs a display, so
   // scheduled/unattended scans should not rely on it.
-  const headedFallback = args.includes('--headed-fallback');
+  const headedFallback = args.has('--headed-fallback');
   // --throttle or --throttle=<ms>: jittered gap between --verify checks to stay
   // under rate-based WAF limits (pracuj.pl flags the session after a few rapid
   // hits). Default base 5000ms. Off by default — most ATS feeds don't need it.
-  const throttleArg = args.find((a) => a === '--throttle' || a.startsWith('--throttle='));
-  const throttleBaseMs = throttleArg ? (Number(throttleArg.split('=')[1]) || 5000) : 0;
+  const throttleBaseMs = args.has('--throttle') ? (Number(args.value('--throttle')) || 5000) : 0;
   // --rediscover-404: when a tracked company's URL 404/410s, search for the
   // moved role and re-verify before marking it expired. Opt-in; rides on --verify.
-  const rediscover = args.includes('--rediscover-404');
-  const companyFlag = args.indexOf('--company');
-  const filterCompany = companyFlag !== -1 ? args[companyFlag + 1]?.toLowerCase() : null;
+  const rediscover = args.has('--rediscover-404');
+  const filterCompany = args.value('--company')?.toLowerCase() ?? null;
 
   // 1. Load providers
   const providers = await loadProviders(PROVIDERS_DIR);

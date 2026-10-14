@@ -10,6 +10,7 @@
 /*.json
 !/package.json
 !/renovate.json
+!/host-ids.json
 /*.yml
 batch/*-list.txt
 batch/*-urls.txt

@@ -8,16 +8,24 @@
 import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
+import { guardArgs } from './cli-guard.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const argv = process.argv.slice(2);
-const targetIdx = argv.indexOf('--target');
-const projectRoot =
-  targetIdx !== -1 && argv[targetIdx + 1] ? argv[targetIdx + 1] : __dirname;
-const JSON_OUT = argv.includes('--json');
+const args = guardArgs({
+  name: 'doctor.mjs',
+  summary: 'setup validation for career-ops',
+  flags: [
+    ['--json', 'print only the cold-start state as JSON'],
+    ['--strict', 'also probe the ATS slugs in portals.yml (network)'],
+    ['--target <dir>', 'check this directory instead of the repo'],
+  ],
+  notes: 'Creates data/pipeline.md and the data/, output/ and reports/ directories when missing.',
+});
+const projectRoot = args.value('--target', __dirname);
+const JSON_OUT = args.has('--json');
 // --strict adds a live ATS-slug probe of portals.yml (network). Opt-in so the
 // default `npm run doctor` stays fast and fully offline.
-const STRICT = argv.includes('--strict');
+const STRICT = args.has('--strict');
 
 // ANSI colors (only on TTY)
 const isTTY = process.stdout.isTTY;

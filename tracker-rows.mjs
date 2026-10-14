@@ -1,9 +1,10 @@
 /**
  * tracker-rows.mjs — Reading and rewriting applications.md table rows.
  *
- * merge-tracker, verify-pipeline, dedup-tracker and normalize-statuses each held
- * their own copy of these helpers, and a copy that drifts reads the same tracker
- * differently from its neighbours. One module, so they cannot.
+ * Every tool that reads or writes the tracker used to hold its own copy of these
+ * helpers, most of them reading cells by fixed position and ignoring the header,
+ * and a copy that drifts reads the same tracker differently from its neighbours.
+ * One module, mapping columns by header name, so they cannot.
  */
 
 import { existsSync } from 'fs';
@@ -96,6 +97,55 @@ export function parseRow(line, colmap) {
     notes: colmap.notes != null ? (parts[colmap.notes] || '') : '',
     raw: line,
   };
+}
+
+/**
+ * Every data row of a tracker, parsed by header name and tagged with its line
+ * index (`row.line`), so a writer replaces lines[row.line] rather than searching
+ * for a raw string that an earlier write in the same run may have changed.
+ *
+ * @param {string[]} lines - The tracker's lines.
+ * @param {Record<string, number>} [colmap] - Defaults to columnsOf(lines).
+ * @returns {object[]}
+ */
+export function trackerRows(lines, colmap = columnsOf(lines)) {
+  const rows = [];
+  lines.forEach((line, i) => {
+    const row = line.startsWith('|') ? parseRow(line, colmap) : null;
+    if (row) rows.push(Object.assign(row, { line: i }));
+  });
+  return rows;
+}
+
+/**
+ * A tracker row written in header order: the inverse of parseRow. An
+ * unrecognised header BETWEEN named columns is written empty; one after the
+ * last named column is not written at all, since the map does not record it.
+ *
+ * @param {object} o - num, date, company, role, location, score, status, pdf, report, notes.
+ * @param {Record<string, number>} colmap - From columnsOf.
+ * @returns {string} `| a | b | ... |`
+ */
+export function buildRow(o, colmap) {
+  const cells = Array(Math.max(...Object.values(colmap))).fill('');
+  for (const [key, i] of Object.entries(colmap)) cells[i - 1] = String(o[key] ?? '');
+  return '| ' + cells.join(' | ') + ' |';
+}
+
+/**
+ * `line` with one named cell's text replaced and its padding kept, so a rewrite
+ * of one value touches nothing else on the row.
+ *
+ * @param {string} line
+ * @param {Record<string, number>} colmap
+ * @param {string} key - e.g. 'score'.
+ * @param {string} text
+ * @returns {string}
+ */
+export function setCell(line, colmap, key, text) {
+  const c = line.split('|');
+  c[colmap[key]] = c[colmap[key]].replace(/\S(?:[\s\S]*\S)?/, text);
+  return c.join('|');
 }
 
 /**

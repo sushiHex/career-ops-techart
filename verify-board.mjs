@@ -22,7 +22,7 @@
  */
 import { readFileSync, existsSync } from 'fs';
 import { join } from 'path';
-import { reportFileOf } from './tracker-rows.mjs';
+import { reportFileOf, trackerRows } from './tracker-rows.mjs';
 
 // Sibling modules resolve beside this file, so it runs from any directory; the
 // data it reads (data/, reports/) stays relative to where it is run.
@@ -46,19 +46,16 @@ if (!existsSync(TRACKER)) {
 const bad = [];
 let live = 0, ok = 0;
 
-for (const line of readFileSync(TRACKER, 'utf-8').split('\n')) {
-  if (!line.startsWith('|')) continue;
-  const c = line.split('|').map((x) => x.trim());
-  if (c.length < 8 || !/^\d+$/.test(c[1] || '')) continue;
-  if (DEAD.has(c[6])) continue;
+for (const row of trackerRows(readFileSync(TRACKER, 'utf-8').split('\n'))) {
+  if (DEAD.has(row.status)) continue;
   live++;
 
-  const shown = parseFloat(String(c[5]).replace('/5', ''));
-  const reportFile = reportFileOf(line);
+  const shown = parseFloat(String(row.score).replace('/5', ''));
+  const reportFile = reportFileOf(row.raw);
   const p = reportFile ? join('reports', reportFile) : null;
 
   let why = null;
-  if (!Number.isFinite(shown)) why = `score cell is not a number ("${c[5]}")`;
+  if (!Number.isFinite(shown)) why = `score cell is not a number ("${row.score}")`;
   else if (shown < 0 || shown > 5) why = `score ${shown} is outside 0-5`;
   else if (!reportFile) why = 'no report link';
   else if (!existsSync(p)) why = `report file missing (${p})`;
@@ -73,7 +70,7 @@ for (const line of readFileSync(TRACKER, 'utf-8').split('\n')) {
       else ok++;
     }
   }
-  if (why) bad.push({ num: c[1], co: c[3], role: c[4], shown, why, actionable: shown >= ACTIONABLE });
+  if (why) bad.push({ num: String(row.num), co: row.company, role: row.role, shown, why, actionable: shown >= ACTIONABLE });
 }
 
 const act = bad.filter((b) => b.actionable);

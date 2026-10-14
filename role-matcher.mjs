@@ -222,29 +222,15 @@ export function extractJobId(url) {
  * decided alone. 102 tracker rows had no identity that day, clustered exactly where one
  * employer posts many similar titles: Apple 13, GitHub 12, Google 6, EA 5.
  *
- * Each rule is anchored at its own HOST, the rule req-resolve.py applies to every
- * adapter, because an id here is not only a guard against merging: two rows with EQUAL
- * ids merge, so a loose rule that hands two postings one id does the very damage the
- * guard exists to prevent. That is also why the four-digit floor is allowed only where
- * the host fixes the position, never in the generic rule, where four digits is a year.
- *
- * github.careers and atlassian.com are front ends over iCIMS, and their page id IS the
- * iCIMS requisition id (GitHub's API `apply_url` and Atlassian's listing `portalUrl` both
- * point at <portal>.icims.com/jobs/<same id>). So all three spellings share one `icims:`
- * key, and the key drops the portal, because one employer serves several (GitHub has
- * careers-githubinc and globalcareers-githubinc). That is safe only because every
- * consumer compares ids within ONE company: merge-tracker and dedup-tracker filter by
- * company first, and eval-write keys its index on id plus company.
+ * The rules are DATA in host-ids.json, which scripts/eval-blockers.py reads too, so the
+ * two cannot hold different lists. That file states the contract (case-insensitive, the
+ * query and fragment cut, group 1 lowercased under its namespace) and why each rule is
+ * anchored at its host. Its `per_employer` flag is not read here: every consumer of these
+ * ids compares within ONE company already (merge-tracker and dedup-tracker filter by
+ * company first, eval-write keys its index on id plus company).
  */
-const HOSTED_ID = [
-  [/^(?:https?:\/\/)?jobs\.apple\.com\/[^?#]*?\/details\/(\d{6,})/i, 'apple'],
-  [/^(?:https?:\/\/)?(?:(?:www\.)?google\.com\/about\/careers\/[^?#]*?|careers\.google\.com)\/jobs\/results\/(\d{6,})/i, 'google'],
-  [/^(?:https?:\/\/)?(?:www\.)?github\.careers\/careers-home\/jobs\/(\d{3,})(?:[/?#]|$)/i, 'icims'],
-  [/^(?:https?:\/\/)?[\w-]+\.icims\.com\/jobs\/(\d{3,})(?:[/?#]|$)/i, 'icims'],
-  [/^(?:https?:\/\/)?(?:www\.)?atlassian\.com\/company\/careers\/details\/(\d{3,})(?:[/?#]|$)/i, 'icims'],
-  [/^(?:https?:\/\/)?jobs\.ea\.com\/[^?#]*?\/JobDetail\/[^/?#]+\/(\d{4,})(?:[/?#]|$)/i, 'ea'],
-  [/^(?:https?:\/\/)?[\w-]+\.breezy\.hr\/p\/([0-9a-f]{8,})/i, 'breezy'],
-];
+const HOSTED_ID = JSON.parse(readFileSync(new URL('./host-ids.json', import.meta.url), 'utf-8'))
+  .rules.map(r => [new RegExp(r.re, 'i'), r.ns]);
 
 function hostedId(pathOnly) {
   for (const [re, ns] of HOSTED_ID) {

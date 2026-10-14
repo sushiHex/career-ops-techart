@@ -36,9 +36,9 @@ import { fileURLToPath } from 'url';
 const { parseScores } = await import(new URL('./audit-scores.mjs', import.meta.url).href);
 
 import { guardArgs } from './cli-guard.mjs';
-import { reportFileOf } from './tracker-rows.mjs';
+import { reportFileOf, trackerRows } from './tracker-rows.mjs';
 
-const { argv: args } = guardArgs({
+const args = guardArgs({
   name: 'rederive-red-flags.mjs',
   summary: 're-derive red_flags_adj across reports from their own evidence',
   flags: [
@@ -50,8 +50,8 @@ const { argv: args } = guardArgs({
   notes: 'Previews by default. Nothing is written without --apply.',
   writesByDefault: false,
 });
-const APPLY = args.includes('--apply');
-const ONLY_FLAGGED = args.includes('--flagged');
+const APPLY = args.has('--apply');
+const ONLY_FLAGGED = args.has('--flagged');
 const REPORTS = 'reports';
 const TRACKER = join('data', 'applications.md');
 
@@ -169,14 +169,11 @@ function selftest() {
   return fails.length === 0;
 }
 
-if (args.includes('--selftest')) process.exit(selftest() ? 0 : 1);
+if (args.has('--selftest')) process.exit(selftest() ? 0 : 1);
 
 const rows = [];
-for (const line of readFileSync(TRACKER, 'utf-8').split('\n')) {
-  if (!line.startsWith('|')) continue;
-  const c = line.split('|').map((x) => x.trim());
-  if (c.length < 8 || !/^\d+$/.test(c[1] || '')) continue;
-  const reportFile = reportFileOf(line);
+for (const row of trackerRows(readFileSync(TRACKER, 'utf-8').split('\n'))) {
+  const reportFile = reportFileOf(row.raw);
   if (!reportFile) continue;
   const p = join(REPORTS, reportFile);
   if (!existsSync(p)) continue;
@@ -187,7 +184,7 @@ for (const line of readFileSync(TRACKER, 'utf-8').split('\n')) {
   const why = rationale(text);
   const { verdict, reason } = classifyRationale(why);
 
-  rows.push({ num: c[1], co: c[3], role: c[4], path: p, rf: s.red_flags_adj, verdict, reason, why });
+  rows.push({ num: String(row.num), co: row.company, role: row.role, path: p, rf: s.red_flags_adj, verdict, reason, why });
 }
 
 const keep = rows.filter((r) => r.verdict === 'keep');
@@ -224,8 +221,8 @@ if (!APPLY) {
 // written rationale proved unreliable in testing: it preserved penalties on reports that
 // mention a category only to RULE IT OUT, and kept two that were plainly match_w_cv
 // content. Those go to a judgment pass instead of being guessed at here.
-const target = args.includes('--all') ? zero : zero.filter((r) => r.reason === 'no stated rationale');
-if (!args.includes('--all')) {
+const target = args.has('--all') ? zero : zero.filter((r) => r.reason === 'no stated rationale');
+if (!args.has('--all')) {
   console.log('');
   console.log(`  applying to the ${target.length} unevidenced cases only.`);
   console.log(`  ${zero.length - target.length} with a written rationale are left for the judgment pass.`);

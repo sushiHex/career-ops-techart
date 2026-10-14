@@ -96,6 +96,49 @@ REQ_ID = _wd.REQ_ID
 tracked_key = _wd.tracked_key
 queue_packets = _wd._prep.queue_packets
 
+# Host-anchored ids (Apple, Google, iCIMS with its github.careers and atlassian.com
+# front ends, EA, Breezy) are DATA in host-ids.json, which role-matcher.mjs reads too,
+# so the two cannot hold different lists. The file states the contract; re.ASCII is
+# part of it, so \w and \d mean here what they mean in JavaScript.
+HOST_IDS_PATH = os.path.join(ROOT, "host-ids.json")
+
+
+def load_host_ids(path=HOST_IDS_PATH):
+    """[(compiled re, namespace, per_employer, rule)] in file order."""
+    with open(path, encoding="utf-8") as fh:
+        rules = json.load(fh)["rules"]
+    return [(re.compile(r["re"], re.I | re.ASCII), r["ns"], bool(r.get("per_employer")), r)
+            for r in rules]
+
+
+HOST_IDS = load_host_ids()
+
+
+def hosted_id(url):
+    """(key, per_employer) for the first host rule matching url, or None.
+
+    role-matcher's hostedId(): the url trimmed, query and fragment cut, group 1
+    lowercased under the rule's namespace.
+    """
+    path = re.split(r"[?#]", str(url).strip())[0]
+    for rx, ns, per_employer, _ in HOST_IDS:
+        m = rx.search(path)
+        if m:
+            return f"{ns}:{m.group(1).lower()}", per_employer
+    return None
+
+
+def employer_key(company):
+    """A company name folded by case and punctuation ONLY, to scope a per_employer id.
+
+    Not src_co(), which drops words such as Games, Labs and Systems: right for joining a
+    tracker row to a portals.yml label, wrong for identity, since it gives Acme Games and
+    Acme Labs one key and so one employer's report would answer for the other's packet.
+    A spelling this fold fails to join ("GitHub" against "GitHub, Inc.") only leaves a
+    packet visible as work, which is the safe direction.
+    """
+    return re.sub(r"[^a-z0-9]", "", str(company or "").lower())
+
 # Greenhouse puts the id in the query string, which is the one place a job
 # identity legitimately lives there. Ashby and Lever use a canonical UUID as a
 # whole path segment; bounding it with `/` keeps a UUID-shaped tracking
@@ -145,26 +188,35 @@ def req_key(url, company):
     employers posting "AI Engineer" is the commoner shape, so a title join would
     be wrong in both directions.
 
-    Tried in order: the shared Workday pattern, a Greenhouse gh_jid, an
-    Ashby/Lever UUID. The order is immaterial in practice because the three key
-    spaces cannot collide (hex holds no R or W, and a Greenhouse numeric id has
-    no letter prefix). This is narrower than role-matcher.mjs, which also reads
-    host-anchored ids (Apple, Google, iCIMS, EA, Breezy) first; a url on those
-    hosts can go unmatched here, which reads as unreported and keeps the packet.
+    Tried in order: the host-anchored rules of host-ids.json, the shared Workday
+    pattern, a Greenhouse gh_jid, an Ashby/Lever UUID. The host rules go first
+    and a match there is final, as in role-matcher.mjs, because a rule that owns
+    its host knows that host's id better than a generic one. Every key is
+    namespaced (`apple:`, `icims:`, `wd:`, `gh:`, `uuid:` and so on, the
+    spellings role-matcher produces), so no two key spaces can collide.
 
     Query and fragment are cut before the Workday pass, the rule jobKey()
     follows: a tracking parameter carrying a req-shaped token is not this
     posting's requisition. Last match wins, because the requisition sits at the
     end of an ATS path.
 
-    The Workday key is COMPANY-SCOPED by tracked_key() whenever the id is a bare
-    R#####, because tenants number from independent counters and one tracker
-    routinely carries bare R##### ids from several employers at once. A false hit here reads as "already reported" and, under
-    --prune, moves a live unevaluated req out of the queue, which is the
-    destructive direction.
+    Two kinds of key are COMPANY-SCOPED, because this index compares across
+    companies. A bare R##### through tracked_key(), since Workday tenants number
+    from independent counters and one tracker routinely carries bare R##### ids
+    from several employers at once. And a host rule's `per_employer` id (iCIMS,
+    Breezy), scoped by employer_key(), which with no company is no key at all. A
+    false hit here reads as "already reported" and, under --prune, moves a live
+    unevaluated req out of the queue, which is the destructive direction.
     """
     if not url:
         return None
+    hosted = hosted_id(url)
+    if hosted:
+        key, per_employer = hosted
+        if not per_employer:
+            return key
+        co = employer_key(company)
+        return f"{key}@{co}" if co else None
     path = str(url).split("?")[0].split("#")[0]
     last = None
     for m in REQ_ID.finditer(path):
@@ -485,6 +537,7 @@ def _packet(**kw):
 
 
 def selftest():
+    global HOST_IDS  # swapped for a planted table in one case, and restored
     fails = []
 
     def check(label, got, want):
@@ -561,7 +614,85 @@ def selftest():
               encoding="utf-8") as fh:
         fh.write("# 001 - Legacy\n\n**Company:** Legacy Co\n")
 
+    # One report per host rule family in host-ids.json. Each packet below names the same
+    # posting with a DIFFERENT url, so only the host-anchored identity can join them.
+    HOSTED = (
+        ("apple", "Apple",
+         "https://jobs.apple.com/en-us/details/201190336-0001/example-role",
+         "https://jobs.apple.com/en-gb/details/201190336-0001/example-role-renamed"),
+        ("google", "Google",
+         "https://careers.google.com/jobs/results/114723757451217499-example-role/",
+         "https://www.google.com/about/careers/applications/jobs/results/"
+         "114723757451217499-example-role-renamed"),
+        ("icims", "GitHub",
+         "https://www.github.careers/careers-home/jobs/1001?lang=en-us",
+         "https://careers-exampleinc.icims.com/jobs/1001/example-role/job"),
+        ("atlassian", "Atlassian",
+         "https://www.atlassian.com/company/careers/details/1002",
+         "https://www.atlassian.com/company/careers/details/1002/?src=feed"),
+        ("ea", "Electronic Arts",
+         "https://jobs.ea.com/en_US/careers/JobDetail/Example-Role/200001",
+         "https://jobs.ea.com/en_GB/careers/JobDetail/Example-Role-Renamed/200001"),
+        ("breezy", "Example Studio",
+         "https://example-studio.breezy.hr/p/3e7c3a9f0349-example-role",
+         "https://example-studio.breezy.hr/p/3e7c3a9f0349-example-role-renamed/apply"),
+    )
+    for i, (name, co, rep_url, _) in enumerate(HOSTED):
+        _write_report(reports, f"60{i}-{name}-2026-10-13.md", rep_url, co)
+    _write_report(reports, "610-acme-games-icims-2026-10-13.md",
+                  "https://careers-acme-games.icims.com/jobs/1003/example-role/job", "Acme Games")
+
     ix = report_index(reports)
+
+    # Every rule's own example in host-ids.json, the case role-matcher is held to in
+    # test-all, so a rule added to the file is tested here with nothing else to edit.
+    for _, ns, per_employer, rule in HOST_IDS:
+        want = rule["key"] + ("@exampleco" if per_employer else "")
+        check(f"host-ids.json example keys as {want}",
+              req_key(rule["example"], "Example Co"), want)
+    # req_key consumes the TABLE, not a private copy: plant a rule nobody else has.
+    probe = os.path.join(tmp, "host-ids.json")
+    with open(probe, "w", encoding="utf-8") as fh:
+        json.dump({"rules": [{"ns": "probe", "re": r"^(?:https?://)?jobs\.probe\.invalid/(\d+)"}]}, fh)
+    real_rules, HOST_IDS = HOST_IDS, load_host_ids(probe)
+    try:
+        check("req_key reads its host rules from the loaded table",
+              req_key("https://jobs.probe.invalid/123", "Probe"), "probe:123")
+    finally:
+        HOST_IDS = real_rules
+    check("the loaded table is host-ids.json",
+          [r for *_, r in HOST_IDS] == [r for *_, r in load_host_ids(HOST_IDS_PATH)], True)
+    for name, co, _, packet_url in HOSTED:
+        check(f"identity: {name} host rule across a re-spelt url",
+              blocker(_packet(url=packet_url, company=co), ix), "reported")
+    # One namespace is one id space, so its rules must agree on scoping, or a scoped
+    # github.careers key and an unscoped icims.com key for one posting never meet.
+    scoping = {}
+    for _, ns, per_employer, _ in HOST_IDS:
+        scoping.setdefault(ns, set()).add(per_employer)
+    check("every namespace in host-ids.json scopes all its rules alike",
+          sorted(ns for ns, s in scoping.items() if len(s) > 1), [])
+    # iCIMS counts per customer, so one employer's report must not answer for another
+    # employer's packet carrying the same number, and with no company there is no key.
+    # Acme Games and Acme Labs share a name once src_co() drops Games and Labs, which is
+    # why the scope is employer_key() and not that join key.
+    check("a per_employer id at a different company is NOT reported",
+          blocker(_packet(url="https://careers-acme-labs.icims.com/jobs/1003/example-role/job",
+                          company="Acme Labs"), ix), "ready")
+    check("a Breezy id on another employer's board is NOT reported",
+          blocker(_packet(url="https://other-studio.breezy.hr/p/3e7c3a9f0349-example-role",
+                          company="Other Studio"), ix), "ready")
+    check("a per_employer id from another front end is NOT reported",
+          blocker(_packet(url="https://www.atlassian.com/company/careers/details/1001",
+                          company="Atlassian"), ix), "ready")
+    # ...and an unkeyable host match is still final: the generic rules must not then
+    # read a req-shaped token out of the same url.
+    check("a per_employer id with no company is no key",
+          req_key("https://www.github.careers/careers-home/jobs/1001/x_JR2000003", ""), None)
+    # A host match is final: the generic rules never re-key a host-owned url.
+    check("a host rule outranks the generic rules",
+          req_key("https://jobs.apple.com/en-us/details/200000002-0001/x_JR2000002", "Apple"),
+          "apple:200000002")
 
     # A written-up req is `reported` even when its judgement fields are filled.
     # This is the case that used to read as `filled`, which is indistinguishable
