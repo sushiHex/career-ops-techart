@@ -7251,6 +7251,22 @@ console.log('\nLocation gates agree (Node scanner vs Python evaluation)');
     'New York City, NY or location to be confirmed', 'Los Angeles & Austin, TX',
     'Remote - US (TX, CA) - HQ in San Francisco', 'Los Angeles\u0085or Austin, TX',
     'San Fra\u1ab0ncisco, California', 'except CA', 'Sacramento (occasional travel to London)',
+    // Round 6: a street address is not a state, a foreign city in a bare list of places is
+    // another place while a foreign country (or a city in prose) qualifies it, a bare city
+    // from a "City, ST" entry is a question, the New York fold stops before a country, a
+    // bare work arrangement names no place, "Anywhere" and "remote within the US" ending an
+    // option are nationwide, and inputs on which Python's Unicode-wide regex semantics and
+    // JavaScript's ASCII ones used to disagree (one raised KeyError in Python).
+    'Torrance 1450 W. Washington Ave (hybrid, 3 days on-site)', 'Torrance 1450 West Washington Avenue',
+    'Los Angeles, London, Sydney', 'Seattle, Boston, Los Angeles, Berlin',
+    'Santa Ana, San Jose, Costa Rica', 'Venice, Italy', 'Onsite in Singapore, reporting to Los Angeles',
+    'Office - Ontario/Canada', 'Manitoba; Ontario; Nova Scotia', 'New York, USA - Remote',
+    'New York, U.S.A. (Remote)', 'New York City', 'Chicago, IL | Hybrid', 'Hybrid', 'Anywhere',
+    'Boston, MA, Chicago, IL, or Remote within Canada or United States',
+    'Remote within the United States (Texas residents only)', 'Remote in US, restricted to Texas',
+    'US Remote, must reside in one of 2 Texas counties',
+    'Los Angeles \u0662 Texas', 'Ontario,\ufeffCA', 'Los Angeles, \u0131reland', 'Seattle; \ufeffHybrid',
+    '\u4e2dRemote US', 'Remote, Texa\u017f',
   ];
   // Agreement alone would pass two gates that are wrong together, so the cases each
   // review round found are also pinned to the right answer.
@@ -7310,6 +7326,20 @@ console.log('\nLocation gates agree (Node scanner vs Python evaluation)');
     'San Fra\u1ab0ncisco, California': 'fail', 'except CA': 'unknown',
     // No commute place here, so only the onsite foreign check can see the trip.
     'Sacramento (occasional travel to London)': 'unknown',
+  });
+  Object.assign(expected.ca, {
+    'Torrance 1450 W. Washington Ave (hybrid, 3 days on-site)': 'pass',
+    'Torrance 1450 West Washington Avenue': 'pass',
+    'Los Angeles, London, Sydney': 'pass', 'Seattle, Boston, Los Angeles, Berlin': 'pass',
+    'Santa Ana, San Jose, Costa Rica': 'fail', 'Venice, Italy': 'fail',
+    'Onsite in Singapore, reporting to Los Angeles': 'fail', 'Office - Ontario/Canada': 'fail',
+    'Manitoba; Ontario; Nova Scotia': 'unknown', 'New York, USA - Remote': 'fail',
+    'New York, U.S.A. (Remote)': 'fail', 'New York City': 'fail', 'Chicago, IL | Hybrid': 'fail',
+    'Hybrid': 'unknown', 'Anywhere': 'pass',
+    'Boston, MA, Chicago, IL, or Remote within Canada or United States': 'pass',
+    'Remote within the United States (Texas residents only)': 'unknown',
+    'Remote in US, restricted to Texas': 'unknown',
+    'US Remote, must reside in one of 2 Texas counties': 'unknown', 'Remote, Texa\u017f': 'unknown',
   });
   Object.assign(expected.tx, { 'TX Remote': 'pass', 'Remote (US) - Must reside in TX': 'pass',
     'Remote (US) - Must reside in CT': 'fail', 'Texas - we are fully remote': 'pass' });
@@ -7500,6 +7530,14 @@ try {
       && warned.length === 1 && /allow/.test(warned[0]) && /block/.test(warned[0])) {
     pass('the scanner ignores generic allow/block keys out loud and applies the policy');
   } else fail(`scanner filter: remote=${f('Remote - US')} toronto=${f('Toronto, Canada')} austin=${f('Austin, TX (Onsite)')} warned=${warned}`);
+  // Both scanners must reach the policy through effectiveLocationFilter, never hand the raw
+  // portals.yml block to the decider, or the scan gate and eval-prep's gate are two gates.
+  const raw = ['scan.mjs', 'scan-ats-full.mjs'].filter((f2) => {
+    const src = readFileSync(join(ROOT, f2), 'utf8');
+    return !/build(?:LocationDecider|LocationFilter)\(effectiveLocationFilter\(config\??\.location_filter\)\)/.test(src);
+  });
+  if (!raw.length) pass('both scanners decide location through effectiveLocationFilter (the policy)');
+  else fail(`these scanners hand portals.yml's location_filter straight to the decider: ${raw.join(', ')}`);
 } catch (e) {
   fail(`scanner filter test crashed: ${e.message}`);
 }

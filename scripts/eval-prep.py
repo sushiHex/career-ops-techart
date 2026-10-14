@@ -1098,6 +1098,54 @@ LOCATION_CASES = [
      "a reachable hub among distant ones still clears, because the candidate can choose which office "
      "the in-office share is served at",
      "inside the commute ceiling"),
+    # Location spellings the shared grammar first read wrongly. Each is now a rule in
+    # presets/locations/_base-us.json or the tokeniser, pinned here and in location-core.mjs.
+    ("Torrance 1450 W. Washington Ave (hybrid, 3 days on-site)", False, "pass",
+     "an office written as a street address. 'Washington' after a house number and a "
+     "direction is the street, not Washington state; read as a state it failed a role "
+     "inside the commute", "inside the commute ceiling"),
+    ("Los Angeles, London, Sydney", False, "pass",
+     "a hub in a comma list of cities. A foreign CITY beside a commute place is another "
+     "place in the list, not a qualifier of it, so it must not void the Los Angeles match"),
+    ("Seattle, Boston, Los Angeles, Berlin", False, "pass",
+     "the same list shape with a trailing foreign city"),
+    ("Santa Ana, San Jose, Costa Rica", False, "fail",
+     "...while a foreign COUNTRY still qualifies the place: this is Santa Ana in Costa Rica, "
+     "not the Orange County city", "non-US"),
+    ("Venice, Italy", False, "fail", "the same rule for a commute name with a foreign twin"),
+    ("Onsite in Singapore, reporting to Los Angeles", False, "fail",
+     "a foreign city counts as another place only in a bare list of place names; in prose "
+     "it still voids the commute match"),
+    ("Office - Ontario/Canada", False, "fail",
+     "'Ontario' alone is the province here; the policy's 'Ontario, CA' entry must not pass "
+     "a bare Ontario", "non-US"),
+    ("Manitoba; Ontario; Nova Scotia", False, "unknown",
+     "a bare 'Ontario' with no state is a question, never a commute pass. The policy writes "
+     "it 'Ontario, CA' precisely because the city name alone is ambiguous"),
+    ("New York, USA - Remote", False, "fail",
+     "a state-scoped remote. The New York fold to the city must not fire before a country, "
+     "or the NY scope reads as a city mention and the row softens to unknown"),
+    ("New York, U.S.A. (Remote)", False, "fail", "the same scope, another spelling"),
+    ("New York City", False, "fail",
+     "the bare city, as several boards write it, is the out-of-range metro"),
+    ("Chicago, IL | Hybrid", False, "fail",
+     "a bare work-arrangement option names no place, so it cannot hold the posting open"),
+    ("Hybrid", False, "unknown", "...and on its own it is a placeholder", "placeholder"),
+    ("Anywhere", False, "pass", "a bare 'Anywhere' is a remote offer", "nationwide"),
+    ("Boston, MA, Chicago, IL, or Remote within Canada or United States", False, "pass",
+     "the remote alternative covers the whole US; the onsite cities before it are "
+     "alternatives, not a scope", "nationwide"),
+    ("Remote within the United States (Texas residents only)", False, "unknown",
+     "a restriction after 'within the US' keeps it out of the nationwide shortcut"),
+    ("Remote in US, restricted to Texas", False, "unknown",
+     "the shortcut fires only when the US ENDS the option; a blacklist of restriction words "
+     "after it missed 'restricted' and passed a Texas-only role"),
+    ("US Remote, must reside in one of 2 Texas counties", False, "unknown",
+     "a street needs a house number AND a direction; a bare number before a state name is "
+     "prose, and reading it as a street erased the Texas restriction"),
+    ("Remote, Texaſ", False, "unknown",
+     "a long s matched the state-name pattern case-insensitively and then missed the "
+     "lookup, raising KeyError; the Python patterns now use JavaScript's ASCII semantics"),
 ]
 
 
