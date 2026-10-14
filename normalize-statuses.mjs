@@ -16,12 +16,11 @@ import { readFileSync, writeFileSync, copyFileSync, existsSync, mkdirSync } from
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { guardArgs } from './cli-guard.mjs';
+import { columnsOf, rebuildRow, trackerPath, trackerRows } from './tracker-rows.mjs';
 
 const CAREER_OPS = dirname(fileURLToPath(import.meta.url));
-// Support both layouts: data/applications.md (boilerplate) and applications.md (original)
-const APPS_FILE = existsSync(join(CAREER_OPS, 'data/applications.md'))
-  ? join(CAREER_OPS, 'data/applications.md')
-  : join(CAREER_OPS, 'applications.md');
+// CAREER_OPS_TRACKER lets tests point the script at an isolated fixture.
+const APPS_FILE = trackerPath(CAREER_OPS);
 const args = guardArgs({
   name: 'normalize-statuses.mjs',
   summary: 'rewrite non-canonical status values in the applications tracker',
@@ -94,23 +93,6 @@ function normalizeStatus(raw) {
   return { status: null, unknown: true };
 }
 
-/**
- * Rebuild a markdown table row from `line.split('|')` cells without dropping the
- * last real cell. `split('|')` adds a leading empty element and, only when the
- * row ends with `|`, a trailing empty one. The old `slice(1, -1)` assumed that
- * trailing empty always existed, so a row written without a trailing pipe
- * (`| 5 | … | note`) lost its notes cell on rewrite. Drop the leading empty and
- * only drop a trailing element when it is genuinely empty.
- *
- * @param {string[]} parts - Trimmed cells from `line.split('|').map(s => s.trim())`.
- * @returns {string} The rebuilt `| a | b | … |` row.
- */
-function rebuildRow(parts) {
-  const cells = parts.slice(1);
-  if (cells.length > 0 && cells[cells.length - 1] === '') cells.pop();
-  return '| ' + cells.join(' | ') + ' |';
-}
-
 // Read applications.md
 if (!existsSync(APPS_FILE)) {
   console.log('No applications.md found. Nothing to normalize.');
@@ -120,55 +102,38 @@ const content = readFileSync(APPS_FILE, 'utf-8');
 const lines = content.split('\n');
 
 let changes = 0;
-let unknowns = [];
+const unknowns = [];
 
-for (let i = 0; i < lines.length; i++) {
-  const line = lines[i];
-  if (!line.startsWith('|')) continue;
-
-  const parts = line.split('|').map(s => s.trim());
-  // Format: ['', '#', 'fecha', 'empresa', 'rol', 'score', 'STATUS', 'pdf', 'report', 'notas', '']
-  if (parts.length < 9) continue;
-  if (parts[1] === '#' || parts[1] === '---' || parts[1] === '') continue;
-
-  const num = parseInt(parts[1]);
-  if (isNaN(num)) continue;
-
-  const rawStatus = parts[6];
+const colmap = columnsOf(lines);
+for (const row of trackerRows(lines, colmap)) {
+  const { num, status: rawStatus } = row;
   const result = normalizeStatus(rawStatus);
 
   if (result.unknown) {
-    unknowns.push({ num, rawStatus, line: i + 1 });
+    unknowns.push({ num, rawStatus, line: row.line + 1 });
     continue;
   }
 
   if (result.status === rawStatus) continue; // Already canonical
 
-  // Apply change
-  const oldStatus = rawStatus;
-  parts[6] = result.status;
+  const parts = row.raw.split('|').map(s => s.trim());
+  parts[colmap.status] = result.status;
 
   // Move DUPLICADO info to notes if needed
-  if (result.moveToNotes && parts[9]) {
-    const existing = parts[9] || '';
-    if (!existing.includes(result.moveToNotes)) {
-      parts[9] = result.moveToNotes + (existing ? '. ' + existing : '');
-    }
-  } else if (result.moveToNotes && !parts[9]) {
-    parts[9] = result.moveToNotes;
+  const moved = result.moveToNotes;
+  if (moved && colmap.notes != null && !row.notes.includes(moved)) {
+    parts[colmap.notes] = row.notes ? `${moved}. ${row.notes}` : moved;
   }
 
   // Also strip bold from score field
-  if (parts[5]) {
-    parts[5] = parts[5].replace(/\*\*/g, '');
+  if (row.score) {
+    parts[colmap.score] = row.score.replace(/\*\*/g, '');
   }
 
-  // Reconstruct line
-  const newLine = rebuildRow(parts);
-  lines[i] = newLine;
+  lines[row.line] = rebuildRow(parts);
   changes++;
 
-  console.log(`#${num}: "${oldStatus}" → "${result.status}"`);
+  console.log(`#${num}: "${rawStatus}" → "${result.status}"`);
 }
 
 if (unknowns.length > 0) {

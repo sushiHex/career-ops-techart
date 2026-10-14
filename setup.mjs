@@ -28,6 +28,7 @@ import { dirname, join, resolve } from 'path';
 import { fileURLToPath } from 'url';
 import { createInterface } from 'readline/promises';
 import yaml from 'js-yaml';
+import { guardArgs } from './cli-guard.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const LANE_PRESETS = join(HERE, 'presets', 'lanes');
@@ -44,15 +45,24 @@ const invokedDirectly = (() => {
       && realpathSync(resolve(process.argv[1])) === realpathSync(fileURLToPath(import.meta.url));
   } catch { return false; }
 })();
-const argv = invokedDirectly ? process.argv.slice(2) : [];
-const flag = (name) => argv.includes(name);
-const opt = (name) => { const i = argv.indexOf(name); return i === -1 ? null : argv[i + 1]; };
-const KNOWN = new Set(['--answers', '--example-answers', '--list-presets', '--dry-run',
-  '--force', '--target', '--help', '-h']);
-for (let i = 0; i < argv.length; i++) {
-  if (!KNOWN.has(argv[i])) { die(`unknown argument: ${argv[i]} (see --help)`, 2); }
-  if (argv[i] === '--answers' || argv[i] === '--target') i++;
-}
+const args = guardArgs({
+  name: 'setup.mjs',
+  summary: 'first-install configuration: writes the User Layer files every tool reads',
+  argv: invokedDirectly ? process.argv.slice(2) : [],
+  flags: [
+    ['--answers <file>', 'unattended: read the answers from this JSON file'],
+    ['--example-answers', 'print an answers file to start from'],
+    ['--list-presets', 'show the lane and location presets'],
+    ['--dry-run', 'show what would be written, write nothing'],
+    ['--force', 'overwrite existing files (each backed up to .bak)'],
+    ['--target <dir>', 'write into this directory instead of this checkout'],
+  ],
+  // The header above is the install guide; --help prints it after the flag list.
+  notes: readFileSync(fileURLToPath(import.meta.url), 'utf8').split('*/')[0]
+    .replace(/^#!.*\n/, '').replace(/^\/\*\*|^ \* ?/gm, '').trim(),
+});
+const flag = (name) => args.has(name);
+const opt = (name) => args.value(name) ?? null;
 
 function die(msg, code = 1) { console.error(`setup: ${msg}`); process.exit(code); }
 
@@ -671,10 +681,6 @@ async function interview() {
 // ---- main --------------------------------------------------------------------------
 
 if (invokedDirectly) {
-  if (flag('--help') || flag('-h')) {
-    console.log(readFileSync(fileURLToPath(import.meta.url), 'utf8').split('*/')[0].replace(/^\/\*\*|^ \* ?/gm, ''));
-    process.exit(0);
-  }
   if (flag('--list-presets')) {
     console.log('lane presets (presets/lanes/):');
     for (const n of listPresets(LANE_PRESETS, '.json')) console.log(`  ${n.padEnd(22)} ${lanePreset(n)._preset?.description || ''}`);

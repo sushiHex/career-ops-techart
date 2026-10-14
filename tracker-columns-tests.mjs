@@ -22,6 +22,7 @@ import { readFileSync, writeFileSync, mkdtempSync, mkdirSync, rmSync } from 'fs'
 import { join, dirname } from 'path';
 import { tmpdir } from 'os';
 import { fileURLToPath } from 'url';
+import { buildRow, columnsOf, isSeparatorRow, parseRow } from './tracker-rows.mjs';
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
 const NODE = process.execPath;
@@ -68,9 +69,7 @@ function makeSandbox(trackerContent, additions = {}) {
 function dataRows(trackerPath) {
   return readFileSync(trackerPath, 'utf-8')
     .split('\n')
-    // Separator rows only. A bare includes('---') also dropped data rows whose
-    // report link contains "---" from a slugified role — see merge-tracker.mjs.
-    .filter(l => l.startsWith('|') && !/^\s*\|[\s:|-]*\|\s*$/.test(l) && !/\bScore\b/.test(l));
+    .filter(l => l.startsWith('|') && !isSeparatorRow(l) && !/\bScore\b/.test(l));
 }
 
 const HEADER_10 = `# Applications Tracker
@@ -172,6 +171,25 @@ const TSV_NO_LOCATION = '2\t2026-02-02\tGlobex\tManager\tApplied\tN/A\t✅\t—\
     fail(`row with "---" yielded ${acmeRows.length} Acme rows (code ${merge.code})\n${rows.join('\n')}`);
   }
   rmSync(sb.dir, { recursive: true, force: true });
+}
+
+// Test: buildRow is the inverse of parseRow, in both layouts. merge-tracker writes
+// with buildRow and reads with parseRow, so a writer that ordered cells by fixed
+// position while the reader mapped them by header would corrupt the next read.
+{
+  const row = {
+    num: 7, date: '2026-03-03', company: 'Globex', role: 'Manager', location: 'Singapore',
+    score: '4.1/5', status: 'Applied', pdf: '❌', report: '[7](../reports/007-globex.md)', notes: 'note',
+  };
+  for (const [label, head] of [['9-col', HEADER_9], ['Location', HEADER_10]]) {
+    const colmap = columnsOf(head.split('\n'));
+    const line = buildRow(row, colmap);
+    const back = parseRow(line, colmap);
+    const want = { ...row, location: colmap.location != null ? row.location : '', raw: line };
+    const same = back && Object.keys(want).every(k => back[k] === want[k]);
+    if (same) pass(`parseRow(buildRow(o)) round-trips on the ${label} layout`);
+    else fail(`round trip on the ${label} layout: ${line} -> ${JSON.stringify(back)}`);
+  }
 }
 
 console.log(`\n${passed} passed, ${failed} failed`);

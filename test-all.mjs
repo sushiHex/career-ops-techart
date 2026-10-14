@@ -22,11 +22,26 @@ const ROOT = __dirname;
 const QUICK = process.argv.includes('--quick');
 const NODE = process.execPath;
 
+// Every temporary directory this run creates lives under one root that is removed when
+// the run ends, so no case can leak one. tmpdir() reads TEMP/TMP/TMPDIR on every call,
+// and the Node and Python children the suite spawns inherit them.
+const RUN_TMP = mkdtempSync(join(tmpdir(), 'career-ops-test-'));
+for (const k of ['TEMP', 'TMP', 'TMPDIR']) process.env[k] = RUN_TMP;
+process.on('exit', () => {
+  // Best effort: a file still held open (antivirus, a killed child) must not turn a
+  // finished run into a stack trace. The run's own exit code already stands.
+  try { rmSync(RUN_TMP, { recursive: true, force: true, maxRetries: 3 }); } catch { /* left for the OS */ }
+});
+
+const TRACKER_HEAD = '# Applications Tracker\n\n' +
+  '| # | Date | Company | Role | Score | Status | PDF | Report | Notes |\n' +
+  '|---|------|---------|------|-------|--------|-----|--------|-------|\n';
+
 // Every tool reads its configuration from CAREER_OPS_CONFIG_DIR when it is set. Point it
 // at an empty directory for this whole run, children included, so the suite sees no
 // configuration at all: a result must not depend on whose profile, location policy or
 // lane vocabulary happens to be installed. Tests that need a config build their own.
-process.env.CAREER_OPS_CONFIG_DIR = mkdtempSync(join(tmpdir(), 'career-ops-noconfig-'));
+process.env.CAREER_OPS_CONFIG_DIR = mkdtempSync(join(RUN_TMP, 'noconfig-'));
 
 let passed = 0;
 let failed = 0;
@@ -187,20 +202,48 @@ function readFile(path) {
   return content;
 }
 
+/**
+ * Drop block comments and whole-line `//` comments, for scans that must read code
+ * and not the prose explaining it.
+ *
+ * @param {string} s - JavaScript source.
+ * @returns {string} The source without those comments.
+ */
+const codeOnly = (s) => s.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^[ \t]*\/\/.*$/gm, '');
+
 console.log('\n🧪 career-ops test suite\n');
 
 // ── 1. SYNTAX CHECKS ────────────────────────────────────────────
 
 console.log('1. Syntax checks');
 
+// One child parses every file, because a `node --check` per file spent ~10s of this
+// suite on process spawns alone. vm.SourceTextModule compiles a module without linking
+// or running it, which is what --check does for an .mjs (hashbang, top-level await and
+// the module-only early errors included). The child needs --experimental-vm-modules,
+// which is why this is a child at all rather than in-process.
+const SYNTAX_CHECKER = `
+const { SourceTextModule } = require('vm');
+const { readFileSync } = require('fs');
+const out = process.argv.slice(1).map((f) => {
+  try { new SourceTextModule(readFileSync(f, 'utf8'), { identifier: f }); return null; }
+  catch (e) { return String(e && e.message || e); }
+});
+process.stdout.write(JSON.stringify(out));`;
 const mjsFiles = readdirSync(ROOT).filter(f => f.endsWith('.mjs'));
-for (const f of mjsFiles) {
-  const result = run(NODE, ['--check', f]);
-  if (result !== null) {
-    pass(`${f} syntax OK`);
-  } else {
-    fail(`${f} has syntax errors`);
-  }
+let syntaxErrors = null;
+try {
+  syntaxErrors = JSON.parse(run(NODE,
+    ['--experimental-vm-modules', '--no-warnings', '-e', SYNTAX_CHECKER, ...mjsFiles]) ?? 'null');
+} catch { /* reported below */ }
+if (!Array.isArray(syntaxErrors) || syntaxErrors.length !== mjsFiles.length) {
+  // A checker that answers for nothing must not read as every file passing.
+  fail(`syntax checker did not return one result per file (${mjsFiles.length} files)`);
+} else {
+  mjsFiles.forEach((f, i) => {
+    if (syntaxErrors[i] === null) pass(`${f} syntax OK`);
+    else fail(`${f} has syntax errors`);
+  });
 }
 
 // ── 2. SCRIPT EXECUTION ─────────────────────────────────────────
@@ -232,21 +275,20 @@ const scripts = [
   { name: 'score-model-tests.mjs', expectExit: 0 },
   { name: 'tracker-columns-tests.mjs', expectExit: 0 },
   { name: 'validate-portals.mjs --file templates/portals.example.yml', expectExit: 0 },
-  // Bare run: no portals.yml in the repo, so it must exit 0 gracefully (and hit
-  // no network). The probe logic itself is unit-tested below with a mock.
-  //
-  // Needs a longer timeout than the shared default. With a real user portals.yml this
-  // probes every ATS board in the file, so its runtime scales with that file rather
-  // than with anything in the repo. It sat around 8s at 80 boards; adding the
-  // coverage-gap employers on 2026-08-24 took it past 100, and it began intermittently
-  // tripping the 30s default and reporting as a crash. The work is network-bound, not
-  // slow code, so the timeout is what should move.
-  { name: 'verify-portals.mjs', expectExit: 0, timeoutMs: 120000 },
+  // Bare run with no portals file: it must exit 0 gracefully and hit no network. It is
+  // pointed at a missing file on purpose, because against an installed portals.yml it
+  // probes every board in it (15s and growing); the probe logic is unit-tested below
+  // with a mock.
+  { name: 'verify-portals.mjs', expectExit: 0,
+    env: { CAREER_OPS_PORTALS: join(RUN_TMP, 'no-portals.yml') } },
 ];
 
-for (const { name, allowFail, timeoutMs } of scripts) {
-  const result = run(NODE, name.split(' '),
-    { stdio: ['pipe', 'pipe', 'pipe'], ...(timeoutMs ? { timeout: timeoutMs } : {}) });
+for (const { name, allowFail, timeoutMs, env } of scripts) {
+  const result = run(NODE, name.split(' '), {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    ...(timeoutMs ? { timeout: timeoutMs } : {}),
+    ...(env ? { env: { ...process.env, ...env } } : {}),
+  });
   if (result !== null) {
     pass(`${name} runs OK`);
   } else if (allowFail) {
@@ -1391,22 +1433,130 @@ try {
   // flags, no factors, no min) via audit-scores.mjs and wrote that into the tracker's FINAL
   // column, which would have moved 234 rows while apply-model and score-audit both called
   // the same tracker clean.
+  //
+  // Which scripts must be guarded is SCANNED, not listed: a hand-kept list is one that
+  // falls behind the code without saying so, and seven writers had been added outside it.
+  // Every repo-root script that both writes files and reads its arguments imports
+  // cli-guard.mjs and calls it, or is named below with the reason it does not.
+  const GUARD_EXEMPT = {
+    'test-all.mjs': 'the test suite; it writes only under its own RUN_TMP',
+    'validate-portals.mjs': 'its only writes are a mkdtemp scratch directory inside --self-test',
+  };
+  try {
+    const WRITES = /\b(?:writeFileSync|appendFileSync|renameSync|unlinkSync|rmSync)\s*\(/;
+    const scanned = readdirSync(ROOT).filter((f) => f.endsWith('.mjs') && f !== 'cli-guard.mjs')
+      .map((f) => [f, codeOnly(readFileSync(join(ROOT, f), 'utf8'))])
+      .filter(([, src]) => WRITES.test(src)
+        && (/process\.argv/.test(src) || /from '\.\/cli-guard\.mjs'/.test(src)));
+    const unguarded = scanned.filter(([f, src]) => !GUARD_EXEMPT[f]
+      && !(/from '\.\/cli-guard\.mjs'/.test(src) && /\bguardArgs\(/.test(src))).map(([f]) => f);
+    const stale = Object.keys(GUARD_EXEMPT).filter((f) => !scanned.some(([s]) => s === f));
+    // A scanner that matches nothing passes everything.
+    if (scanned.length < 15) {
+      fail(`cli-guard scan found only ${scanned.length} writers that read their arguments; the scan is broken`);
+    } else if (unguarded.length || stale.length) {
+      fail(`writers that read argv without cli-guard: ${unguarded.join(', ') || 'none'}; `
+        + `exemptions matching no writer: ${stale.join(', ') || 'none'}`);
+    } else {
+      pass(`all ${scanned.length - Object.keys(GUARD_EXEMPT).length} argument-reading writers go through `
+        + `cli-guard (${Object.keys(GUARD_EXEMPT).length} exempt, each with a reason)`);
+    }
+  } catch (e) {
+    fail(`cli-guard scan crashed: ${e.message}`);
+  }
+
+  // The parser itself, in-process, on the accepting side (a refusal exits the process,
+  // so those cases run as children below). A flag that declares a value takes it in
+  // either spelling, and the value is consumed rather than mistaken for a stray argument.
+  try {
+    const { guardArgs } = await import(pathToFileURL(join(ROOT, 'cli-guard.mjs')).href);
+    const spec = (argv) => guardArgs({ name: 'probe', summary: 'probe', argv, flags: [
+      ['--dry-run', ''], ['--company <name>', ''], ['--throttle[=<ms>]', ''], ['--min <n>', '']] });
+    const spaced = spec(['--company', 'Acme', '--dry-run']);
+    const joined = spec(['--company=Acme Corp', '--throttle']);
+    const tuned = spec(['--throttle=8000', '--min', '-1']);
+    const cases = [
+      ['--company X', spaced.value('--company') === 'Acme' && spaced.has('--dry-run')
+        && spaced.positional.length === 0],
+      ['--company=X', joined.value('--company') === 'Acme Corp'],
+      ['bare optional --throttle', joined.has('--throttle') && joined.value('--throttle', 'dflt') === 'dflt'],
+      ['--throttle=N', tuned.value('--throttle') === '8000'],
+      ['a "-1" value', tuned.value('--min') === '-1'],
+      ['an absent flag', !spaced.has('--min') && spaced.value('--min', '6') === '6'],
+    ];
+    for (const [what, ok] of cases) {
+      if (ok) pass(`cli-guard parses ${what}`); else fail(`cli-guard mis-parses ${what}`);
+    }
+  } catch (e) {
+    fail(`cli-guard parser probe crashed: ${e.message}`);
+  }
+
+  // Behavioural probes run only where a broken guard is harmless: from an empty scratch
+  // directory, so a script reading reports/ or data/ relative to its cwd finds nothing,
+  // and with the three tracker writers pointed at a scratch tracker by CAREER_OPS_TRACKER.
+  // rederive-red-flags imports audit-scores.mjs before it parses arguments, so it runs
+  // from the repo; it previews by default, so a broken guard there writes nothing. None of the five takes a bare argument, so a bare word and a "-1" are
+  // refused as well.
+  const guardDir = join(RUN_TMP, 'guard');
+  mkdirSync(guardDir, { recursive: true });
+  const guardEnv = { ...process.env, CAREER_OPS_TRACKER: join(guardDir, 'applications.md'),
+    CAREER_OPS_ADDITIONS: join(guardDir, 'additions') };
+  const guarded = (script, argv, cwd = guardDir) => {
+    try {
+      return { code: 0, out: execFileSync(NODE, [join(ROOT, script), ...argv],
+        { cwd, env: guardEnv, encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] }) };
+    } catch (e) { return { code: e.status, out: `${e.stdout || ''}${e.stderr || ''}` }; }
+  };
   for (const script of ['dedup-tracker.mjs', 'normalize-statuses.mjs',
     'merge-tracker.mjs', 'refresh-job-links.mjs',
     'rederive-red-flags.mjs']) {
-    const helpOut = run('node', [join(ROOT, script), '--help'], { cwd: ROOT });
-    const helped = typeof helpOut === 'string' && /--help/.test(helpOut);
+    const cwd = script === 'rederive-red-flags.mjs' ? ROOT : guardDir;
+    const helped = /--help/.test(guarded(script, ['--help'], cwd).out);
+    const bad = ['--definitely-not-a-flag', '-1', 'dry-run'];
+    const codes = bad.map((arg) => guarded(script, [arg], cwd).code);
 
-    let refusedCode = null;
-    try {
-      execFileSync('node', [join(ROOT, script), '--definitely-not-a-flag'],
-        { cwd: ROOT, stdio: ['pipe', 'pipe', 'pipe'] });
-    } catch (e) { refusedCode = e.status; }
-
-    if (helped && refusedCode === 2) {
-      pass(`${script}: --help prints usage, unknown flag exits 2`);
+    if (helped && codes.every((c) => c === 2)) {
+      pass(`${script}: --help prints usage, ${bad.join(' / ')} exit 2`);
     } else {
-      fail(`${script}: help=${helped}, unknown-flag exit=${refusedCode} (want usage + exit 2)`);
+      fail(`${script}: help=${helped}, exits ${codes.join('/')} for ${bad.join(' / ')} (want usage + exit 2)`);
+    }
+  }
+
+  // A typo of the one flag that writes, on a script that previews by default. From the
+  // empty directory, a guard that let it through would fail to import and exit 1.
+  {
+    const r = guarded('apply-model.mjs', ['--aply']);
+    if (r.code === 2 && /would silently preview/.test(r.out)) {
+      pass('apply-model.mjs: a mistyped --apply exits 2 and says it would have silently previewed');
+    } else {
+      fail(`apply-model.mjs --aply: exit ${r.code}, ${r.out.trim().slice(0, 160)}`);
+    }
+  }
+
+  // A declared value flag, in both spellings, reaches the script. doctor --json only reads.
+  // The two targets differ in whether cv.md exists, so a value dropped on the floor would
+  // read the repo root for both and the two answers could not both hold.
+  {
+    const bare = join(guardDir, 'doctor-bare');
+    const withCv = join(guardDir, 'doctor-cv');
+    mkdirSync(bare, { recursive: true });
+    mkdirSync(withCv, { recursive: true });
+    writeFileSync(join(withCv, 'cv.md'), '# CV\n');
+    const missing = (argv) => {
+      try { return JSON.parse(guarded('doctor.mjs', argv).out).missing; } catch { return null; }
+    };
+    const spaced = missing(['--json', '--target', bare]);
+    const joined = missing(['--json', `--target=${withCv}`]);
+    if (spaced?.includes('cv.md') && Array.isArray(joined) && !joined.includes('cv.md')) {
+      pass('doctor.mjs: --target <dir> and --target=<dir> both reach the script');
+    } else {
+      fail(`doctor.mjs --target: missing ${JSON.stringify(spaced)} / ${JSON.stringify(joined)}`);
+    }
+    const valueless = guarded('doctor.mjs', ['--json', '--target']);
+    if (valueless.code === 2 && /--target needs a value/.test(valueless.out)) {
+      pass('doctor.mjs: a value flag given no value exits 2');
+    } else {
+      fail(`doctor.mjs --target with no value: exit ${valueless.code}, ${valueless.out.trim().slice(0, 160)}`);
     }
   }
 
@@ -1520,7 +1670,11 @@ try {
     // The location policy loader every Python gate reads, and NVIDIA's per-req remote
     // check, which used to hard-code California and now asks the policy.
     ['scripts/_location.py', /_location selftest: \d+ checks, 0 failure\(s\)/],
-    ['scripts/nvidia-liveness.py', /nvidia-liveness selftest: \d+ home-remote cases, 0 failure\(s\)/],
+    // Both also read Workday liveness, and each closed live reqs on a one-page search or a
+    // response with no canApply until it moved onto req-resolve's walker and reader.
+    ['scripts/nvidia-liveness.py',
+      /nvidia-liveness selftest: \d+ home-remote cases \+ \d+ search cases, 0 failure\(s\)/],
+    ['scripts/workday-peek.py', /0 failure\(s\)/],
     // select()'s own filters (live, home_remote, tracked, the floor boundary, and a
     // zero-scoring title rescued by an in-lane body) used to be pinned only by test 23's
     // two-row fixture, which never exercised most of them.
@@ -1651,6 +1805,7 @@ try {
     } else {
       fail('dedup-tracker did not refuse an unrecognised flag — a typo can rewrite the tracker');
     }
+    rmSync(dirname(tmpTracker), { recursive: true, force: true });
   }
 
   // ── Score units: the tracker states FINAL, not BASE ───────────────
@@ -1773,6 +1928,22 @@ try {
     ['role', 'Senior AI Platform and Tools Engineer', 'senior ai platform and tools engineer'],
     ['role', 'Staff Software Engineer, DevEx - VALORANT (REQ-0645134)', 'staff software engineer devex valorant'],
     ['role', 'Staff Software Engineer, DevEx - VALORANT', 'staff software engineer devex valorant'],
+    // The tracker records a Greenhouse or Riot id as a BARE number; a board title
+    // carries none. Missing this form brought 33 tracked roles back as new.
+    ['role', 'Staff Software Engineer - Test Systems & Tooling (5349405250)', 'staff software engineer test systems and tooling'],
+    ['role', 'Technical Art Lead, Rigging - VALORANT, Agents (8102471)', 'technical art lead rigging valorant agents'],
+    // A parenthetical that CONTAINS an id goes whole, team label included.
+    ['role', 'Senior Technical Marketing Engineer - Content Specialist (Industrial Engineering, JR2878530)', 'senior technical marketing engineer content specialist'],
+    ['role', 'Lead Technical Artist (26WD145751)', 'lead technical artist'],
+    ['role', 'Principal Machine Learning Engineer (P711740)', 'principal machine learning engineer'],
+    // A facet suffix is part of the id, or it survives as a stray "1" in the key.
+    ['role', 'Senior Engineer - JR2292444-1', 'senior engineer'],
+    // A parenthetical WITHOUT an id is part of the title. The old `r` branch
+    // stripped any word starting with r, so these two collapsed into one key.
+    ['role', 'Technical Artist (Rigging)', 'technical artist rigging'],
+    ['role', 'Senior Software Engineer (Robotics)', 'senior software engineer robotics'],
+    // A short number in a title is not an id.
+    ['role', 'Senior Engineer, Team 2026 Launch (Year 3)', 'senior engineer team 2026 launch year 3'],
   ];
   for (const [kind, input, expected] of canonCases) {
     const got = kind === 'company' ? canonicalCompany(input) : canonicalRole(input);
@@ -2871,9 +3042,7 @@ try {
     writeFileSync(join(tmpDir, 'reports', '012-acme-2026-01-04.md'), '# fixture\n');
     const tracker = join(tmpDir, 'data', 'applications.md');
     writeFileSync(tracker,
-      '# Applications Tracker\n\n' +
-      '| # | Date | Company | Role | Score | Status | PDF | Report | Notes |\n' +
-      '|---|------|---------|------|-------|--------|-----|--------|-------|\n' +
+      TRACKER_HEAD +
       '| 12 | 2026-01-04 | Acme | Engineer | 4.2/5 | Evaluated | ✅ | [12](reports/012-acme-2026-01-04.md) | ok |\n');
 
     // Migrate by pointing the script at the fixture tracker via env override.
@@ -2925,9 +3094,7 @@ try {
     mkdirSync(join(dedupTmp, 'data'));
     const tracker = join(dedupTmp, 'data', 'applications.md');
     writeFileSync(tracker,
-      '# Applications Tracker\n\n' +
-      '| # | Date | Company | Role | Score | Status | PDF | Report | Notes |\n' +
-      '|---|------|---------|------|-------|--------|-----|--------|-------|\n' +
+      TRACKER_HEAD +
       '| 21 | 2026-01-08 | Acme | Full Stack Engineer, Foundation | 3.9/5 | Applied | ❌ | [21](../reports/021-foundation.md) | applied sibling |\n' +
       '| 22 | 2026-01-08 | Acme | Full Stack Engineer, Guarded Releases | 4.3/5 | Evaluated | ❌ | [22](../reports/022-guarded.md) | evaluated sibling |\n' +
       '| 23 | 2026-01-08 | Acme | Staff Software Engineer, API | 4.0/5 | Evaluated | ❌ | [23](../reports/023-api.md) | acronym sibling |\n' +
@@ -3001,9 +3168,7 @@ try {
     // guard doesn't block the collapse), so dedup promotes #50's status and
     // rewrites the row — exercising rebuildRow() on a no-trailing-pipe row.
     writeFileSync(tracker,
-      '# Applications Tracker\n\n' +
-      '| # | Date | Company | Role | Score | Status | PDF | Report | Notes |\n' +
-      '|---|------|---------|------|-------|--------|-----|--------|-------|\n' +
+      TRACKER_HEAD +
       '| 50 | 2026-02-01 | Globex | Widget Engineer | 4.5/5 | Rejected | ❌ | [50](../reports/050-widget.md) | KEEPER_NOTE_SENTINEL\n' +
       '| 51 | 2026-02-02 | Globex | Widget Engineer | 3.0/5 | Evaluated | ❌ | [51](../reports/051-widget.md) | dup row |\n');
 
@@ -3052,9 +3217,7 @@ try {
     // report 592 instead of report 591, sees a real disagreement while a
     // link-keyed lookup sees none.
     writeFileSync(tracker,
-      '# Applications Tracker\n\n' +
-      '| # | Date | Company | Role | Score | Status | PDF | Report | Notes |\n' +
-      '|---|------|---------|------|-------|--------|-----|--------|-------|\n' +
+      TRACKER_HEAD +
       '| 592 | 2026-09-19 | Fixtureco | Report Link Fixture One | 4.05/5 | Evaluated | ❌ | [592](../reports/591-fixture-link-one-2026-09-19.md) | row number is one more than its linked report |\n' +
       '| 593 | 2026-09-19 | Fixtureco | Report Link Fixture Two | 3.64/5 | Evaluated | ❌ | [593](../reports/592-fixture-link-two-2026-09-19.md) | row number is one more than its linked report |\n' +
       '| 594 | 2026-09-19 | Fixtureco | Report Link Fixture Unlinked | 4.0/5 | Evaluated | ❌ | not yet linked | no parseable report link at all, must read NOT CHECKED |\n');
@@ -3139,6 +3302,28 @@ console.log('\n🧪 Testing verify-board reports NOT CHECKED, not a silent pass,
   rmSync(noTrackerTmp, { recursive: true, force: true });
 }
 
+// One merge-tracker fixture: a tracker holding `rows`, report files and TSV additions,
+// merged in a temp dir. Returns the merged tracker text, or null if merge-tracker crashed;
+// `inspect(trackerPath)`, when given, runs after the merge and before the dir is removed.
+const mergeFixture = (prefix, { rows, reports = {}, tsvs = {}, inspect }) => {
+  const dir = mkdtempSync(join(tmpdir(), prefix));
+  try {
+    for (const d of ['data', 'reports', 'additions']) mkdirSync(join(dir, d));
+    const tracker = join(dir, 'data', 'applications.md');
+    writeFileSync(tracker, TRACKER_HEAD + rows.map(r => `${r}\n`).join(''));
+    for (const [f, body] of Object.entries(reports)) writeFileSync(join(dir, 'reports', f), `${body}\n`);
+    for (const [f, body] of Object.entries(tsvs)) writeFileSync(join(dir, 'additions', f), `${body}\n`);
+    const r = run(NODE, ['merge-tracker.mjs'], {
+      env: { ...process.env, CAREER_OPS_TRACKER: tracker, CAREER_OPS_ADDITIONS: join(dir, 'additions') },
+    });
+    if (r === null) return null;
+    inspect?.(tracker);
+    return readFileSync(tracker, 'utf-8');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+};
+
 // ── MERGE-TRACKER FUZZY DEDUP (#751 / #721 family) ──────────────
 // roleFuzzyMatch over-matched whenever the token overlap dominated the
 // SMALLER side: two distinct roles sharing a long prefix ("Full-Stack
@@ -3150,60 +3335,44 @@ console.log('\n🧪 Testing verify-board reports NOT CHECKED, not a silent pass,
 // distinct specialties fall below the 0.6 threshold.
 console.log('\n🧪 Testing merge-tracker fuzzy dedup (distinct roles vs reposts)...');
 try {
-  const mergeTmp = mkdtempSync(join(tmpdir(), 'career-ops-merge-'));
-  try {
-    mkdirSync(join(mergeTmp, 'data'));
-    mkdirSync(join(mergeTmp, 'reports'));
-    const additionsDir = join(mergeTmp, 'additions');
-    mkdirSync(additionsDir);
-    const tracker = join(mergeTmp, 'data', 'applications.md');
-    writeFileSync(tracker,
-      '# Applications Tracker\n\n' +
-      '| # | Date | Company | Role | Score | Status | PDF | Report | Notes |\n' +
-      '|---|------|---------|------|-------|--------|-----|--------|-------|\n' +
-      '| 1 | 2026-01-04 | StreamCo | Full Stack Engineer 5, Ads Reporting | 4.4/5 | Evaluated | ❌ | [1](../reports/001-streamco-2026-01-04.md) | existing |\n' +
-      '| 2 | 2026-01-04 | Uber | Senior Software Engineer, Consumer Fulfillment (UberEats) | 4.2/5 | Evaluated | ❌ | [2](../reports/002-uber-2026-01-04.md) | existing |\n');
-    for (const n of ['001-streamco-2026-01-04', '002-uber-2026-01-04', '003-streamco-2026-01-05', '004-uber-2026-01-05', '005-streamco-2026-01-06']) {
-      writeFileSync(join(mergeTmp, 'reports', `${n}.md`), '# fixture\n');
-    }
+  const merged = mergeFixture('career-ops-merge-', {
+    rows: [
+      '| 1 | 2026-01-04 | StreamCo | Full Stack Engineer 5, Ads Reporting | 4.4/5 | Evaluated | ❌ | [1](../reports/001-streamco-2026-01-04.md) | existing |',
+      '| 2 | 2026-01-04 | Uber | Senior Software Engineer, Consumer Fulfillment (UberEats) | 4.2/5 | Evaluated | ❌ | [2](../reports/002-uber-2026-01-04.md) | existing |',
+    ],
+    reports: Object.fromEntries(['001-streamco-2026-01-04', '002-uber-2026-01-04', '003-streamco-2026-01-05',
+      '004-uber-2026-01-05', '005-streamco-2026-01-06'].map(n => [`${n}.md`, '# fixture'])),
     // Two DISTINCT roles (long shared prefix / shared brand token) + one true repost (score bump).
-    writeFileSync(join(additionsDir, '003-streamco.tsv'),
-      '3\t2026-01-05\tStreamCo\tFull-Stack Engineer 5, AI Insights & Visualizations\tEvaluated\t4.6/5\t❌\t[3](reports/003-streamco-2026-01-05.md)\tdistinct role\n');
-    writeFileSync(join(additionsDir, '004-uber.tsv'),
-      '4\t2026-01-05\tUber\tSenior Software Engineer, UberEats Feed\tEvaluated\t4.1/5\t❌\t[4](reports/004-uber-2026-01-05.md)\tdistinct team (#751)\n');
-    writeFileSync(join(additionsDir, '005-streamco.tsv'),
-      '5\t2026-01-06\tStreamCo\tFull Stack Engineer 5, Ads Reporting\tEvaluated\t4.5/5\t❌\t[5](reports/005-streamco-2026-01-06.md)\trepost\n');
-
-    const mergeResult = run(NODE, ['merge-tracker.mjs'], { env: { ...process.env, CAREER_OPS_TRACKER: tracker, CAREER_OPS_ADDITIONS: additionsDir } });
-    if (mergeResult === null) {
-      fail('merge-tracker.mjs crashed during fuzzy dedup regression test');
+    tsvs: {
+      '003-streamco.tsv': '3\t2026-01-05\tStreamCo\tFull-Stack Engineer 5, AI Insights & Visualizations\tEvaluated\t4.6/5\t❌\t[3](reports/003-streamco-2026-01-05.md)\tdistinct role',
+      '004-uber.tsv': '4\t2026-01-05\tUber\tSenior Software Engineer, UberEats Feed\tEvaluated\t4.1/5\t❌\t[4](reports/004-uber-2026-01-05.md)\tdistinct team (#751)',
+      '005-streamco.tsv': '5\t2026-01-06\tStreamCo\tFull Stack Engineer 5, Ads Reporting\tEvaluated\t4.5/5\t❌\t[5](reports/005-streamco-2026-01-06.md)\trepost',
+    },
+  });
+  if (merged === null) {
+    fail('merge-tracker.mjs crashed during fuzzy dedup regression test');
+  } else {
+    // Distinct role sharing a long prefix must be ADDED, not folded into the existing row.
+    if (merged.includes('AI Insights & Visualizations') && merged.includes('Ads Reporting')) {
+      pass('distinct roles with shared prefix kept as separate rows');
     } else {
-      const merged = readFileSync(tracker, 'utf-8');
-
-      // Distinct role sharing a long prefix must be ADDED, not folded into the existing row.
-      if (merged.includes('AI Insights & Visualizations') && merged.includes('Ads Reporting')) {
-        pass('distinct roles with shared prefix kept as separate rows');
-      } else {
-        fail('distinct role with shared prefix was merged away (silent data loss)');
-      }
-
-      // #751 repro: different teams under one brand token must both survive.
-      if (merged.includes('UberEats Feed') && merged.includes('Consumer Fulfillment')) {
-        pass('brand-token roles (#751: UberEats Feed vs Consumer Fulfillment) kept separate');
-      } else {
-        fail('brand-token roles were deduped (#751 regression)');
-      }
-
-      // True repost (identical role tokens) must still UPDATE in place — exactly one row, score bumped.
-      const adsRows = merged.split('\n').filter(l => l.includes('Ads Reporting'));
-      if (adsRows.length === 1 && adsRows[0].includes('4.5/5')) {
-        pass('true repost still updates the existing row in place (4.4 → 4.5, no duplicate)');
-      } else {
-        fail(`repost handling broken: ${adsRows.length} 'Ads Reporting' rows, expected 1 updated to 4.5/5`);
-      }
+      fail('distinct role with shared prefix was merged away (silent data loss)');
     }
-  } finally {
-    rmSync(mergeTmp, { recursive: true, force: true });
+
+    // #751 repro: different teams under one brand token must both survive.
+    if (merged.includes('UberEats Feed') && merged.includes('Consumer Fulfillment')) {
+      pass('brand-token roles (#751: UberEats Feed vs Consumer Fulfillment) kept separate');
+    } else {
+      fail('brand-token roles were deduped (#751 regression)');
+    }
+
+    // True repost (identical role tokens) must still UPDATE in place — exactly one row, score bumped.
+    const adsRows = merged.split('\n').filter(l => l.includes('Ads Reporting'));
+    if (adsRows.length === 1 && adsRows[0].includes('4.5/5')) {
+      pass('true repost still updates the existing row in place (4.4 → 4.5, no duplicate)');
+    } else {
+      fail(`repost handling broken: ${adsRows.length} 'Ads Reporting' rows, expected 1 updated to 4.5/5`);
+    }
   }
 } catch (e) {
   fail(`merge-tracker fuzzy dedup tests crashed: ${e.message}`);
@@ -3220,7 +3389,7 @@ try {
 // across a report-number/title change.
 console.log('\n🧪 Testing job-id authoritative dedup (merge + dedup)...');
 try {
-  const { extractJobId, roleFuzzyMatch } = await import(pathToFileURL(join(ROOT, 'role-matcher.mjs')).href);
+  const { extractJobId, roleFuzzyMatch, idSetsOverlap, idSetsConflict } = await import(pathToFileURL(join(ROOT, 'role-matcher.mjs')).href);
 
   // unit: extractJobId distinguishes the real-world URLs that were mis-merged
   const zSenior = extractJobId('https://zillow.wd5.myworkdayjobs.com/zillow_group_external/job/remote-usa/example-role-08_p747039');
@@ -3245,6 +3414,53 @@ try {
   } else {
     fail(`extractJobId mangled the separator form: staff=${sonyStaff} senior=${sonySenior}`);
   }
+  // Company-hosted boards whose ids the generic rules missed. github.careers writes a
+  // FOUR-digit id, so the Senior (5742) and Staff (5708) reqs of one team both came back
+  // null and dedup-tracker proposed deleting one as the other's duplicate.
+  const hosted = [
+    // github.careers and atlassian.com are front ends over iCIMS whose page id IS the
+    // iCIMS id, so all three spellings of one posting share one key.
+    ['https://www.github.careers/careers-home/jobs/5742', 'icims:5742'],
+    ['https://www.github.careers/careers-home/jobs/5742?lang=en-us', 'icims:5742'],
+    ['https://www.github.careers/careers-home/jobs/5708', 'icims:5708'],
+    ['https://careers-githubinc.icims.com/jobs/5708/login', 'icims:5708'],
+    ['https://globalcareers-githubinc.icims.com/jobs/15816/x/job', 'icims:15816'],
+    ['https://jobs.apple.com/en-us/details/275158197-0670/lead-developer-ai-workflows', 'apple:275158197'],
+    ['https://www.google.com/about/careers/applications/jobs/results/72710505838017443-software-engineer-iii', 'google:72710505838017443'],
+    // the same Google posting WITHOUT its title slug: the generic 7+ digit rule used to
+    // claim this spelling first and key it as id:, a different key for one posting.
+    ['https://www.google.com/about/careers/applications/jobs/results/72710505838017443', 'google:72710505838017443'],
+    ['https://jobs.ea.com/en_US/careers/JobDetail/Senior-Tools-Engineer-Apex-Legends/212777', 'ea:212777'],
+    ['https://www.atlassian.com/company/careers/details/26789', 'icims:26789'],
+    ['https://agbo.breezy.hr/p/f90b2472f4e5-expression-of-interest', 'breezy:f90b2472f4e5'],
+  ];
+  const hostedBad = hosted.filter(([u, want]) => extractJobId(u) !== want)
+    .map(([u, want]) => `${u} -> ${extractJobId(u)} (want ${want})`);
+  if (!hostedBad.length) pass(`extractJobId reads ${hosted.length} company-hosted id forms, query strings ignored`);
+  else fail(`extractJobId missed hosted ids: ${hostedBad.join('; ')}`);
+  // A host-anchored rule must not fire on a host it does not own: an Apple-shaped path on
+  // a tracker would otherwise hand two postings one id, and equal ids MERGE.
+  if (extractJobId('https://tracker.example.com/r/jobs.apple.com/en-us/details/275158197-0670/x') !== 'apple:275158197') {
+    pass('a hosted id rule does not fire on a URL that only mentions the host');
+  } else {
+    fail('a hosted id rule fired on a wrapper URL that merely mentions jobs.apple.com');
+  }
+
+  // A row's identity is a SET: one posting is recorded under different numbering systems
+  // (an Eightfold id in its URL, a JR id in its role cell). Rows sharing ANY
+  // id are one posting; rows conflict only when both have ids and share none.
+  {
+    const both = new Set(['id:790310000001', 'wd:jr10001']);
+    const jrOnly = new Set(['wd:jr10001']);
+    const other = new Set(['wd:jr10002']);
+    const none = new Set();
+    const ok = idSetsOverlap(both, jrOnly) && !idSetsConflict(both, jrOnly)
+      && idSetsConflict(both, other) && !idSetsOverlap(both, other)
+      && !idSetsConflict(both, none) && !idSetsConflict(none, none) && !idSetsOverlap(none, none);
+    if (ok) pass('identity sets: any shared id is one posting; disjoint non-empty sets conflict; empty is inconclusive');
+    else fail('identity set semantics wrong (overlap / conflict / empty)');
+  }
+
   // the facet suffix must still be stripped where it really is a facet
   if (extractJobId('https://zillow.wd5.myworkdayjobs.com/x/job/Remote-USA/Principal-MLE_P711740-2') === 'wd:p711740') {
     pass('extractJobId still strips a genuine Workday facet suffix (-2)');
@@ -3259,64 +3475,79 @@ try {
   }
 
   // integration: merge-tracker must ADD a distinct-job-id role, not clobber the existing one
-  const jTmp = mkdtempSync(join(tmpdir(), 'career-ops-jobid-'));
-  try {
-    mkdirSync(join(jTmp, 'data'));
-    mkdirSync(join(jTmp, 'reports'));
-    const jAdds = join(jTmp, 'additions');
-    mkdirSync(jAdds);
-    const jTracker = join(jTmp, 'data', 'applications.md');
-    writeFileSync(jTracker,
-      '# Applications Tracker\n\n' +
-      '| # | Date | Company | Role | Score | Status | PDF | Report | Notes |\n' +
-      '|---|------|---------|------|-------|--------|-----|--------|-------|\n' +
-      '| 10 | 2026-07-05 | Zillow | Senior Machine Learning Engineer | 3.0/5 | Discarded | ❌ | [10](../reports/010-zillow-senior.md) | existing distinct role |\n');
-    writeFileSync(join(jTmp, 'reports', '010-zillow-senior.md'),
-      '**URL:** https://zillow.wd5.myworkdayjobs.com/zillow_group_external/job/remote-usa/example-role-08_p747039\n');
-    writeFileSync(join(jTmp, 'reports', '011-zillow-principal.md'),
-      '**URL:** https://zillow.wd5.myworkdayjobs.com/en-US/Zillow_Group_External/job/Remote-USA/Example-Role-04_P711740-2\n');
-    // distinct posting (higher score) whose title fuzzy-matches the existing row
-    writeFileSync(join(jAdds, '011-zillow.tsv'),
-      '11\t2026-07-16\tZillow\tPrincipal Machine Learning Engineer, Agentic AI\tEvaluated\t3.5/5\t❌\t[11](reports/011-zillow-principal.md)\tdistinct job id\n');
+  {
+    const m = mergeFixture('career-ops-jobid-', {
+      rows: ['| 10 | 2026-07-05 | Zillow | Senior Machine Learning Engineer | 3.0/5 | Discarded | ❌ | [10](../reports/010-zillow-senior.md) | existing distinct role |'],
+      reports: {
+        '010-zillow-senior.md': '**URL:** https://zillow.wd5.myworkdayjobs.com/zillow_group_external/job/remote-usa/example-role-08_p747039',
+        '011-zillow-principal.md': '**URL:** https://zillow.wd5.myworkdayjobs.com/en-US/Zillow_Group_External/job/Remote-USA/Example-Role-04_P711740-2',
+      },
+      // distinct posting (higher score) whose title fuzzy-matches the existing row
+      tsvs: { '011-zillow.tsv': '11\t2026-07-16\tZillow\tPrincipal Machine Learning Engineer, Agentic AI\tEvaluated\t3.5/5\t❌\t[11](reports/011-zillow-principal.md)\tdistinct job id' },
+    });
+    if (m === null) fail('merge-tracker crashed during job-id dedup test');
+    else if (m.includes('Senior Machine Learning Engineer') && m.includes('Principal Machine Learning Engineer, Agentic AI')) {
+      pass('merge-tracker keeps distinct-job-id roles separate (no clobber)');
+    } else fail('merge-tracker clobbered a distinct-job-id role via fuzzy title match');
+  }
 
-    const jMerge = run(NODE, ['merge-tracker.mjs'], { env: { ...process.env, CAREER_OPS_TRACKER: jTracker, CAREER_OPS_ADDITIONS: jAdds } });
-    if (jMerge === null) {
-      fail('merge-tracker crashed during job-id dedup test');
-    } else {
-      const m = readFileSync(jTracker, 'utf-8');
-      if (m.includes('Senior Machine Learning Engineer') && m.includes('Principal Machine Learning Engineer, Agentic AI')) {
-        pass('merge-tracker keeps distinct-job-id roles separate (no clobber)');
-      } else {
-        fail('merge-tracker clobbered a distinct-job-id role via fuzzy title match');
-      }
-    }
-  } finally {
-    rmSync(jTmp, { recursive: true, force: true });
+  // integration: an id the report states BESIDE a bare careers host, or only in the
+  // row's role cell, is still an id. On 2026-10-08 a report reading "**URL:**
+  // https://<tenant>.wd5.myworkdayjobs.com/<site> (JR...)" yielded no id because only
+  // the first token of the line was read; with no id the row conflicted with nothing,
+  // and a new requisition whose title fuzzy-matched was merged over it.
+  for (const [label, existingUrlLine, existingRole] of [
+    ['an id beside a bare host on the URL line',
+     '**URL:** https://acme.wd5.myworkdayjobs.com/AcmeExternal (JR1000101)',
+     'Senior Machine Learning Engineer'],
+    ['an id only in the role cell',
+     '**URL:** https://acme.wd5.myworkdayjobs.com/AcmeExternal',
+     'Senior Machine Learning Engineer (JR1000101)'],
+  ]) {
+    const m = mergeFixture('career-ops-jobid-line-', {
+      rows: [`| 20 | 2026-07-08 | Acme | ${existingRole} | 2.0/5 | Discarded | ❌ | [20](../reports/020-acme-senior.md) | existing distinct req |`],
+      reports: {
+        '020-acme-senior.md': existingUrlLine,
+        '021-acme-mle.md': '**URL:** https://acme.wd5.myworkdayjobs.com/AcmeExternal/job/US-CA-Remote/Example-Role-21_JR1000202',
+      },
+      tsvs: { '021-acme.tsv': '21\t2026-10-08\tAcme\tMachine Learning Engineer (JR1000202)\tSKIP\t4.0/5\t❌\t[21](reports/021-acme-mle.md)\tdistinct req' },
+    }) || '';
+    if (m.includes('existing distinct req') && m.includes('Machine Learning Engineer (JR1000202)')) {
+      pass(`merge-tracker keeps a distinct req separate when the existing row's id is ${label}`);
+    } else fail(`merge-tracker merged a distinct req over a row whose id is ${label}`);
+  }
+
+  // integration: an addition whose REPORT number equals an existing row's ROW number at
+  // the same employer is not that row. The two sequences are independent, and a
+  // number-plus-company match that ran before the id guard would have folded the next
+  // evaluation into whichever row of that employer carried the number.
+  {
+    const m = mergeFixture('career-ops-rownum-', {
+      rows: ['| 31 | 2026-10-08 | Acme | Example Role Alpha (JR1000303) | 3.0/5 | SKIP | ❌ | [29](../reports/029-acme-alpha.md) | row 31, report 29 |'],
+      reports: {
+        '029-acme-alpha.md': '**URL:** https://acme.wd5.myworkdayjobs.com/AcmeExternal/job/US-CA-Remote/Example-Role-29_JR1000303',
+        '031-acme-beta.md': '**URL:** https://acme.wd5.myworkdayjobs.com/AcmeExternal/job/US-CA-Remote/Example-Role-31_JR1000404',
+      },
+      tsvs: { '031-acme.tsv': '31\t2026-10-09\tAcme\tExample Role Beta (JR1000404)\tEvaluated\t4.2/5\t❌\t[31](reports/031-acme-beta.md)\tnew req, report 31' },
+    }) || '';
+    if (m.includes('row 31, report 29') && m.includes('Example Role Beta (JR1000404)')) {
+      pass('merge-tracker does not pair an addition with a row by row number');
+    } else fail('merge-tracker folded a new req into the row that shares its number');
   }
 
   // integration: SAME job-id across a report-number + title change must UPDATE in place
-  const rTmp = mkdtempSync(join(tmpdir(), 'career-ops-jobid-repost-'));
-  try {
-    mkdirSync(join(rTmp, 'data'));
-    mkdirSync(join(rTmp, 'reports'));
-    const rAdds = join(rTmp, 'additions');
-    mkdirSync(rAdds);
-    const rTracker = join(rTmp, 'data', 'applications.md');
-    writeFileSync(rTracker,
-      '# Applications Tracker\n\n' +
-      '| # | Date | Company | Role | Score | Status | PDF | Report | Notes |\n' +
-      '|---|------|---------|------|-------|--------|-----|--------|-------|\n' +
-      '| 40 | 2026-07-05 | Acme | Data Engineer, Search | 3.2/5 | Evaluated | ❌ | [40](../reports/040-acme.md) | original |\n');
-    writeFileSync(join(rTmp, 'reports', '040-acme.md'), '**URL:** https://boards.greenhouse.io/acme/jobs/1194374\n');
-    writeFileSync(join(rTmp, 'reports', '041-acme.md'), '**URL:** https://boards.greenhouse.io/acme/jobs/1194374\n');
-    // same greenhouse job id, different report number and a retitle → should UPDATE #40, not add
-    writeFileSync(join(rAdds, '041-acme.tsv'),
-      '41\t2026-07-16\tAcme\tSenior Data Engineer, Discovery Search\tEvaluated\t4.0/5\t❌\t[41](reports/041-acme.md)\tsame job reposted\n');
-    const rMerge = run(NODE, ['merge-tracker.mjs'], { env: { ...process.env, CAREER_OPS_TRACKER: rTracker, CAREER_OPS_ADDITIONS: rAdds } });
-    if (rMerge === null) {
-      fail('merge-tracker crashed during same-job-id repost test');
-    } else {
-      const m = readFileSync(rTracker, 'utf-8');
+  {
+    const m = mergeFixture('career-ops-jobid-repost-', {
+      rows: ['| 40 | 2026-07-05 | Acme | Data Engineer, Search | 3.2/5 | Evaluated | ❌ | [40](../reports/040-acme.md) | original |'],
+      reports: {
+        '040-acme.md': '**URL:** https://boards.greenhouse.io/acme/jobs/1194374',
+        '041-acme.md': '**URL:** https://boards.greenhouse.io/acme/jobs/1194374',
+      },
+      // same greenhouse job id, different report number and a retitle -> should UPDATE #40, not add
+      tsvs: { '041-acme.tsv': '41\t2026-07-16\tAcme\tSenior Data Engineer, Discovery Search\tEvaluated\t4.0/5\t❌\t[41](reports/041-acme.md)\tsame job reposted' },
+    });
+    if (m === null) fail('merge-tracker crashed during same-job-id repost test');
+    else {
       const rows = m.split('\n').filter(l => /^\|\s*\d+\s*\|/.test(l) && l.includes('Acme'));
       if (rows.length === 1 && rows[0].includes('4.0/5')) {
         pass('merge-tracker updates same-job-id repost in place across a report-number change');
@@ -3324,8 +3555,47 @@ try {
         fail(`same-job-id repost handling broken: ${rows.length} Acme rows (expected 1 at 4.0/5)`);
       }
     }
-  } finally {
-    rmSync(rTmp, { recursive: true, force: true });
+  }
+
+  // integration: TWO additions updating ONE row in a single run must both land. The row
+  // was found by its raw text as read at start, which the first write had replaced, so
+  // the second update was logged and silently dropped.
+  {
+    const url = '**URL:** https://boards.greenhouse.io/acme/jobs/7654321';
+    const m = mergeFixture('career-ops-twice-', {
+      rows: ['| 50 | 2026-07-05 | Acme | Data Engineer, Search | 3.2/5 | Evaluated | ❌ | [50](../reports/050-acme.md) | original |'],
+      reports: { '050-acme.md': url, '051-acme.md': url, '052-acme.md': url },
+      tsvs: {
+        '051-acme.tsv': '51\t2026-07-16\tAcme\tData Engineer, Search\tEvaluated\t4.0/5\t❌\t[51](reports/051-acme.md)\tfirst re-eval',
+        '052-acme.tsv': '52\t2026-07-17\tAcme\tData Engineer, Search\tEvaluated\t4.3/5\t❌\t[52](reports/052-acme.md)\tsecond re-eval',
+      },
+    });
+    const rows = (m || '').split('\n').filter(l => /^\|\s*\d+\s*\|/.test(l) && l.includes('Acme'));
+    if (rows.length === 1 && rows[0].includes('4.3/5') && rows[0].includes('(4→4.3)')) {
+      pass('merge-tracker applies two updates to one row in a single run');
+    } else {
+      fail(`second update to one row in a run was dropped: ${rows.join(' / ') || 'merge crashed'}`);
+    }
+  }
+
+  // integration: a BRAND-NEW posting sent twice in one run is one row. The second
+  // addition was compared only against rows read at start, so it was added again.
+  {
+    const url = '**URL:** https://boards.greenhouse.io/acme/jobs/7654322';
+    const m = mergeFixture('career-ops-newtwice-', {
+      rows: [],
+      reports: { '060-acme.md': url, '061-acme.md': url },
+      tsvs: {
+        '060-acme.tsv': '60\t2026-07-16\tAcme\tPlatform Engineer\tEvaluated\t3.9/5\t❌\t[60](reports/060-acme.md)\tfirst',
+        '061-acme.tsv': '61\t2026-07-17\tAcme\tPlatform Engineer\tEvaluated\t4.2/5\t❌\t[61](reports/061-acme.md)\tsecond',
+      },
+    });
+    const rows = (m || '').split('\n').filter(l => /^\|\s*\d+\s*\|/.test(l) && l.includes('Acme'));
+    if (rows.length === 1 && rows[0].includes('4.2/5')) {
+      pass('merge-tracker folds a new posting sent twice in one run into one row');
+    } else {
+      fail(`a new posting sent twice in one run: ${rows.join(' / ') || 'merge crashed'}`);
+    }
   }
 } catch (e) {
   fail(`job-id authoritative dedup tests crashed: ${e.message}`);
@@ -3338,41 +3608,24 @@ try {
 // recoverable.
 console.log('\n🧪 Testing merge-tracker backup-on-write...');
 try {
-  const bTmp = mkdtempSync(join(tmpdir(), 'career-ops-merge-bak-'));
-  try {
-    mkdirSync(join(bTmp, 'data'));
-    mkdirSync(join(bTmp, 'reports'));
-    const bAdds = join(bTmp, 'additions');
-    mkdirSync(bAdds);
-    const bTracker = join(bTmp, 'data', 'applications.md');
-    const original =
-      '# Applications Tracker\n\n' +
-      '| # | Date | Company | Role | Score | Status | PDF | Report | Notes |\n' +
-      '|---|------|---------|------|-------|--------|-----|--------|-------|\n' +
-      '| 1 | 2026-01-04 | BackupCo | Widget Engineer | 4.0/5 | Evaluated | ❌ | [1](../reports/001-backupco.md) | original row |\n';
-    writeFileSync(bTracker, original);
-    writeFileSync(join(bTmp, 'reports', '001-backupco.md'), '# fixture\n');
-    writeFileSync(join(bTmp, 'reports', '002-backupco.md'), '# fixture\n');
-    writeFileSync(join(bAdds, '002-backupco.tsv'),
-      '2\t2026-01-05\tBackupCo\tGadget Engineer\tEvaluated\t4.1/5\t❌\t[2](reports/002-backupco.md)\tnew row\n');
-
-    const bMerge = run(NODE, ['merge-tracker.mjs'], { env: { ...process.env, CAREER_OPS_TRACKER: bTracker, CAREER_OPS_ADDITIONS: bAdds } });
-    if (bMerge === null) {
-      fail('merge-tracker crashed during backup test');
-    } else if (!existsSync(`${bTracker}.bak`)) {
-      fail('merge-tracker did not write a .bak snapshot before the destructive write');
-    } else if (readFileSync(`${bTracker}.bak`, 'utf-8') !== original) {
-      fail('merge-tracker .bak does not match the pre-merge tracker content');
-    } else {
-      const merged = readFileSync(bTracker, 'utf-8');
-      if (merged.includes('Gadget Engineer') && merged.includes('Widget Engineer')) {
-        pass('merge-tracker writes a pre-merge .bak and still applies the merge');
-      } else {
-        fail('merge-tracker merge did not apply after backup');
-      }
-    }
-  } finally {
-    rmSync(bTmp, { recursive: true, force: true });
+  const row = '| 1 | 2026-01-04 | BackupCo | Widget Engineer | 4.0/5 | Evaluated | ❌ | [1](../reports/001-backupco.md) | original row |';
+  let bak = null;
+  const merged = mergeFixture('career-ops-merge-bak-', {
+    rows: [row],
+    reports: { '001-backupco.md': '# fixture', '002-backupco.md': '# fixture' },
+    tsvs: { '002-backupco.tsv': '2\t2026-01-05\tBackupCo\tGadget Engineer\tEvaluated\t4.1/5\t❌\t[2](reports/002-backupco.md)\tnew row' },
+    inspect: (tracker) => { if (existsSync(`${tracker}.bak`)) bak = readFileSync(`${tracker}.bak`, 'utf-8'); },
+  });
+  if (merged === null) {
+    fail('merge-tracker crashed during backup test');
+  } else if (bak === null) {
+    fail('merge-tracker did not write a .bak snapshot before the destructive write');
+  } else if (bak !== `${TRACKER_HEAD}${row}\n`) {
+    fail('merge-tracker .bak does not match the pre-merge tracker content');
+  } else if (merged.includes('Gadget Engineer') && merged.includes('Widget Engineer')) {
+    pass('merge-tracker writes a pre-merge .bak and still applies the merge');
+  } else {
+    fail('merge-tracker merge did not apply after backup');
   }
 } catch (e) {
   fail(`merge-tracker backup test crashed: ${e.message}`);
@@ -3384,57 +3637,36 @@ try {
 // update it in-place instead of appending NewCo as a new row.
 console.log('\n🧪 Testing merge-tracker report-number cross-company collision (#912)...');
 try {
-  const col912Tmp = mkdtempSync(join(tmpdir(), 'career-ops-merge-912-'));
-  try {
-    mkdirSync(join(col912Tmp, 'data'));
-    mkdirSync(join(col912Tmp, 'reports'));
-    const col912Additions = join(col912Tmp, 'additions');
-    mkdirSync(col912Additions);
-
-    const col912Tracker = join(col912Tmp, 'data', 'applications.md');
-    writeFileSync(col912Tracker,
-      '# Applications Tracker\n\n' +
-      '| # | Date | Company | Role | Score | Status | PDF | Report | Notes |\n' +
-      '|---|------|---------|------|-------|--------|-----|--------|-------|\n' +
-      '| 1 | 2026-01-01 | OtherCo | Staff Engineer | 4.0/5 | Evaluated | ❌ | [1](../reports/001-otherco-2026-01-01.md) | original |\n');
-    writeFileSync(join(col912Tmp, 'reports', '001-otherco-2026-01-01.md'), '# fixture\n');
-    writeFileSync(join(col912Tmp, 'reports', '001-newco-2026-01-05.md'), '# fixture\n');
-
+  const col912Merged = mergeFixture('career-ops-merge-912-', {
+    rows: ['| 1 | 2026-01-01 | OtherCo | Staff Engineer | 4.0/5 | Evaluated | ❌ | [1](../reports/001-otherco-2026-01-01.md) | original |'],
+    reports: { '001-otherco-2026-01-01.md': '# fixture', '001-newco-2026-01-05.md': '# fixture' },
     // NewCo TSV also carries report number [1] — cross-company collision
-    writeFileSync(join(col912Additions, '001-newco.tsv'),
-      '1\t2026-01-05\tNewCo\tNew Role\tEvaluated\t2.7/5\t❌\t[1](reports/001-newco-2026-01-05.md)\tcollision\n');
+    tsvs: { '001-newco.tsv': '1\t2026-01-05\tNewCo\tNew Role\tEvaluated\t2.7/5\t❌\t[1](reports/001-newco-2026-01-05.md)\tcollision' },
+  });
+  if (col912Merged === null) {
+    fail('merge-tracker crashed during report-number collision test (#912)');
+  } else {
+    const col912Rows = col912Merged.split('\n').filter(l => l.startsWith('| ') && !l.startsWith('| #') && !l.startsWith('|---'));
+    const expectedOtherCoRow = '| 1 | 2026-01-01 | OtherCo | Staff Engineer | 4.0/5 | Evaluated | ❌ | [1](../reports/001-otherco-2026-01-01.md) | original |';
 
-    const col912Result = run(NODE, ['merge-tracker.mjs'], {
-      env: { ...process.env, CAREER_OPS_TRACKER: col912Tracker, CAREER_OPS_ADDITIONS: col912Additions },
-    });
-    if (col912Result === null) {
-      fail('merge-tracker crashed during report-number collision test (#912)');
+    if (col912Rows.length === 2) {
+      pass('report-number collision (#912): merged tracker has exactly 2 rows');
     } else {
-      const col912Merged = readFileSync(col912Tracker, 'utf-8');
-      const col912Rows = col912Merged.split('\n').filter(l => l.startsWith('| ') && !l.startsWith('| #') && !l.startsWith('|---'));
-      const expectedOtherCoRow = '| 1 | 2026-01-01 | OtherCo | Staff Engineer | 4.0/5 | Evaluated | ❌ | [1](../reports/001-otherco-2026-01-01.md) | original |';
-
-      if (col912Rows.length === 2) {
-        pass('report-number collision (#912): merged tracker has exactly 2 rows');
-      } else {
-        fail(`report-number collision (#912): expected 2 rows, got ${col912Rows.length}`);
-      }
-
-      if (col912Rows.some(r => r.trim() === expectedOtherCoRow.trim())) {
-        pass('report-number collision (#912): existing OtherCo row left untouched (exact match)');
-      } else {
-        fail('report-number collision (#912): OtherCo row was overwritten by NewCo addition');
-      }
-
-      const expectedNewCoRow = '| 2 | 2026-01-05 | NewCo | New Role | 2.7/5 | Evaluated | ❌ | [1](../reports/001-newco-2026-01-05.md) | collision |';
-      if (col912Rows.some(r => r.trim() === expectedNewCoRow.trim())) {
-        pass('report-number collision (#912): NewCo appended as a new entry with correct data');
-      } else {
-        fail('report-number collision (#912): NewCo entry was swallowed or has incorrect data');
-      }
+      fail(`report-number collision (#912): expected 2 rows, got ${col912Rows.length}`);
     }
-  } finally {
-    rmSync(col912Tmp, { recursive: true, force: true });
+
+    if (col912Rows.some(r => r.trim() === expectedOtherCoRow.trim())) {
+      pass('report-number collision (#912): existing OtherCo row left untouched (exact match)');
+    } else {
+      fail('report-number collision (#912): OtherCo row was overwritten by NewCo addition');
+    }
+
+    const expectedNewCoRow = '| 2 | 2026-01-05 | NewCo | New Role | 2.7/5 | Evaluated | ❌ | [1](../reports/001-newco-2026-01-05.md) | collision |';
+    if (col912Rows.some(r => r.trim() === expectedNewCoRow.trim())) {
+      pass('report-number collision (#912): NewCo appended as a new entry with correct data');
+    } else {
+      fail('report-number collision (#912): NewCo entry was swallowed or has incorrect data');
+    }
   }
 } catch (e) {
   fail(`merge-tracker report-number collision test crashed: ${e.message}`);
@@ -3533,9 +3765,7 @@ try {
     mkdirSync(additionsB);
 
     writeFileSync(join(mergeTmp, 'data', 'applications.md'),
-      '# Applications Tracker\n\n' +
-      '| # | Date | Company | Role | Score | Status | PDF | Report | Notes |\n' +
-      '|---|------|---------|------|-------|--------|-----|--------|-------|\n');
+      TRACKER_HEAD);
     writeFileSync(join(mergeTmp, 'reports', '010-alpha-2026-01-07.md'), '# fixture\n');
     writeFileSync(join(mergeTmp, 'reports', '011-beta-2026-01-07.md'), '# fixture\n');
     writeFileSync(join(additionsA, '010-alpha.tsv'),
@@ -3638,9 +3868,7 @@ if (!sqliteAvailable) {
 
       // 1. Round trip: clean canonical input must export byte-identical.
       const clean =
-        '# Applications Tracker\n\n' +
-        '| # | Date | Company | Role | Score | Status | PDF | Report | Notes |\n' +
-        '|---|------|---------|------|-------|--------|-----|--------|-------|\n' +
+        TRACKER_HEAD +
         '| 2 | 2026-01-05 | Beta | Designer | 4.0/5 | Applied | ✅ | [2](../reports/002-beta-2026-01-05.md) | second |\n' +
         '| 1 | 2026-01-04 | Acme | Engineer | 4.2/5 | Evaluated | ❌ | [1](../reports/001-acme-2026-01-04.md) | first |\n';
       writeFileSync(md, clean);
@@ -5073,9 +5301,7 @@ try {
     const calix = 'https://calix.wd1.myworkdayjobs.com/Calix/job/Remote/Staff-Software-Engineer-AI-ML_R11095';
     // Only the Workiva req is tracked. The Calix one is real pending work.
     writeFileSync(join(paTmp, 'data', 'applications.md'),
-      '# Applications Tracker\n\n' +
-      '| # | Date | Company | Role | Score | Status | PDF | Report | Notes |\n' +
-      '|---|------|---------|------|-------|--------|-----|--------|-------|\n' +
+      TRACKER_HEAD +
       '| 700 | 2026-09-19 | Workiva | Senior Staff Machine Learning Engineer - US (R11095) | 4.0/5 | Evaluated | x | [700](../reports/700-workiva-2026-09-19.md) | tracked |\n');
     writeFileSync(join(paTmp, 'data', 'pipeline.md'),
       '# Inbox\n\n' +
@@ -5157,23 +5383,31 @@ const evalPacket = (over = {}) => JSON.stringify({
   live: true, num: null, ...over,
 }, null, 1);
 
+// One eval-write sandbox: a temp dir holding reports/ and batch/eval-queue/. `packet`
+// writes a queue packet and returns its path; `run` runs eval-write there, with `env`
+// added to the environment, and never throws.
+const evalWriteFixture = (prefix) => {
+  const dir = mkdtempSync(join(tmpdir(), prefix));
+  mkdirSync(join(dir, 'reports'));
+  mkdirSync(join(dir, 'batch', 'eval-queue'), { recursive: true });
+  const packet = (name, over) => {
+    const p = join(dir, 'batch', 'eval-queue', name);
+    writeFileSync(p, evalPacket(over));
+    return p;
+  };
+  const run = (argv, env = {}) => {
+    try {
+      return { code: 0, out: execFileSync(NODE, [join(ROOT, 'eval-write.mjs'), ...argv],
+        { cwd: dir, encoding: 'utf-8', timeout: 30000, env: { ...process.env, ...env } }) };
+    } catch (e) { return { code: e.status ?? 1, out: `${e.stdout || ''}${e.stderr || ''}` }; }
+  };
+  return { dir, packet, run };
+};
+
 console.log('\n🧪 Testing eval-write refuses to certify a posting it could not verify...');
 try {
-  const liveTmp = mkdtempSync(join(tmpdir(), 'career-ops-eval-write-live-'));
+  const { dir: liveTmp, packet, run: runWrite } = evalWriteFixture('career-ops-eval-write-live-');
   try {
-    mkdirSync(join(liveTmp, 'reports'));
-    mkdirSync(join(liveTmp, 'batch', 'eval-queue'), { recursive: true });
-    const packet = (name, over) => {
-      const p = join(liveTmp, 'batch', 'eval-queue', name);
-      writeFileSync(p, evalPacket(over));
-      return p;
-    };
-    const runWrite = (argv) => {
-      try {
-        return { code: 0, out: execFileSync(NODE, [join(ROOT, 'eval-write.mjs'), ...argv],
-          { cwd: liveTmp, encoding: 'utf-8', timeout: 30000 }) };
-      } catch (e) { return { code: e.status ?? 1, out: `${e.stdout || ''}${e.stderr || ''}` }; }
-    };
     const wroteSlug = (slug) => readdirSync(join(liveTmp, 'reports')).some(f => f.includes(slug));
 
     const unknown = runWrite([packet('unknown.json',
@@ -5221,6 +5455,19 @@ try {
     } else {
       fail(`eval-write refused a live:true packet (exit ${ok.code}): ${ok.out.trim().slice(0, 250)}`);
     }
+
+    // An Ashby posting id is a UUID whose last group is often all digits; it is not a
+    // requisition, and labelling the role cell with it put a fake id in the tracker.
+    mkdirSync(join(liveTmp, 'batch', 'tracker-additions'), { recursive: true });
+    runWrite([packet('uuid.json', { slug: 'gate-uuid', title: 'Staff Platform Engineer',
+      url: 'https://jobs.ashbyhq.com/acme/a8581363-d348-ab0a-17b6-ee50cfa58aee' }), '--date=2026-09-19']);
+    const tsvDir = join(liveTmp, 'batch', 'tracker-additions');
+    const tsv = readdirSync(tsvDir).map(f => readFileSync(join(tsvDir, f), 'utf-8')).join('\n');
+    if (tsv.includes('Staff Platform Engineer') && !tsv.includes('113241621221')) {
+      pass('eval-write: an Ashby UUID does not become a requisition label in the role cell');
+    } else {
+      fail(`eval-write labelled a role with a UUID fragment: ${tsv.slice(0, 250)}`);
+    }
   } finally {
     rmSync(liveTmp, { recursive: true, force: true });
   }
@@ -5230,32 +5477,20 @@ try {
 
 console.log('\n🧪 Testing eval-write allocates report numbers instead of demanding them...');
 try {
-  const numTmp = mkdtempSync(join(tmpdir(), 'career-ops-eval-write-num-'));
+  const { dir: numTmp, packet, run: runNum } = evalWriteFixture('career-ops-eval-write-num-');
   try {
-    mkdirSync(join(numTmp, 'reports'));
-    mkdirSync(join(numTmp, 'batch', 'eval-queue'), { recursive: true });
     // 600 is the highest finished report; 603 is a live reserve-report-num.mjs
     // sentinel, a slot another window is holding, so neither may be handed out
     // and the first allocation is 604.
     writeFileSync(join(numTmp, 'reports', '600-seed-fixture-2026-09-19.md'), '# 600 seed\n');
     writeFileSync(join(numTmp, 'reports', '603-RESERVED.md'), '');
-    const pk = (name, over) => {
-      const p = join(numTmp, 'batch', 'eval-queue', name);
-      // Each packet here stands for a DIFFERENT req, so each needs its own url.
-      // The fixture used to leave them all on the shared default, which was
-      // invisible while the prior-report search was prefiltered to one title slug
-      // and one date; eval-write now searches by requisition identity across the
-      // whole reports directory, and under that these were correctly one req.
-      // `over` still wins, so the rerun case below keeps its url by keeping its slug.
-      writeFileSync(p, evalPacket({ url: `https://example.invalid/fixture/job/${over.slug}`, ...over }));
-      return p;
-    };
-    const runNum = (argv) => {
-      try {
-        return { code: 0, out: execFileSync(NODE, [join(ROOT, 'eval-write.mjs'), ...argv],
-          { cwd: numTmp, encoding: 'utf-8', timeout: 30000 }) };
-      } catch (e) { return { code: e.status ?? 1, out: `${e.stdout || ''}${e.stderr || ''}` }; }
-    };
+    // Each packet here stands for a DIFFERENT req, so each needs its own url.
+    // The fixture used to leave them all on the shared default, which was
+    // invisible while the prior-report search was prefiltered to one title slug
+    // and one date; eval-write now searches by requisition identity across the
+    // whole reports directory, and under that these were correctly one req.
+    // `over` still wins, so the rerun case below keeps its url by keeping its slug.
+    const pk = (name, over) => packet(name, { url: `https://example.invalid/fixture/job/${over.slug}`, ...over });
 
     // Both packets in ONE invocation, which is where a naive max+1 hands the
     // same number out twice.
@@ -5378,21 +5613,8 @@ try {
 // never to dedup reqs by title.
 console.log('\n🧪 Testing eval-write keys report identity on the req, not the title...');
 try {
-  const idTmp = mkdtempSync(join(tmpdir(), 'career-ops-eval-write-id-'));
+  const { dir: idTmp, packet: pk, run: runId } = evalWriteFixture('career-ops-eval-write-id-');
   try {
-    mkdirSync(join(idTmp, 'reports'));
-    mkdirSync(join(idTmp, 'batch', 'eval-queue'), { recursive: true });
-    const pk = (name, over) => {
-      const p = join(idTmp, 'batch', 'eval-queue', name);
-      writeFileSync(p, evalPacket(over));
-      return p;
-    };
-    const runId = (argv) => {
-      try {
-        return { code: 0, out: execFileSync(NODE, [join(ROOT, 'eval-write.mjs'), ...argv],
-          { cwd: idTmp, encoding: 'utf-8', timeout: 30000 }) };
-      } catch (e) { return { code: e.status ?? 1, out: `${e.stdout || ''}${e.stderr || ''}` }; }
-    };
     const reportsFor = (slug) => readdirSync(join(idTmp, 'reports'))
       .filter(f => f.endsWith(`-${slug}-2026-09-19.md`));
 
@@ -5451,25 +5673,19 @@ try {
 // honours it.
 console.log('\n🧪 Testing eval-write gates comp only on a verified total band...');
 try {
-  const compTmp = mkdtempSync(join(tmpdir(), 'career-ops-eval-write-comp-'));
+  const { dir: compTmp, packet, run: runWrite } = evalWriteFixture('career-ops-eval-write-comp-');
   try {
-    mkdirSync(join(compTmp, 'reports'));
     mkdirSync(join(compTmp, 'config'));
     // The floor is configuration now, so this fixture supplies its own, as a real
     // setup would. 200 is a fixture value.
     writeFileSync(join(compTmp, 'config', 'profile.yml'),
       'compensation:\n  minimum: "USD 200K"\n');
-    mkdirSync(join(compTmp, 'batch', 'eval-queue'), { recursive: true });
     const SUB = '$120,000 - $150,000';   // well under the fixture's $200K total-comp floor
     const write = (slug, comp) => {
-      const p = join(compTmp, 'batch', 'eval-queue', `${slug}.json`);
-      writeFileSync(p, evalPacket({ slug, comp, url: `https://example.invalid/j/${slug}` }));
-      try {
-        // This fixture's own floor, not the suite-wide empty config directory.
-        execFileSync(NODE, [join(ROOT, 'eval-write.mjs'), p, '--date=2026-09-19'],
-          { cwd: compTmp, encoding: 'utf-8', timeout: 30000,
-            env: { ...process.env, CAREER_OPS_CONFIG_DIR: join(compTmp, 'config') } });
-      } catch { /* the assertions below read the disk, not the exit code */ }
+      // This fixture's own floor, not the suite-wide empty config directory. The
+      // assertions below read the disk, not the exit code.
+      runWrite([packet(`${slug}.json`, { slug, comp, url: `https://example.invalid/j/${slug}` }), '--date=2026-09-19'],
+        { CAREER_OPS_CONFIG_DIR: join(compTmp, 'config') });
       const f = readdirSync(join(compTmp, 'reports')).find(x => x.includes(`-${slug}-`));
       const body = f ? readFileSync(join(compTmp, 'reports', f), 'utf-8') : '';
       return { body, final: Number((body.match(/^final:\s*([\d.]+)/m) || [])[1]) };
@@ -5578,9 +5794,7 @@ try {
     // Header and row agree with the stated final, so the ONLY thing that can
     // disagree is the model replay.
     writeFileSync(join(sepTmp, 'data', 'applications.md'),
-      '# Applications Tracker\n\n' +
-      '| # | Date | Company | Role | Score | Status | PDF | Report | Notes |\n' +
-      '|---|------|---------|------|-------|--------|-----|--------|-------|\n' +
+      TRACKER_HEAD +
       '| 700 | 2026-09-19 | Fixtureco | Legacy Separator Fixture | 2.0/5 | Evaluated | x | [700](../reports/700-legacy-em-dash-2026-09-19.md) | legacy em dash separator |\n' +
       '| 701 | 2026-09-19 | Fixtureco | Plain Separator Fixture | 2.0/5 | Evaluated | x | [701](../reports/701-plain-separator-2026-09-19.md) | plain separator |\n');
 
@@ -5644,9 +5858,7 @@ try {
       '```\n';
     const fixtures = [[710, 'not published', 'none'], [711, SUB, 'base'],
                       [712, SUB, 'total'], [713, SUB, 'unknown']];
-    let table = '# Applications Tracker\n\n' +
-      '| # | Date | Company | Role | Score | Status | PDF | Report | Notes |\n' +
-      '|---|------|---------|------|-------|--------|-----|--------|-------|\n';
+    let table = TRACKER_HEAD;
     for (const [num, posted, basis] of fixtures) {
       writeFileSync(join(cbTmp, 'reports', `${num}-comp-basis-2026-09-19.md`),
         cbReport(num, posted, basis));
@@ -5703,7 +5915,6 @@ try {
   // Comments are stripped before the literal scan: naming the old broken pattern
   // in a comment is exactly how this stays understandable, and a scan that
   // punished it would push the explanation out of the file.
-  const codeOnly = (s) => s.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^[ \t]*\/\/.*$/gm, '');
   for (const f of ['pipeline-audit.mjs', 'role-matcher.mjs', 'eval-write.mjs']) {
     const src = readFileSync(join(ROOT, f), 'utf8');
     if (/from '\.\/req-id-core\.mjs'/.test(src)) {
@@ -5782,17 +5993,11 @@ try {
 
 console.log('\n🧪 Testing eval-write labels the tracker role cell from the shared pattern...');
 try {
-  const labTmp = mkdtempSync(join(tmpdir(), 'career-ops-eval-write-label-'));
+  const { dir: labTmp, packet, run: runWrite } = evalWriteFixture('career-ops-eval-write-label-');
   try {
-    mkdirSync(join(labTmp, 'reports'));
-    mkdirSync(join(labTmp, 'batch', 'eval-queue'), { recursive: true });
     const runLabel = (name, over) => {
-      const p = join(labTmp, 'batch', 'eval-queue', name);
-      writeFileSync(p, evalPacket(over));
-      try {
-        execFileSync(NODE, [join(ROOT, 'eval-write.mjs'), p, '--date=2026-09-19'],
-          { cwd: labTmp, encoding: 'utf-8', timeout: 30000 });
-      } catch (e) { return `RUN FAILED: ${e.stdout || ''}${e.stderr || ''}`; }
+      const r = runWrite([packet(name, over), '--date=2026-09-19']);
+      if (r.code !== 0) return `RUN FAILED: ${r.out}`;
       const dir = join(labTmp, 'batch', 'tracker-additions');
       const tsv = readdirSync(dir).filter(x => x.includes(over.slug));
       return tsv.length ? readFileSync(join(dir, tsv[0]), 'utf-8') : '';
@@ -5846,18 +6051,9 @@ try {
 // rule 3.
 console.log('\n🧪 Testing eval-write finds a prior report by req, not by title and date...');
 try {
-  const dupTmp = mkdtempSync(join(tmpdir(), 'career-ops-eval-write-dup-'));
+  const { dir: dupTmp, packet, run: runWrite } = evalWriteFixture('career-ops-eval-write-dup-');
   try {
-    mkdirSync(join(dupTmp, 'reports'));
-    mkdirSync(join(dupTmp, 'batch', 'eval-queue'), { recursive: true });
-    const runDup = (name, date, over) => {
-      const p = join(dupTmp, 'batch', 'eval-queue', name);
-      writeFileSync(p, evalPacket(over));
-      try {
-        return execFileSync(NODE, [join(ROOT, 'eval-write.mjs'), p, `--date=${date}`],
-          { cwd: dupTmp, encoding: 'utf-8', timeout: 30000 });
-      } catch (e) { return `${e.stdout || ''}${e.stderr || ''}`; }
-    };
+    const runDup = (name, date, over) => runWrite([packet(name, over), `--date=${date}`]).out;
     const URL_A = 'https://example.invalid/fixture/job/900001';
 
     runDup('first.json', '2026-09-01', { slug: 'alpha-title', url: URL_A });
@@ -5899,7 +6095,9 @@ try {
     // so it cannot be pulled in and called directly. Same idiom the requisition-pattern
     // scan uses: when behaviour cannot observe a rule, assert the rule.
     const ewSrc = readFileSync('eval-write.mjs', 'utf8');
-    const nu = ewSrc.slice(ewSrc.indexOf('const normUrl'), ewSrc.indexOf('const normCo'));
+    const nuAt = ewSrc.indexOf('const normUrl');
+    const nuEnd = nuAt < 0 ? -1 : ewSrc.indexOf('\n};', nuAt);
+    const nu = nuEnd < 0 ? '' : ewSrc.slice(nuAt, nuEnd);
     if (/m\[1\]\.toLowerCase\(\)\s*\+\s*m\[2\]\.toLowerCase\(\)\s*\+\s*m\[3\]/.test(nu)
         && !/m\[3\]\.toLowerCase/.test(nu)) {
       pass('eval-write normUrl folds scheme and host and leaves the path alone');
@@ -5921,15 +6119,10 @@ try {
     // Two packets for one req inside a SINGLE invocation. The index is built once,
     // before either report exists, so without feeding each write back into it both
     // packets see an empty index and both write.
-    const p1 = join(dupTmp, 'batch', 'eval-queue', 'batch1.json');
-    const p2 = join(dupTmp, 'batch', 'eval-queue', 'batch2.json');
-    writeFileSync(p1, evalPacket({ slug: 'theta-title', url: 'https://example.invalid/fixture/job/900003' }));
-    writeFileSync(p2, evalPacket({ slug: 'iota-title', url: 'https://example.invalid/fixture/job/900003' }));
-    let oneRun = '';
-    try {
-      oneRun = execFileSync(NODE, [join(ROOT, 'eval-write.mjs'), p1, p2, '--date=2026-09-19'],
-        { cwd: dupTmp, encoding: 'utf-8', timeout: 30000 });
-    } catch (e) { oneRun = `${e.stdout || ''}${e.stderr || ''}`; }
+    const oneRun = runWrite([
+      packet('batch1.json', { slug: 'theta-title', url: 'https://example.invalid/fixture/job/900003' }),
+      packet('batch2.json', { slug: 'iota-title', url: 'https://example.invalid/fixture/job/900003' }),
+      '--date=2026-09-19']).out;
     if ((oneRun.match(/^WROTE /gm) || []).length === 1 && /SKIP .*already written as/.test(oneRun)) {
       pass('eval-write: two packets for one req in one invocation write one report');
     } else {
@@ -5963,6 +6156,196 @@ try {
   }
 } catch (e) {
   fail(`eval-write prior-report test crashed: ${e.message}`);
+}
+
+// ── ONE HOST-ID TABLE, ONE ROLE-CELL ID DEFINITION ──────────────
+// Host-anchored requisition ids (Apple, Google, iCIMS and its front ends, EA, Breezy)
+// lived only in role-matcher.mjs, so eval-blockers.py could not recognise a packet on
+// those hosts as already reported unless its url matched a report's exactly. They are
+// DATA in host-ids.json now. Each rule carries its own example and key, which
+// role-matcher is held to here and eval-blockers --selftest holds itself to, so a rule
+// added to the file is tested in both with nothing else to edit.
+//
+// The role cell had three definitions of "an id": eval-write's label (writer),
+// role-matcher's identity (reader) and scan.mjs's canonicalRole (stripper), kept in
+// step by a comment. The writer and stripper now live in req-id-core.mjs beside the
+// reader's pattern, and the inclusions that matter are asserted: whatever the writer
+// puts in a role cell, and whatever the reader finds there, the stripper removes, or a
+// tracked role comes back as new on every scan. Fixtures always run; the real tracker
+// and the reports it links are read too whenever they are on disk.
+console.log('\n🧪 Testing one host-id table and one role-cell id definition...');
+try {
+  const hostIds = JSON.parse(readFileSync(join(ROOT, 'host-ids.json'), 'utf-8'));
+  const { extractJobId, rowIdReader } = await import(pathToFileURL(join(ROOT, 'role-matcher.mjs')).href);
+
+  for (const r of hostIds.rules) {
+    const got = extractJobId(r.example);
+    if (got === r.key) pass(`role-matcher keys the ${r.ns} example as ${r.key}`);
+    else fail(`role-matcher keyed host-ids.json's ${r.ns} example ${r.example} as ${got}, want ${r.key}`);
+  }
+  // An example proves a rule matches; only the anchor proves it matches nothing ELSE.
+  // Two equal ids merge two rows, so an unanchored rule is the damage the id prevents.
+  const loose = hostIds.rules.filter(r => !r.re.startsWith('^(?:https?://)?'));
+  if (!loose.length) pass(`every host-ids.json rule is anchored at the url's own host (${hostIds.rules.length})`);
+  else fail(`host-ids.json rules not anchored at the host: ${loose.map(r => r.ns).join(', ')}`);
+
+  // role-matcher consumes the TABLE beside it, not a private copy: run it against a
+  // planted table holding a rule nobody else has.
+  const probeDir = mkdtempSync(join(tmpdir(), 'career-ops-host-ids-'));
+  try {
+    for (const f of ['role-matcher.mjs', 'req-id-core.mjs']) {
+      writeFileSync(join(probeDir, f), readFileSync(join(ROOT, f)));
+    }
+    writeFileSync(join(probeDir, 'host-ids.json'), JSON.stringify({ rules: [
+      { ns: 'probe', re: String.raw`^(?:https?://)?jobs\.probe\.invalid/(\d+)` }] }));
+    const probed = await import(pathToFileURL(join(probeDir, 'role-matcher.mjs')).href);
+    const got = probed.extractJobId('https://jobs.probe.invalid/123');
+    if (got === 'probe:123') pass('role-matcher reads its host rules from host-ids.json');
+    else fail(`role-matcher ignored a planted host-ids.json rule (got ${got})`);
+  } finally {
+    rmSync(probeDir, { recursive: true, force: true });
+  }
+  // eval-blockers proves the same with a planted table in its own --selftest.
+  if (readFileSync(join(ROOT, 'scripts/eval-blockers.py'), 'utf-8').includes('"host-ids.json"')) {
+    pass('scripts/eval-blockers.py names host-ids.json as its table');
+  } else {
+    fail('scripts/eval-blockers.py no longer names host-ids.json');
+  }
+
+  // No literal copy. A copy is recognisable by a rule's host written as a REGEX would
+  // write it, "jobs\.apple\.com" or "jobs[.]apple[.]com"; the plain spelling may appear
+  // in prose and fixtures.
+  const hostsOf = (re) => re.match(/[a-z0-9-]+(?:\\\.[a-z0-9-]+)+/gi) || [];
+  const copyOf = (h) => new RegExp(h.split('\\.').join(String.raw`(?:\\\.|\[\.\])`), 'i');
+  const hosts = [...new Set(hostIds.rules.flatMap(r => hostsOf(r.re)))];
+  if (hostIds.rules.every(r => hostsOf(r.re).length)) {
+    pass(`the literal scan found an escaped host in every rule (${hosts.length} hosts)`);
+  } else {
+    fail('a host-ids.json rule yields no escaped host, so the literal scan cannot see a copy of it');
+  }
+  const planted = ['const R = /^jobs\\.apple\\.com\\/x/i;', "R = re.compile(r'jobs[.]apple[.]com')"];
+  if (planted.every(s => hosts.some(h => copyOf(h).test(s)))) {
+    pass('the literal scan detects a planted copy in either spelling');
+  } else {
+    fail('the literal scan cannot detect a planted copy, so it proves nothing');
+  }
+  for (const f of ['role-matcher.mjs', 'scripts/eval-blockers.py']) {
+    const src = readFileSync(join(ROOT, f), 'utf-8');
+    const copies = hosts.filter(h => copyOf(h).test(src));
+    if (!copies.length) pass(`${f} holds no literal copy of a host rule`);
+    else fail(`${f} holds its own copy of a host rule: ${copies.join(', ')}`);
+  }
+
+  // The writer and the stripper are imported, never redefined.
+  const core = await import(pathToFileURL(join(ROOT, 'req-id-core.mjs')).href);
+  const { canonicalRole } = await import(pathToFileURL(join(ROOT, 'scan.mjs')).href);
+  for (const [f, name, def] of [
+    ['eval-write.mjs', 'reqLabel', /(?:const|let|function)\s+reqLabel\b/],
+    ['scan.mjs', 'ROLE_ID_TOKEN_SRC', /(?:const|let)\s+ROLE_ID_TOKEN\w*\s*=/],
+  ]) {
+    const src = readFileSync(join(ROOT, f), 'utf-8');
+    const imports = new RegExp(`import \\{[^}]*\\b${name}\\b[^}]*\\} from '\\./req-id-core\\.mjs'`).test(src);
+    if (imports && !def.test(src)) pass(`${f} imports ${name} from req-id-core.mjs and defines none of its own`);
+    else fail(`${f} must import ${name} from req-id-core.mjs rather than define it`);
+  }
+
+  // An id token is stripped when the title comes back WHOLE and nothing else: once in
+  // the parenthesis eval-write writes and once bare, as hand-written cells carry it.
+  const T = 'Example Role';
+  const strippedBy = (strip) => (tok) =>
+    strip(`${T} (${tok})`) === 'example role' && strip(`${T} ${tok}`) === 'example role';
+  const strips = strippedBy(canonicalRole);
+  // A fake reader-side token list: every raw span the shared pattern finds, which is
+  // role-matcher's reqIdsIn(). Checked below to account for every id rowIdReader reports.
+  const rawIds = (cell) => [...String(cell).matchAll(core.reqIdGlobal())].map(m => m[1]);
+  const keyOf = (raw) => `wd:${core.canonId(raw).toLowerCase()}`;
+  const noStrip = (s) => String(s).toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+  const digitsOnly = (s) => noStrip(String(s).replace(/\d+/g, ' '));
+  if (canonicalRole(T) === 'example role' && strips('JR1000001')
+      && !strippedBy(noStrip)('JR1000001') && !strippedBy(digitsOnly)('JR1000001')
+      && !strippedBy(() => '')('JR1000001')) {
+    pass('the inclusion check goes red against a stripper that strips nothing, keeps a prefix or erases the title');
+  } else {
+    fail('the inclusion check cannot fail, so it proves nothing');
+  }
+
+  // Fixtures: one url per writer branch and one cell per reader form.
+  const writerFixtures = [
+    'https://fixture.wd5.myworkdayjobs.com/Site/job/US/Role_JR1000001',
+    'https://fixture.wd5.myworkdayjobs.com/Site/job/US/Role_JR-100001',
+    'https://fixture.wd5.myworkdayjobs.com/Site/job/US/Role_R23555-1',
+    'https://fixture.wd1.myworkdayjobs.com/Ext/job/CA/Role_26WD100001-1',
+    'https://fixture.wd5.myworkdayjobs.com/Site/job/US/Role_10000101',
+    'https://job-boards.greenhouse.io/fixture/jobs/1000001',
+  ];
+  const readerFixtures = ['Senior Engineer (Team, JR1000001)', 'Staff Engineer JR-100001',
+    'Engineer (R23555-1)', 'Engineer - 26WD100001'];
+  const read = rowIdReader(ROOT);
+  const checkWriter = (urls) => {
+    const out = { labels: 0, misses: [] };
+    for (const u of urls) {
+      const label = core.reqLabel(u);
+      if (!label) continue;
+      out.labels++;
+      if (!strips(label)) out.misses.push(`${label} from ${u}`);
+    }
+    return out;
+  };
+  const checkReader = (cells) => {
+    const out = { ids: 0, misses: [] };
+    for (const cell of cells) {
+      const raws = rawIds(cell);
+      const located = new Set(raws.map(keyOf));
+      for (const id of read({ role: cell, report: '' })) {
+        out.ids++;
+        if (!located.has(id)) out.misses.push(`${cell} [${id}: not a span this check can locate]`);
+      }
+      for (const raw of raws) if (!strips(raw)) out.misses.push(`${cell} [${raw}]`);
+    }
+    return out;
+  };
+  const wf = checkWriter(writerFixtures), rf = checkReader(readerFixtures);
+  if (wf.labels === writerFixtures.length && !wf.misses.length) pass(`every writer fixture label is stripped (${wf.labels})`);
+  else fail(`writer fixtures: ${wf.labels}/${writerFixtures.length} labelled, kept: ${wf.misses.join('; ')}`);
+  if (rf.ids === readerFixtures.length && !rf.misses.length) pass(`every reader fixture id is stripped (${rf.ids})`);
+  else fail(`reader fixtures: ${rf.ids}/${readerFixtures.length} read, kept: ${rf.misses.join('; ')}`);
+
+  const { trackerPath, columnsOf, parseRow } = await import(pathToFileURL(join(ROOT, 'tracker-rows.mjs')).href);
+  const tracker = trackerPath(ROOT);
+  if (!existsSync(tracker)) {
+    console.log(`  (no tracker at ${tracker}: the fixtures above are the whole check here)`);
+  } else {
+    const trackerDir = dirname(tracker);
+    const lines = readFileSync(tracker, 'utf-8').split('\n');
+    const cols = columnsOf(lines);
+    const cells = [], urls = new Set();
+    let links = 0, readable = 0;
+    for (const line of lines) {
+      const row = line.startsWith('|') ? parseRow(line, cols) : null;
+      if (!row) continue;
+      cells.push(row.role);
+      const link = String(row.report).match(/\]\(([^)]+)\)/);
+      if (!link) continue;
+      links++;
+      const path = join(trackerDir, link[1]);
+      if (!existsSync(path)) continue;
+      readable++;
+      const m = readFileSync(path, 'utf-8').match(/^[ \t]*\*\*URL:\*\*[ \t]*(\S+)/im);
+      if (m) urls.add(m[1]);
+    }
+    const r = checkReader(cells);
+    if (!r.misses.length) pass(`every role-cell id role-matcher reads is stripped by canonicalRole (${r.ids} ids in ${cells.length} rows)`);
+    else fail(`canonicalRole keeps ${r.misses.length} role-cell ids: ${r.misses.slice(0, 3).join('; ')}`);
+    if (!readable) {
+      console.log(`  (none of the tracker's ${links} report links is on disk: the writer corpus check has nothing to read)`);
+    } else {
+      const w = checkWriter(urls);
+      if (!w.misses.length) pass(`every label eval-write would write is stripped by canonicalRole (${w.labels} labels, ${readable}/${links} linked reports read)`);
+      else fail(`canonicalRole keeps ${w.misses.length} of ${w.labels} writer labels: ${w.misses.slice(0, 3).join('; ')}`);
+    }
+  }
+} catch (e) {
+  fail(`host-id table / role-cell definition test crashed: ${e.message}`);
 }
 
 // ── SETUP HARNESS ───────────────────────────────────────────────
@@ -6868,6 +7251,22 @@ console.log('\nLocation gates agree (Node scanner vs Python evaluation)');
     'New York City, NY or location to be confirmed', 'Los Angeles & Austin, TX',
     'Remote - US (TX, CA) - HQ in San Francisco', 'Los Angeles\u0085or Austin, TX',
     'San Fra\u1ab0ncisco, California', 'except CA', 'Sacramento (occasional travel to London)',
+    // Round 6: a street address is not a state, a foreign city in a bare list of places is
+    // another place while a foreign country (or a city in prose) qualifies it, a bare city
+    // from a "City, ST" entry is a question, the New York fold stops before a country, a
+    // bare work arrangement names no place, "Anywhere" and "remote within the US" ending an
+    // option are nationwide, and inputs on which Python's Unicode-wide regex semantics and
+    // JavaScript's ASCII ones used to disagree (one raised KeyError in Python).
+    'Torrance 1450 W. Washington Ave (hybrid, 3 days on-site)', 'Torrance 1450 West Washington Avenue',
+    'Los Angeles, London, Sydney', 'Seattle, Boston, Los Angeles, Berlin',
+    'Santa Ana, San Jose, Costa Rica', 'Venice, Italy', 'Onsite in Singapore, reporting to Los Angeles',
+    'Office - Ontario/Canada', 'Manitoba; Ontario; Nova Scotia', 'New York, USA - Remote',
+    'New York, U.S.A. (Remote)', 'New York City', 'Chicago, IL | Hybrid', 'Hybrid', 'Anywhere',
+    'Boston, MA, Chicago, IL, or Remote within Canada or United States',
+    'Remote within the United States (Texas residents only)', 'Remote in US, restricted to Texas',
+    'US Remote, must reside in one of 2 Texas counties',
+    'Los Angeles \u0662 Texas', 'Ontario,\ufeffCA', 'Los Angeles, \u0131reland', 'Seattle; \ufeffHybrid',
+    '\u4e2dRemote US', 'Remote, Texa\u017f',
   ];
   // Agreement alone would pass two gates that are wrong together, so the cases each
   // review round found are also pinned to the right answer.
@@ -6927,6 +7326,20 @@ console.log('\nLocation gates agree (Node scanner vs Python evaluation)');
     'San Fra\u1ab0ncisco, California': 'fail', 'except CA': 'unknown',
     // No commute place here, so only the onsite foreign check can see the trip.
     'Sacramento (occasional travel to London)': 'unknown',
+  });
+  Object.assign(expected.ca, {
+    'Torrance 1450 W. Washington Ave (hybrid, 3 days on-site)': 'pass',
+    'Torrance 1450 West Washington Avenue': 'pass',
+    'Los Angeles, London, Sydney': 'pass', 'Seattle, Boston, Los Angeles, Berlin': 'pass',
+    'Santa Ana, San Jose, Costa Rica': 'fail', 'Venice, Italy': 'fail',
+    'Onsite in Singapore, reporting to Los Angeles': 'fail', 'Office - Ontario/Canada': 'fail',
+    'Manitoba; Ontario; Nova Scotia': 'unknown', 'New York, USA - Remote': 'fail',
+    'New York, U.S.A. (Remote)': 'fail', 'New York City': 'fail', 'Chicago, IL | Hybrid': 'fail',
+    'Hybrid': 'unknown', 'Anywhere': 'pass',
+    'Boston, MA, Chicago, IL, or Remote within Canada or United States': 'pass',
+    'Remote within the United States (Texas residents only)': 'unknown',
+    'Remote in US, restricted to Texas': 'unknown',
+    'US Remote, must reside in one of 2 Texas counties': 'unknown', 'Remote, Texa\u017f': 'unknown',
   });
   Object.assign(expected.tx, { 'TX Remote': 'pass', 'Remote (US) - Must reside in TX': 'pass',
     'Remote (US) - Must reside in CT': 'fail', 'Texas - we are fully remote': 'pass' });
@@ -7117,6 +7530,14 @@ try {
       && warned.length === 1 && /allow/.test(warned[0]) && /block/.test(warned[0])) {
     pass('the scanner ignores generic allow/block keys out loud and applies the policy');
   } else fail(`scanner filter: remote=${f('Remote - US')} toronto=${f('Toronto, Canada')} austin=${f('Austin, TX (Onsite)')} warned=${warned}`);
+  // Both scanners must reach the policy through effectiveLocationFilter, never hand the raw
+  // portals.yml block to the decider, or the scan gate and eval-prep's gate are two gates.
+  const raw = ['scan.mjs', 'scan-ats-full.mjs'].filter((f2) => {
+    const src = readFileSync(join(ROOT, f2), 'utf8');
+    return !/build(?:LocationDecider|LocationFilter)\(effectiveLocationFilter\(config\??\.location_filter\)\)/.test(src);
+  });
+  if (!raw.length) pass('both scanners decide location through effectiveLocationFilter (the policy)');
+  else fail(`these scanners hand portals.yml's location_filter straight to the decider: ${raw.join(', ')}`);
 } catch (e) {
   fail(`scanner filter test crashed: ${e.message}`);
 }

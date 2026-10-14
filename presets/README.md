@@ -82,7 +82,9 @@ onsite work; both gates read it, and it narrows a metro-scoped remote offer the 
 `same_state_out` does. **`review_metro_companies`** is scanner-only: at a listed employer an
 out-of-range metro comes back as a question rather than a rejection, because some
 employers post an HQ metro on reqs whose team is distributed. The evaluation gate still
-judges the location it is given.
+judges the location it is given. A portals.yml `location_filter` may override the policy's
+lists in the scanner only; its veto lists (`hard_out_metro`, `blocked_geo`) are ADDED to the
+policy's, never swapped for them, because a swap can only loosen the gate.
 
 Then check it:
 
@@ -106,18 +108,22 @@ pass costs one line of triage, so when the text does not settle the question the
 
 1. **Options.** A posting has one or more options (split at `|`, `;`, `·`, `•`, a new line,
    or given as a list). It passes if any option passes, is `unknown` if any is unknown, and
-   fails only when every option fails. An exclusion standing in an option of its own ("US
-   Remote; excluding CA, NY") applies to the posting's remote options, and a bare "Remote"
-   beside options that are all foreign is `unknown`: it could be that country's.
+   fails only when every option fails. An option that is only a work arrangement ("Hybrid",
+   "Onsite") names no place and is dropped like a placeholder. An exclusion standing in an
+   option of its own ("US Remote; excluding CA, NY") applies to the posting's remote
+   options, and a bare "Remote" beside options that are all foreign is `unknown`: it could
+   be that country's.
 2. **States become tokens first.** Every state the text names is replaced by a token such as
    `<TX>` before any pattern reads it, so a code can never be mistaken for a word. A name
    counts unless it is part of a city name ("New York City", "Kansas City", "Washington,
-   PA"); a code counts only in capitals and in a field position ("Irvine, CA", "US, TX,
+   PA") or of a street address, a house number and a direction before it ("1450 W.
+   Washington"; "one of 2 Texas counties" is still Texas); a code counts only in capitals and in a field position ("Irvine, CA", "US, TX,
    Remote", "Remote - TX", "Remote: CA, OR, WA", "CA/TX"). "LA" and "IN" count only after a
    comma or in a list of codes; "CT" and "MT" are time zones beside a time-zone word or in
    "US (CT)", even for someone who lives in Connecticut or Montana; "CA" and "IN" beside a
    foreign place are Canada and India. DC and New York City have one spelling each after
-   folding, and DC is one city, so any DC place is Washington, DC.
+   folding, and DC is one city, so any DC place is Washington, DC; "New York, USA" stays
+   the state.
 3. **Exclusions come out.** A state list after "except", "excluding", "not available in",
    "residents of" and the like, or before "excluded" / "not eligible", names states that are
    OUT: the home state among them fails that remote offer, and the rest are removed before
@@ -125,17 +131,23 @@ pass costs one line of triage, so when the text does not settle the question the
    not an exclusion.
 4. **A commute place passes.** If one place in the option is in the commute list, the option
    passes, unless a far metro overlaps the match ("Walnut" inside "Walnut Creek"), a foreign
-   place stands beside it ("Dublin, Ireland" for a Dublin, Ohio commuter), or that place
-   names a state the policy does not reach ("Glendale, AZ"). A commute entry written "City,
-   ST" also meets the city alone wherever the place's state is that state ("US, VA,
-   Arlington"). In a list of onsite places, "New York" on its own is the city. A place with
+   country or region stands beside it ("Dublin, Ireland" for a Dublin, Ohio commuter;
+   "Santa Ana, San Jose, Costa Rica"), or that place names a state the policy does not reach
+   ("Glendale, AZ"). A foreign CITY in a bare list of capitalised place names is another
+   place and does not void the match ("Los Angeles, London, Sydney"); in prose it does
+   ("Onsite in Singapore, reporting to Los Angeles"). A commute entry written "City, ST"
+   also meets the city alone wherever the place's state is that state ("US, VA,
+   Arlington"), and a bare mention of that city with no state at all is a question
+   ("Ontario" alone may be the province). In a list of onsite places, "New York" on its own is the city. A place with
    no state takes the state of the next "City, ST" in the same or/and/slash list, never of a
    remote alternative or a bare state name; when that borrowed state is the only thing
    against a commute match, the answer is `unknown`, because "Glendale or Scottsdale, AZ"
    and "Irvine or Austin, TX" have the same shape and only one of them is two Arizona
    cities.
 5. **A remote offer is judged by its SCOPE.** Nationwide wording passes ("anywhere in the
-   US", and "anywhere in North America", which contains it). An "or"
+   US", and "anywhere in North America", which contains it; a bare "Anywhere"; and "remote
+   within [Canada or] the United States" when the US ends the option, so "Remote in US,
+   restricted to Texas" goes on to the scope rules). An "or"
    alternative that passes on its own carries the option. A state named in a scope position
    ("US, TX, Remote", "TX - Remote", "Remote - Texas", "Remote (TX)", "Remote: CA, OR, WA",
    "must reside in Texas", "Texas - Dallas Metro - Remote") decides it: reachable (home, or a

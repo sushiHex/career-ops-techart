@@ -11,31 +11,40 @@
  * computed one way everywhere.
  *
  * Run:
- *   node eval-write.mjs batch/eval-queue/<packet>.json [--date=YYYY-MM-DD]
- *   node eval-write.mjs batch/eval-queue/*.json
- *   node eval-write.mjs <packet> --dry-run
+ *   node eval-write.mjs batch/eval-queue/<packet>.json --date=YYYY-MM-DD
+ *   node eval-write.mjs batch/eval-queue/*.json --date=YYYY-MM-DD
+ *   node eval-write.mjs <packet> --date=YYYY-MM-DD --dry-run
  */
-import { readFileSync, writeFileSync, readdirSync, existsSync, mkdirSync, unlinkSync } from 'fs';
+import { readFileSync, writeFileSync, readdirSync, mkdirSync, unlinkSync } from 'fs';
 import { basename, join } from 'path';
 import { applyModel, loadPrefs } from './score-model.mjs';
-import { REQ_ID_SRC } from './req-id-core.mjs';
-import { extractJobId } from './role-matcher.mjs';
+import { reqLabel } from './req-id-core.mjs';
+import { extractJobId, companyKey } from './role-matcher.mjs';
+import { guardArgs } from './cli-guard.mjs';
 
-const args = process.argv.slice(2);
-const DRY = args.includes('--dry-run');
-const dateArg = args.find(a => a.startsWith('--date='));
-const files = args.filter(a => !a.startsWith('--'));
+const args = guardArgs({
+  name: 'eval-write.mjs',
+  summary: 'turn filled eval-prep packets into reports and tracker TSVs',
+  positional: '<packet.json>...',
+  flags: [
+    ['--date <YYYY-MM-DD>', 'report date (required; never taken from the clock)'],
+    ['--dry-run', 'print what would be written, write nothing'],
+  ],
+  notes: 'Writes reports/ and batch/tracker-additions/ unless --dry-run is given.',
+});
+const DRY = args.has('--dry-run');
+const files = args.positional;
 if (!files.length) {
-  console.log('usage: node eval-write.mjs <packet.json> [...] [--date=YYYY-MM-DD] [--dry-run]');
+  console.log('usage: node eval-write.mjs <packet.json> [...] --date=YYYY-MM-DD [--dry-run]');
   process.exit(1);
 }
-if (!dateArg) {
+const DATE = args.value('--date');
+if (!DATE) {
   console.error('--date=YYYY-MM-DD is required. The date is not derived here on purpose:\n' +
     'a report dated by the machine clock silently disagrees with the tracker row when a\n' +
     'run crosses midnight, which has already happened once in this project.');
   process.exit(1);
 }
-const DATE = dateArg.split('=')[1];
 if (!/^\d{4}-\d{2}-\d{2}$/.test(DATE)) { console.error('bad --date'); process.exit(1); }
 
 const prefs = loadPrefs();
@@ -115,7 +124,6 @@ const claimNum = () => {
  */
 const LOC_SEP = ' -- ';
 
-/** Two spellings of one posting URL are one req: case and a trailing slash are noise. */
 /** Two spellings of one posting URL are one req.
  *  SCHEME and HOST are folded; path, query and fragment are NOT. Lowercasing the whole
  *  URL conflates postings that differ only by case, and this comparison decides whether a
@@ -127,37 +135,6 @@ const normUrl = (u) => {
   const s = String(u).trim().replace(/\/+$/, '');
   const m = /^(https?:\/\/)([^/?#]+)(.*)$/i.exec(s);
   return m ? m[1].toLowerCase() + m[2].toLowerCase() + m[3] : s.toLowerCase();
-};
-/** "Fixtureco, Inc." and "Fixtureco" are one employer. */
-const normCo = (c) => String(c).toLowerCase().replace(/[^a-z0-9]+/g, '');
-
-/**
- * The requisition id that travels in the tracker's role cell, e.g. "... (JR2508244)".
- *
- * COMPOSED from the shared pattern rather than spelled again. The spelling this
- * file used to hold was (JR[-_]?\d{4,}|R\d{5,}|\d{7,}), and its four-digit floor
- * after JR is the exact bug removed from pipeline-audit: four digits also matches
- * the DATE in a report filename slug, which minted the id JR2026. It also had no
- * branch for Autodesk's 26WD form, so an Autodesk row reached merge-tracker with
- * no id in its role cell at all.
- *
- * The bare \d{7,} alternative is this consumer's own, and it is legitimate: the
- * shared pattern deliberately excludes the bare numeric Workday id because a
- * loose \d{7,} would swallow ids from other boards when used as a DEDUP KEY.
- * Here it is only a human-readable label, so the looser form costs nothing and
- * is the only thing that labels a "..._17372837" Workday row.
- *
- * Query and fragment are cut first, the same rule jobKey() follows: a tracking
- * parameter carrying a req-shaped token is not this posting's requisition.
- * Last match wins, because the requisition sits at the end of an ATS path.
- */
-const reqLabel = (url) => {
-  const path = String(url || '').trim().replace(/[?#].*$/, '');
-  let last = null;
-  for (const m of path.matchAll(new RegExp(`${REQ_ID_SRC}|[_/-](\\d{7,})(?![0-9])`, 'gi'))) {
-    last = m[1] || m[2];
-  }
-  return last;
 };
 
 /**
@@ -183,7 +160,7 @@ function sameReq(path, p) {
   try { t = readFileSync(path, 'utf8'); } catch { return false; }
   const theirUrl = machineUrl(t), theirCo = machineCo(t);
   if (theirUrl && p.url) return normUrl(theirUrl) === normUrl(p.url);
-  return !!theirCo && normCo(theirCo) === normCo(p.company);
+  return !!theirCo && companyKey(theirCo) === companyKey(p.company);
 }
 
 /**
@@ -229,7 +206,7 @@ function indexReport(file, url, company) {
   if (!REPORT_INDEX.byUrl.has(u)) REPORT_INDEX.byUrl.set(u, file);
   const id = extractJobId(url);
   if (!id || !company) return;
-  const k = `${id}|${normCo(company)}`;
+  const k = `${id}|${companyKey(company)}`;
   if (!REPORT_INDEX.byReqCo.has(k)) REPORT_INDEX.byReqCo.set(k, file);
 }
 
@@ -261,7 +238,7 @@ function priorReport(p) {
     if (byUrl) return byUrl;
     const id = extractJobId(p.url);
     if (id && p.company) {
-      const hit = ix.byReqCo.get(`${id}|${normCo(p.company)}`);
+      const hit = ix.byReqCo.get(`${id}|${companyKey(p.company)}`);
       if (hit) return hit;
     }
   }
@@ -478,13 +455,15 @@ verified: "${DATE} ${p.ats} API"
   // Anchor on the separator, not \b. Workday URLs end "..._17372837" and underscore
   // is a word character, so \b never matches before the digits and the id was
   // silently dropped, which is what let the fuzzy fallback over-merge in the first
-  // place. The pattern itself is reqLabel() above, shared with the rest of Node.
+  // place. reqLabel() lives in req-id-core.mjs. Only a shared-pattern id in this cell
+  // is IDENTITY to role-matcher; a bare-number label is for the reader, and scan.mjs
+  // strips both (req-id-core.mjs says why the three differ).
   const reqId = reqLabel(p.url);
   const roleCell = reqId && !p.title.includes(reqId)
     ? `${cell(p.title)} (${reqId})` : cell(p.title);
   const tsv = [N, DATE, cell(p.company), roleCell, p.status,
     `${m.final.toFixed(1)}/5`, '❌',
-    `[${N}](reports/${N}-${p.slug}-${DATE}.md)`, note].join('\t');
+    `[${N}](${file})`, note].join('\t');
 
   console.log(`${DRY ? 'DRY  ' : 'WROTE'} ${N}  ${m.final.toFixed(2)}  ` +
     `${String(p.status).padEnd(9)} ${p.company} - ${String(p.title).slice(0, 46)}`);

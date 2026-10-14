@@ -22,15 +22,26 @@
  *   node score-audit.mjs --all        # include pre-cutover history
  *   node score-audit.mjs --fix        # rewrite headers/rows to the model value
  */
+import { columnsOf, setCell, trackerRows } from './tracker-rows.mjs';
 import { readFileSync, writeFileSync, readdirSync, existsSync } from 'fs';
 import { join } from 'path';
 import { applyModel, loadPrefs, persistedArrangement } from './score-model.mjs';
+import { guardArgs } from './cli-guard.mjs';
 
 const CUTOVER = '2026-07-27';   // the day score-model.mjs became the only rubric
 const TOL = 0.051;              // both sides are printed to one decimal
-const args = process.argv.slice(2);
-const FIX = args.includes('--fix');
-const ALL = args.includes('--all');
+const args = guardArgs({
+  name: 'score-audit.mjs',
+  summary: 'check that tracker rows, report headers and the model agree',
+  flags: [
+    ['--fix', 'rewrite report headers and tracker rows to the model value'],
+    ['--all', 'include pre-cutover history'],
+  ],
+  notes: 'Reports only by default. Nothing is written without --fix.',
+  writesByDefault: false,
+});
+const FIX = args.has('--fix');
+const ALL = args.has('--all');
 
 const prefs = loadPrefs();
 const TRACKER = 'data/applications.md';
@@ -53,16 +64,13 @@ const trackerLines = readFileSync(TRACKER, 'utf8').split('\n');
 // the pipeline rules already declare authoritative, so use it.
 const rows = new Map();
 const unlinked = [];
-trackerLines.forEach((line, i) => {
-  if (!line.trim().startsWith('|')) return;
-  const c = line.trim().replace(/^\||\|$/g, '').split('|').map(s => s.trim());
-  if (c.length < 8 || !/^\d+$/.test(c[0])) return;
-  const idx = c.findIndex(x => /^[\d.]+\s*\/\s*5$/.test(x));
-  if (idx < 0) return;
-  const link = line.match(/\]\(\s*(?:\.\.\/)?reports\/([^)\s]+)\s*\)/);
-  if (!link) { unlinked.push(Number(c[0])); return; }
-  rows.set(link[1], { score: parseFloat(c[idx]), line: i, cell: idx, num: Number(c[0]) });
-});
+const colmap = columnsOf(trackerLines);
+for (const row of trackerRows(trackerLines, colmap)) {
+  if (!/^[\d.]+\s*\/\s*5$/.test(row.score)) continue;
+  const link = row.raw.match(/\]\(\s*(?:\.\.\/)?reports\/([^)\s]+)\s*\)/);
+  if (!link) { unlinked.push(row.num); continue; }
+  rows.set(link[1], { score: parseFloat(row.score), line: row.line, num: row.num });
+}
 
 const field = (t, k) => {
   const m = t.match(new RegExp('^\\s*' + k + ':\\s*"?([^"\\n]+)', 'm'));
@@ -231,11 +239,7 @@ for (const d of disagree) {
     hdr++;
   }
   if (!near(d.stated, d.row)) {
-    const c = trackerLines[d.rowRef.line].split('|');
-    // +1: the split on a line starting with "|" yields an empty first element, so
-    // the cell indexes counted above are all one to the left of the split array.
-    c[d.rowRef.cell + 1] = c[d.rowRef.cell + 1].replace(/[\d.]+\s*\/\s*5/, `${v}/5`);
-    trackerLines[d.rowRef.line] = c.join('|');
+    trackerLines[d.rowRef.line] = setCell(trackerLines[d.rowRef.line], colmap, 'score', `${v}/5`);
     trk++;
   }
 }

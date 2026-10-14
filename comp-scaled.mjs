@@ -32,6 +32,7 @@
  */
 import { readFileSync, existsSync } from 'fs';
 import { join } from 'path';
+import { reportFileOf, trackerRows } from './tracker-rows.mjs';
 
 const { parseScores, computeGlobal } = await import(
   new URL('./audit-scores.mjs', import.meta.url).href
@@ -60,14 +61,11 @@ if (!(FLOOR > 0)) {
 
 const DEAD = new Set(['Rejected', 'Discarded', 'SKIP']);
 const rows = [];
-for (const line of readFileSync(join('data', 'applications.md'), 'utf-8').split('\n')) {
-  if (!line.startsWith('|')) continue;
-  const c = line.split('|').map((x) => x.trim());
-  if (c.length < 8 || !/^\d+$/.test(c[1] || '')) continue;
-  if (DEAD.has(c[6])) continue;
-  const rm = line.match(/\((?:\.\.\/)?reports\/([^)]+)\)/);
-  if (!rm) continue;
-  const p = join('reports', rm[1].split('/').pop());
+for (const row of trackerRows(readFileSync(join('data', 'applications.md'), 'utf-8').split('\n'))) {
+  if (DEAD.has(row.status)) continue;
+  const reportFile = reportFileOf(row.raw);
+  if (!reportFile) continue;
+  const p = join('reports', reportFile);
   if (!existsSync(p)) continue;
   const text = readFileSync(p, 'utf-8');
   const s = parseScores(text);
@@ -92,7 +90,7 @@ for (const line of readFileSync(join('data', 'applications.md'), 'utf-8').split(
       : (band.basis === 'total' && achievable < FLOOR ? Math.pow(achievable / FLOOR, K) : 1);
     scaled = (cur) * factor;
   }
-  rows.push({ num: c[1], co: c[3], role: c[4], cur, fit, band, achievable, factor, scaled });
+  rows.push({ num: String(row.num), co: row.company, role: row.role, cur, fit, band, achievable, factor, scaled });
 }
 
 const scored = rows.filter((r) => r.scaled !== null);

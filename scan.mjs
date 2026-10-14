@@ -30,14 +30,16 @@
  *   node scan.mjs --verify --throttle=8000     # custom base gap in ms (waits base..2*base)
  */
 
+import { trackerRows } from './tracker-rows.mjs';
 import { readFileSync, writeFileSync, appendFileSync, existsSync, mkdirSync, readdirSync } from 'fs';
 import { pathToFileURL, fileURLToPath } from 'url';
 import path from 'path';
 import yaml from 'js-yaml';
 
-import { isMain } from './cli-guard.mjs';
+import { guardArgs, isMain } from './cli-guard.mjs';
 import { makeHttpCtx } from './providers/_http.mjs';
 import { buildSignals, decideLocations, effectiveLocationFilter } from './location-core.mjs';
+import { ROLE_ID_TOKEN_SRC } from './req-id-core.mjs';
 
 const parseYaml = yaml.load;
 
@@ -143,19 +145,16 @@ function compileTitleKeyword(keyword) {
   if (!body) return () => false;
   const escaped = body.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/\s+/g, '\\s+');
   const tail = isStem ? '' : '(?=$|[^a-z0-9])';
-  return (title) => new RegExp(`(^|[^a-z0-9])${escaped}${tail}`, 'i').test(title);
+  // Built once per keyword. Building it per call cost about 2s a scan: every one of
+  // ~22,000 titles against ~130 keywords, and twice over for each rejected title.
+  const re = new RegExp(`(^|[^a-z0-9])${escaped}${tail}`, 'i');
+  return (title) => re.test(title);
 }
 
+/** True when a title passes portals.yml `title_filter`; buildTitleExplainer says why. */
 export function buildTitleFilter(titleFilter) {
-  const positive = (titleFilter?.positive || []).map(compileTitleKeyword);
-  const negative = (titleFilter?.negative || []).map(compileTitleKeyword);
-
-  return (title) => {
-    const text = String(title ?? '');
-    const hasPositive = positive.length === 0 || positive.some(match => match(text));
-    const hasNegative = negative.some(match => match(text));
-    return hasPositive && !hasNegative;
-  };
+  const explain = buildTitleExplainer(titleFilter);
+  return (title) => explain(title).pass;
 }
 
 /**
@@ -431,11 +430,6 @@ async function searchForNewUrl(page, offer) {
 
 // ── Dedup ───────────────────────────────────────────────────────────
 
-const PERMANENT_SCAN_HISTORY_STATUSES = new Set([
-  'skipped_invalid_url',
-  'skipped_blocked_host',
-]);
-
 function daysBetweenIsoDates(start, end) {
   if (!/^\d{4}-\d{2}-\d{2}$/.test(start) || !/^\d{4}-\d{2}-\d{2}$/.test(end)) return null;
   const startDate = new Date(`${start}T00:00:00Z`);
@@ -445,12 +439,10 @@ function daysBetweenIsoDates(start, end) {
 }
 
 export function shouldDedupScanHistoryRow({ firstSeen, status = 'added' }, { recheckAfterDays = null, today = new Date().toISOString().slice(0, 10) } = {}) {
-  if (PERMANENT_SCAN_HISTORY_STATUSES.has(status)) return true;
-  if (status !== 'added') return true;
-  if (recheckAfterDays == null) return true;
+  // Only an `added` row expires; a skip (skipped_invalid_url, skipped_blocked_host) is permanent.
+  if (status !== 'added' || recheckAfterDays == null) return true;
   const ageDays = daysBetweenIsoDates(firstSeen, today);
-  if (ageDays == null) return true;
-  return ageDays < recheckAfterDays;
+  return ageDays == null || ageDays < recheckAfterDays;
 }
 
 function scanHistoryPolicy(config = {}) {
@@ -515,6 +507,12 @@ export function canonicalCompany(value) {
     .trim();
 }
 
+// The token is defined in req-id-core.mjs beside the label eval-write writes into a role
+// cell and the pattern role-matcher reads out of it; test-all asserts this stripper covers
+// both over the real tracker and reports.
+const ROLE_PAREN_WITH_ID = new RegExp(String.raw`\((?=[^)]*${ROLE_ID_TOKEN_SRC})[^)]*\)`, 'gi');
+const ROLE_BARE_ID = new RegExp(ROLE_ID_TOKEN_SRC, 'gi');
+
 /**
  * Canonical role title for tracker matching.
  *
@@ -526,13 +524,24 @@ export function canonicalCompany(value) {
  * Engineer - AI Agents and Systems". That is why every match is written to
  * data/already-evaluated.tsv rather than dropped silently: an over-merge stays
  * visible and recoverable instead of quietly deleting a live role.
+ *
+ * WHAT COUNTS AS AN ID is ROLE_ID_TOKEN_SRC from req-id-core.mjs: the shared
+ * Workday pattern composed with the forms the tracker writes beside it, among them
+ * a BARE number of five or more digits, which is how a Greenhouse gh_jid and a
+ * Riot or Disney id are recorded, "(5349405250)". The previous rule recognised an id
+ * only by a JR/R/REQ/GH prefix, so it missed the bare form and 33 roles already
+ * on the tracker came back as new; and because its `r`
+ * branch accepted any word, it also stripped "(Rigging)" and "(Robotics)",
+ * merging titles that differ in exactly the word that tells them apart. A
+ * parenthetical is now dropped whole when it CONTAINS an id, since the tracker
+ * often writes the team beside it, "(Industrial Engineering, JR2878530)", and a
+ * board title carries neither.
  */
 export function canonicalRole(value) {
   return String(value ?? '')
     .toLowerCase()
-    .replace(/\((?:jr|req|r|gh)[- ]?[\w-]+\)/gi, ' ')
-    .replace(/\breq[- ]?\d+\b/gi, ' ')
-    .replace(/\bjr\d{6,}\b/gi, ' ')
+    .replace(ROLE_PAREN_WITH_ID, ' ')
+    .replace(ROLE_BARE_ID, ' ')
     .replace(/&/g, ' and ')
     .replace(/[^a-z0-9]+/g, ' ')
     .trim();
@@ -542,14 +551,10 @@ function loadSeenCompanyRoles() {
   const seen = new Map();
   if (existsSync(APPLICATIONS_PATH)) {
     const text = readFileSync(APPLICATIONS_PATH, 'utf-8');
-    for (const line of text.split('\n')) {
-      if (!line.trim().startsWith('|')) continue;
-      const cells = line.split('|').map(s => s.trim());
-      // | # | Date | Company | Role | Score | Status | ...
-      const [, num, , company, role, score, status] = cells;
-      if (!/^\d+$/.test(num || '') || !company || !role) continue;
+    for (const { num, company, role, score, status } of trackerRows(text.split('\n'))) {
+      if (!company || !role) continue;
       const key = `${canonicalCompany(company)}::${canonicalRole(role)}`;
-      if (!seen.has(key)) seen.set(key, { num, company, role, score, status });
+      if (!seen.has(key)) seen.set(key, { num: String(num), company, role, score, status });
     }
   }
   return seen;
@@ -826,23 +831,33 @@ function guardStatusFor(code) {
 }
 
 async function main() {
-  const args = process.argv.slice(2);
-  const dryRun = args.includes('--dry-run');
-  const verify = args.includes('--verify');
+  const args = guardArgs({
+    name: 'scan.mjs',
+    summary: 'zero-token portal scan into data/pipeline.md',
+    flags: [
+      ['--dry-run', 'report what would be added, write nothing'],
+      ['--company <name>', 'scan only companies whose name contains this'],
+      ['--verify', 'check each new posting is live before adding it'],
+      ['--headed-fallback', 'with --verify, retry an anti-bot challenge in a headed browser'],
+      ['--throttle[=<ms>]', 'with --verify, jittered gap between checks (default 5000ms)'],
+      ['--rediscover-404', 'with --verify, look for a moved role before marking it expired'],
+    ],
+    notes: 'Without --dry-run this writes data/pipeline.md, data/scan-history.tsv and its veto logs in data/.',
+  });
+  const dryRun = args.has('--dry-run');
+  const verify = args.has('--verify');
   // Opt-in: on an anti-bot challenge (e.g. pracuj.pl Cloudflare wall), retry the
   // URL in a headed browser. Off by default — headed Chromium needs a display, so
   // scheduled/unattended scans should not rely on it.
-  const headedFallback = args.includes('--headed-fallback');
+  const headedFallback = args.has('--headed-fallback');
   // --throttle or --throttle=<ms>: jittered gap between --verify checks to stay
   // under rate-based WAF limits (pracuj.pl flags the session after a few rapid
   // hits). Default base 5000ms. Off by default — most ATS feeds don't need it.
-  const throttleArg = args.find((a) => a === '--throttle' || a.startsWith('--throttle='));
-  const throttleBaseMs = throttleArg ? (Number(throttleArg.split('=')[1]) || 5000) : 0;
+  const throttleBaseMs = args.has('--throttle') ? (Number(args.value('--throttle')) || 5000) : 0;
   // --rediscover-404: when a tracked company's URL 404/410s, search for the
   // moved role and re-verify before marking it expired. Opt-in; rides on --verify.
-  const rediscover = args.includes('--rediscover-404');
-  const companyFlag = args.indexOf('--company');
-  const filterCompany = companyFlag !== -1 ? args[companyFlag + 1]?.toLowerCase() : null;
+  const rediscover = args.has('--rediscover-404');
+  const filterCompany = args.value('--company')?.toLowerCase() ?? null;
 
   // 1. Load providers
   const providers = await loadProviders(PROVIDERS_DIR);
@@ -867,7 +882,6 @@ async function main() {
   const config = rawConfig && typeof rawConfig === 'object' ? rawConfig : {};
   const companies = Array.isArray(config.tracked_companies) ? config.tracked_companies : [];
   const boards = Array.isArray(config.job_boards) ? config.job_boards : [];
-  const titleFilter = buildTitleFilter(config.title_filter);
   const explainTitle = buildTitleExplainer(config.title_filter);
   const locationDecider = buildLocationDecider(effectiveLocationFilter(config.location_filter));
   const salaryFilter = buildSalaryFilter(config.salary_filter);
@@ -996,14 +1010,14 @@ async function main() {
       totalFound += jobs.length;
 
       for (const job of jobs) {
-        if (!titleFilter(job.title)) {
+        const why = explainTitle(job.title);
+        if (!why.pass) {
           totalFilteredTitle++;
           // Only NEGATIVE-keyword kills are logged. "No positive matched" is
           // ~97% of rejections and is mostly genuine off-domain noise, but a
           // negative keyword vetoing a title is the dangerous class: bare
           // "Marketing" silently killed "Senior Technical Marketing Engineer",
           // a req that went on to reach interview, on every scan for months.
-          const why = explainTitle(job.title);
           if (why.reason.startsWith('negative')) {
             titleVetoes.push({ company: job.company, title: job.title, reason: why.reason, url: job.url });
           }

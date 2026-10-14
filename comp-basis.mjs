@@ -19,8 +19,15 @@
  */
 import { readFileSync, writeFileSync, existsSync } from 'fs';
 import { join } from 'path';
+import { reportFileOf, trackerRows } from './tracker-rows.mjs';
+import { guardArgs } from './cli-guard.mjs';
 
-const QUIET = process.argv.includes('--quiet');
+const QUIET = guardArgs({
+  name: 'comp-basis.mjs',
+  summary: 'emit, per tracked row, whether its comp figure is BASE or TOTAL',
+  flags: [['--quiet', 'print only the summary line']],
+  notes: 'Writes data/comp-basis.json.',
+}).has('--quiet');
 // Sibling modules resolve beside this file, so it runs from any directory; the
 // data it reads (data/, reports/) stays relative to where it is run.
 const here = (f) => new URL(f, import.meta.url).href;
@@ -32,14 +39,10 @@ if (!existsSync(TRACKER)) { console.log('no tracker'); process.exit(0); }
 const out = {};
 const tally = { base: 0, total: 0, unknown: 0, 'no-figure': 0 };
 
-for (const line of readFileSync(TRACKER, 'utf-8').split('\n')) {
-  if (!line.startsWith('|')) continue;
-  const c = line.split('|').map((x) => x.trim());
-  if (c.length < 8 || !/^\d+$/.test(c[1] || '')) continue;
-
-  const rm = line.match(/\((?:\.\.\/)?reports\/([^)]+)\)/);
-  if (!rm) continue;
-  const p = join('reports', rm[1].split('/').pop());
+for (const row of trackerRows(readFileSync(TRACKER, 'utf-8').split('\n'))) {
+  const reportFile = reportFileOf(row.raw);
+  if (!reportFile) continue;
+  const p = join('reports', reportFile);
   if (!existsSync(p)) continue;
 
   let text;
@@ -56,7 +59,7 @@ for (const line of readFileSync(TRACKER, 'utf-8').split('\n')) {
   const posted = compBand(text.replace(/^[ \t]*comp_total_est(?:imate)?:.*$/gim, ''));
 
   const basis = band ? band.basis : 'no-figure';
-  out[c[1]] = {
+  out[row.num] = {
     basis, status: v.status,
     lo: band ? band.lo : null, hi: band ? band.hi : null,
     posted_basis: posted ? posted.basis : 'no-figure',

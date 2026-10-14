@@ -20,11 +20,19 @@ at it fixes verification at the source and lets the first attempt succeed. The
 fallback to the platform default matters: if certifi is ever missing, callers
 should degrade to their curl path rather than crash on import.
 """
+import functools
 import ssl
 
 
-def build_context():
-    """An SSL context that trusts certifi's bundle, falling back to the platform."""
+@functools.cache
+def tls_context():
+    """An SSL context that trusts certifi's bundle, falling back to the platform.
+
+    Built on first use and then kept. Contexts are reusable across connections, and
+    rebuilding one per request re-reads and re-parses the whole CA bundle; building it at
+    import charged about 0.28s to every tool that imports a fetcher and never fetches
+    (eval-blockers, eval-prep --list and --selftest).
+    """
     try:
         import certifi
     except ImportError:
@@ -33,11 +41,6 @@ def build_context():
         return ssl.create_default_context(cafile=certifi.where())
     except Exception:
         return ssl.create_default_context()
-
-
-# Built once at import. Contexts are reusable across connections and rebuilding
-# one per request re-reads and re-parses the whole CA bundle.
-CTX = build_context()
 
 
 def is_tls_failure(exc):

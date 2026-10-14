@@ -30,6 +30,7 @@ import { fileURLToPath } from 'url';
 
 import { isMain } from './cli-guard.mjs';
 import { applyModel, loadPrefs, persistedArrangement } from './score-model.mjs';
+import { reportFileOf, trackerRows } from './tracker-rows.mjs';
 
 const args = process.argv.slice(2);
 const has = (f) => args.includes(f);
@@ -132,19 +133,16 @@ function reportDate(name) {
 function actionableReports() {
   if (!existsSync(TRACKER)) return new Map();
   const out = new Map();
-  for (const line of readFileSync(TRACKER, 'utf-8').split('\n')) {
-    if (!line.startsWith('|')) continue;
-    const c = line.split('|').map((x) => x.trim());
-    if (c.length < 8) continue;
-    const sm = (c[5] || '').match(/([\d.]+)\/5/);
+  for (const row of trackerRows(readFileSync(TRACKER, 'utf-8').split('\n'))) {
+    const sm = (row.score || '').match(/([\d.]+)\/5/);
     if (!sm) continue;
     const score = parseFloat(sm[1]);
-    const status = c[6];
-    const rm = line.match(/\((?:\.\.\/)?reports\/([^)]+)\)/);
-    if (score >= 4.0 && !['Rejected', 'Discarded', 'SKIP'].includes(status) && rm) {
+    const status = row.status;
+    const reportFile = reportFileOf(row.raw);
+    if (score >= 4.0 && !['Rejected', 'Discarded', 'SKIP'].includes(status) && reportFile) {
       // `role` is needed by prefFactor: a de-prioritised title keeps only a
       // fraction of its company preference, so omitting it overstates the score.
-      out.set(rm[1].split('/').pop(), { company: c[3], role: c[4], score, status });
+      out.set(reportFile, { company: row.company, role: row.role, score, status });
     }
   }
   return out;

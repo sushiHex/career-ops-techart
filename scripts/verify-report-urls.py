@@ -19,7 +19,7 @@ Run:
   python scripts/verify-report-urls.py --all
   python scripts/verify-report-urls.py --from 440
 """
-import importlib.util, os, re, sys
+import concurrent.futures, importlib.util, os, re, sys
 
 for _s in (sys.stdout, sys.stderr):
     try:
@@ -75,16 +75,38 @@ if "--from" in sys.argv:
 elif "--all" not in sys.argv:
     files = files[-40:]
 
+
+def report_url(fn):
+    """The report's **URL:** value, or None when it has no such header."""
+    m = URL_RE.search(open(os.path.join(REPORTS, fn), encoding="utf-8", errors="replace").read())
+    return m.group(1).strip().rstrip(")") if m else None
+
+
+def posting_url(url):
+    """Is this a URL the loop below resolves: an http address with a path?"""
+    return bool(url) and url.startswith("http") and not is_bare_host(url)
+
+
+def check(fn):
+    """(url, resolver verdict or None) for one report."""
+    url = report_url(fn)
+    return url, (rr.resolve(url) if posting_url(url) else None)
+
+
+# Resolving is the slow part, about 700 network round trips, so it runs on a small pool.
+# map() yields in file order, so everything below prints exactly as a one-at-a-time run.
+# Eight workers: the reports span dozens of hosts, the cap keeps any one ATS from seeing
+# more than a handful of requests at once, and a board many reports share is downloaded
+# once, by req-resolve's single-flight board cache.
+verdicts = concurrent.futures.ThreadPoolExecutor(max_workers=8).map(check, files)
+
 bad, closed, unsupported, rootonly = [], [], [], []
 print(f"checking {len(files)} reports\n")
-for fn in files:
-    txt = open(os.path.join(REPORTS, fn), encoding="utf-8", errors="replace").read()
-    m = URL_RE.search(txt)
-    if not m:
+for fn, (url, r) in zip(files, verdicts):
+    if url is None:
         print(f"  NO-URL     {fn}")
         bad.append((fn, "no **URL:** header"))
         continue
-    url = m.group(1).strip().rstrip(")")
     if not url.startswith("http"):
         continue
     # A bare host with no path is not a posting address, and resolving it is worse than
@@ -98,7 +120,6 @@ for fn in files:
         print(f"  NO-PATH    {fn}  ({url})")
         rootonly.append(fn)
         continue
-    r = rr.resolve(url)
     note = r.get("note") or ""
     # A checker that reports its own coverage gaps as defects trains you to ignore
     # it. Three outcomes are NOT report defects and are counted separately:

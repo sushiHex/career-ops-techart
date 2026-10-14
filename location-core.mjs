@@ -106,7 +106,8 @@ function compile(key, g = '') {
 const KEYS = ['remote', 'remote_friendly', 'remote_hybrid', 'us', 'city_suffix', 'time_zone_words', 'time_zone_abbrev',
   'time_zone_us_paren', 'placeholder', 'nationwide', 'exclusion_lead', 'exclusion_trail', 'weak_context', 'scope_shapes',
   'metro_scope', 'chunk_split', 'sentence_break', 'place_split', 'place_donor',
-  'undetermined', 'travel_phrase', 'preference_after', 'context_before', 'negation_before'];
+  'undetermined', 'travel_phrase', 'preference_after', 'context_before', 'negation_before',
+  'street_before', 'place_list'];
 const RX = Object.fromEntries(KEYS.map((k) => [k, compile(k)]));
 const RXG = Object.fromEntries(KEYS.map((k) => [k, compile(k, 'g')]));
 const CITY_SUFFIX = new RegExp(`^(?:${expand(G.city_suffix)})`, 'i');
@@ -136,6 +137,10 @@ function alternation(words, flags = 'i') {
   return new RegExp(`(?<![A-Za-z0-9])(?:${items.map(esc).join('|')})(?![A-Za-z0-9])`, flags);
 }
 const BLOCKED_CODES = alternation(BASE.blocked_codes, '');
+// The foreign places in blocked_geo that are CITIES. Beside a commute place a city is
+// another place in a list ("Los Angeles, London, Sydney"), where a country or region
+// qualifies it ("Dublin, Ireland"), so only the second voids a commute match.
+const FOREIGN_CITIES = alternation(BASE.foreign_cities);
 const spansOf = (re, t) => [...t.matchAll(new RegExp(re.source, re.flags.includes('g') ? re.flags : `${re.flags}g`))]
   .map((m) => [m.index, m.index + m[0].length]);
 
@@ -144,9 +149,11 @@ const spansOf = (re, t) => [...t.matchAll(new RegExp(re.source, re.flags.include
  * (grammar "folds"). scripts/_location.py fold() is the same function.
  */
 export function foldOption(option) {
-  // Every combining mark, as Python's category "Mn", and whitespace JavaScript's \s does
-  // not know made plain.
-  let t = String(option ?? '').normalize('NFD').replace(/\p{Mn}/gu, '').replace(/[\x1c-\x1f\x85]/g, ' ');
+  // Every combining mark, as Python's category "Mn", and every non-ASCII whitespace
+  // character made a plain space: the two engines disagree about which of them \s
+  // matches. scripts/_location.py _ODD_SPACE is the same class.
+  let t = String(option ?? '').normalize('NFD').replace(/\p{Mn}/gu, '')
+    .replace(/[\x1c-\x1f\x85\xa0\u1680\u2000-\u200b\u2028\u2029\u202f\u205f\u3000\ufeff]/g, ' ');
   for (const [re, rep] of FOLDS) t = t.replace(re, rep);
   t = t.trim();
   return { raw: t, text: t.toLowerCase() };
@@ -162,11 +169,12 @@ export function tokenize(text, home = null, blockedRe = alternation(BASE.blocked
   // `usPlace` reads a policy's own entry, which is always a US place: "Dublin, CA" in a
   // California policy is Dublin, California, whatever Dublin means in a posting.
   const blocked = !usPlace && (blockedRe.test(t) || BLOCKED_CODES.test(t));
-  // Names, unless part of a city name: "New York City", "Kansas City", "Washington, PA".
+  // Names, unless part of a city name: "New York City", "Kansas City", "Washington, PA",
+  // or of a street address: "1450 W. Washington".
   let out = '', last = 0;
   for (const m of t.matchAll(NAMES)) {
     const after = t.slice(m.index + m[0].length);
-    if (CITY_SUFFIX.test(after)) continue;
+    if (CITY_SUFFIX.test(after) || RX.street_before.test(t.slice(0, m.index))) continue;
     const city = /^\s*,\s*([A-Z]{2})(?![A-Za-z])/.exec(after);
     if (city && STATE_CODES.has(city[1])) continue;
     out += t.slice(last, m.index) + `<${STATE_ABBR[m[1].toLowerCase()]}>`;
@@ -344,22 +352,31 @@ function commuteIn(n, s) {
       const bare = /^<([A-Z]{2})>$/.exec(probe.trim());
       if (onsite && bare && s.stateAsCity[bare[1]]) probe = s.stateAsCity[bare[1]];
       const hits = s.commute.spans(probe);
-      let clash = false;
+      let clash = false, bareCity = false;
       for (const [m, code] of s.commuteCities) {
         const found = m.spans(probe);
-        if (found.length && (!st.size || st.has(code))) hits.push(...found);
+        if (found.length && st.has(code)) hits.push(...found);
+        // An entry written "City, ST" was written that way because the city alone is
+        // ambiguous: "Ontario" with no state is as likely the Canadian province as
+        // Ontario, California. A question, not a pass.
+        else if (found.length && !st.size) bareCity = true;
         else if (found.length) clash = true;          // "Carson or Austin, TX" against "Carson, CA"
       }
-      if (!hits.length) { ambiguous = ambiguous || (clash && !owned); continue; }
+      if (!hits.length) { ambiguous = ambiguous || (clash && !owned) || bareCity; continue; }
       // A far metro over the match voids it ("Walnut" inside "Walnut Creek").
       const outs = s.far.spans(probe);
       if (hits.every((h) => overlaps(h, outs))) continue;
-      // So does a foreign place BESIDE it when no US state is named: "Dublin, Ireland" is
-      // not the Dublin in an Ohio commute list. The match itself may be a foreign name
-      // too ("Dublin" alone), which settles nothing.
+      // So does a foreign country or region BESIDE it when no US state is named: "Dublin,
+      // Ireland" is not the Dublin in an Ohio commute list. The match itself may be a
+      // foreign name too ("Dublin" alone), which settles nothing, and a foreign CITY in a
+      // bare list of place names is another place ("Los Angeles, London, Sydney"),
+      // which does not qualify it either. In prose it still does: "Onsite in Singapore,
+      // reporting to Los Angeles".
       const trips = spansOf(RX.travel_phrase, probe);
+      const cities = new Set(RX.place_list.test(probe)
+        ? spansOf(FOREIGN_CITIES, probe).map(([a, b]) => `${a}:${b}`) : []);
       const abroad = [...spansOf(s.blocked, probe), ...spansOf(BLOCKED_CODES, probe)]
-        .filter(([c]) => !trips.some(([a, b]) => a <= c && c < b));
+        .filter(([c, d]) => !trips.some(([a, b]) => a <= c && c < b) && !cities.has(`${c}:${d}`));
       if (!tokens(probe).size && !RX.us.test(probe) && abroad.some((x) => !overlaps(x, hits))) continue;
       if ([...st].some((c) => !s.reachable.has(c))) { ambiguous = ambiguous || !owned; continue; }
       return 'pass';
@@ -604,6 +621,14 @@ export function effectiveLocationFilter(portalsFilter = {}, policy = loadLocatio
     //  - upstream's generic allow / block / always_allow keys. Merged beside the policy's
     //    signal keys they were never consulted at all, silently.
     if (IGNORED_FILTER_KEYS.has(k)) { ignored.push(k); continue; }
+    // A veto list is ADDED to, never replaced: replacing it could only loosen the gate,
+    // and silently. A portals.yml hard_out_metro that omitted the policy's "Walnut Creek"
+    // would let the commute signal "Walnut" pass a Bay Area role in the scanner while
+    // eval-prep, which never reads portals.yml, failed it.
+    if (VETO_FILTER_KEYS.has(k) && Array.isArray(v)) {
+      merged[k] = [...new Set([...(merged[k] || []), ...v])];
+      continue;
+    }
     if (Array.isArray(v) ? v.length : v != null) merged[k] = v;
   }
   if (ignored.length) {
@@ -614,6 +639,7 @@ export function effectiveLocationFilter(portalsFilter = {}, policy = loadLocatio
 }
 const IGNORED_FILTER_KEYS = new Set(['california_signals', 'socal_signals', 'allow', 'block',
   'always_allow', 'always_allow_scoped', 'block_hard']);
+const VETO_FILTER_KEYS = new Set(['hard_out_metro', 'blocked_geo']);
 
 // ── Selftest ────────────────────────────────────────────────────────
 // Run it with: node location-core.mjs --selftest
@@ -672,6 +698,8 @@ const SELFTEST_OPTIONS = [
   ['Remote (US)', 'accept', 'unscoped, parenthesised'],
   ['US Remote', 'accept', 'unscoped, no punctuation at all'],
   ['Remote', 'accept', 'remote-anywhere'],
+  ['Remote, Global', 'accept', 'worldwide remote includes the US'],
+  ['Remote - Worldwide', 'accept', 'worldwide remote, dash-separated'],
   // The documented precedence case: an incidental foreign mention must not
   // outrank an explicit US-remote offer, and a prose field is not a scope.
   ['Remote, US (occasional travel to London)', 'accept', 'prose field is not a subdivision'],
@@ -837,7 +865,33 @@ if (invokedDirectly) {
       'a DC scope is not the Washington home state'],
     [policy({ code: 'WA', name: 'Washington' }, ['Seattle']), 'Washington, DC', 'reject',
       'onsite DC is another place'],
+    // Location spellings that the shared grammar first read wrongly.
+    [ca, 'Torrance 1450 W. Washington Ave (hybrid, 3 days on-site)', 'accept',
+      'a state name after a house number is a street, not a state'],
+    [ca, 'Los Angeles, London, Sydney', 'accept', 'a foreign city beside a commute place is another place'],
+    [ca, 'Santa Ana, San Jose, Costa Rica', 'reject', 'a foreign country still qualifies the place'],
+    [ca, 'Office - Ontario/Canada', 'reject', 'a bare Ontario is not the policy\'s "Ontario, CA"'],
+    [ca, 'Ontario', 'unknown', 'a bare city from a "City, ST" entry is a question'],
+    [ca, 'New York, USA - Remote', 'reject', 'the New York fold does not fire before a country'],
+    [ca, 'New York City', 'reject', 'the bare city is the out-of-range metro'],
+    [ca, 'Anywhere', 'accept', 'a bare "Anywhere" is a remote offer'],
+    [ca, 'Boston, MA, Chicago, IL, or Remote within Canada or United States', 'accept',
+      'remote within the US is open nationwide'],
+    [ca, 'Remote within the United States (Texas residents only)', 'unknown',
+      'a restriction keeps it out of the nationwide shortcut'],
+    [ca, 'Remote in US, restricted to Texas', 'unknown', 'the shortcut needs the US to end the option'],
+    [ca, 'US Remote, must reside in one of 2 Texas counties', 'unknown',
+      'a bare number before a state name is not a street'],
+    [ca, 'Torrance 1450 West Washington Avenue', 'accept', 'a spelled-out street direction'],
+    [ca, 'Onsite in Singapore, reporting to Los Angeles', 'reject',
+      'a foreign city in prose still voids the commute match'],
   ];
+  // A bare work-arrangement option names no place.
+  const hybridOnly = decideLocations('Chicago, IL | Hybrid', ca).verdict;
+  if (hybridOnly !== 'reject') {
+    bad++;
+    console.log(`FAIL  posting "Chicago, IL | Hybrid"\n      got ${hybridOnly}, want reject (a bare "Hybrid" option is a placeholder)`);
+  }
   for (const [sig, option, want, why] of POLICY_CASES) {
     const got = classifyLocationOption(option, sig);
     if (got !== want) {
@@ -855,7 +909,13 @@ if (invokedDirectly) {
     { home_state: { code: 'TX', name: 'Texas' }, commute: { signals: ['Austin'] } },
     (m) => warned.push(m));
   const effSig = buildSignals(eff);
+  // A veto list in portals.yml is added to the policy's, never swapped for it.
+  const vetoSig = buildSignals(effectiveLocationFilter({ hard_out_metro: ['San Francisco'], blocked_geo: ['Narnia'] },
+    loadLocationPolicy(join(LOCATION_PRESETS, 'california-socal.json')), () => {}));
   const effChecks = [
+    ['an override veto list is added to, not swapped for, the policy\'s',
+      classifyLocationOption('Walnut Creek, CA', vetoSig) === 'reject'
+      && classifyLocationOption('Narnia', vetoSig) === 'reject'],
     ['an override list replaces the policy list', eff.commute_signals.join() === 'Round Rock'],
     ['the other policy lists are kept', eff.home_state_signals.includes('Texas')],
     ['legacy California keys are not unioned into home', !('california_signals' in eff)

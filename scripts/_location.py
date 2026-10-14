@@ -51,8 +51,15 @@ def _expand(p):
              .replace("{US}", G["us"]).replace("{R}", G["remote"]))
 
 
+# Python's \d, \w, \b and case folding are Unicode-wide where JavaScript's (no `u` flag)
+# are ASCII, so an Arabic-Indic digit or a long s ("Texaſ") read differently in the two
+# engines, and the second one crashed the state lookup here. ASCII semantics everywhere
+# make the two the same engine; fold() has already made the text ASCII-spaced.
+_A = re.ASCII
+
+
 def _compile(key):
-    flags = 0 if key in G["case_sensitive"] else re.I
+    flags = (0 if key in G["case_sensitive"] else re.I) | _A
     v = G[key]
     return [re.compile(_expand(p), flags) for p in v] if isinstance(v, list) else re.compile(_expand(v), flags)
 
@@ -61,7 +68,8 @@ RX = {k: _compile(k) for k in (
     "remote", "remote_friendly", "remote_hybrid", "us", "city_suffix", "time_zone_words", "time_zone_abbrev",
     "time_zone_us_paren", "placeholder", "nationwide", "exclusion_lead", "exclusion_trail", "weak_context",
     "scope_shapes", "metro_scope", "chunk_split", "sentence_break", "place_split", "place_donor",
-    "undetermined", "travel_phrase", "preference_after", "context_before", "negation_before")}
+    "undetermined", "travel_phrase", "preference_after", "context_before", "negation_before",
+    "street_before", "place_list")}
 
 
 def _repl(r):
@@ -69,18 +77,21 @@ def _repl(r):
     return re.sub(r"\$(\d)", r"\\\1", r)
 
 
-FOLDS = [(re.compile(p, re.I), _repl(r)) for p, r in G["folds"]]
-PLACE_BREAK = (re.compile(G["place_break"][0], re.I), _repl(G["place_break"][1]))
-# Whitespace JavaScript's \s does not know, made plain before either engine reads the text.
-_ODD_SPACE = re.compile(r"[\x1c-\x1f\x85]")
+FOLDS = [(re.compile(p, re.I | _A), _repl(r)) for p, r in G["folds"]]
+PLACE_BREAK = (re.compile(G["place_break"][0], re.I | _A), _repl(G["place_break"][1]))
+# Every whitespace character that is not an ASCII one, made a plain space before either
+# engine reads the text: the two disagree about which of these \s matches (JavaScript's
+# includes U+FEFF and NBSP, Python's \x1c-\x1f and \x85). location-core.mjs ODD_SPACE.
+_ODD_SPACE = re.compile(r"[\x1c-\x1f\x85\xa0\u1680\u2000-\u200b\u2028\u2029\u202f\u205f\u3000\ufeff]")
 TOKEN = re.compile(r"<([A-Z]{2})>")
 OPTION_SPLIT = re.compile(r"\s*(?:[;|·•\n])\s*")
-_ALT_SPLIT = re.compile(r"\s+or\s+|\s*/\s*", re.I)
-_NAMES = re.compile(r"(?<![A-Za-z])(" + "|".join(re.escape(n) for n in SPELLED_STATES) + r")(?![A-Za-z])", re.I)
+_ALT_SPLIT = re.compile(r"\s+or\s+|\s*/\s*", re.I | _A)
+_NAMES = re.compile(r"(?<![A-Za-z])(" + "|".join(re.escape(n) for n in SPELLED_STATES) + r")(?![A-Za-z])",
+                    re.I | _A)
 _CODE = re.compile(r"(?<![A-Za-z0-9<])([A-Z]{2})(?![A-Za-z0-9>])")
 _RUN = re.compile(r"(?<![A-Za-z0-9<])[A-Z]{2}(?:\s*(?:,|/|&|\s(?:or|and)\s)\s*[A-Z]{2})+(?![A-Za-z0-9>])")
-_CODE_BEFORE = re.compile(G["code_before"], re.I)
-_CODE_AFTER = re.compile(G["code_after"], re.I)
+_CODE_BEFORE = re.compile(G["code_before"], re.I | _A)
+_CODE_AFTER = re.compile(G["code_after"], re.I | _A)
 AMBIGUOUS = {c: tuple(r) for c, r in G["ambiguous_codes"].items()}
 TZ_CODES = set(G["time_zone_codes"])
 COUNTRY_LIKE = set(G["country_like_codes"])
@@ -96,11 +107,16 @@ def _alternation(words, flags=re.I):
     items = sorted({w.strip() for w in words or [] if w and w.strip()}, key=len, reverse=True)
     if not items:
         return re.compile(r"(?!x)x")
-    return re.compile(r"(?<![A-Za-z0-9])(?:" + "|".join(re.escape(w) for w in items) + r")(?![A-Za-z0-9])", flags)
+    return re.compile(r"(?<![A-Za-z0-9])(?:" + "|".join(re.escape(w) for w in items) + r")(?![A-Za-z0-9])",
+                      flags | _A)
 
 
 BLOCKED = _alternation(BASE["blocked_geo"])
 BLOCKED_CODES = _alternation(BASE["blocked_codes"], 0)
+# The foreign places in blocked_geo that are CITIES. Beside a commute place a city is
+# another place in a list ("Los Angeles, London, Sydney"), where a country or region
+# qualifies it ("Dublin, Ireland"), so only the second voids a commute match.
+FOREIGN_CITIES = _alternation(BASE.get("foreign_cities"))
 
 
 def fold(text):
@@ -120,11 +136,12 @@ def tokenize(text, home=None, us_place=False):
     California policy is Dublin, California, whatever Dublin means in a posting."""
     t = fold(text)
     blocked = not us_place and bool(BLOCKED.search(t) or BLOCKED_CODES.search(t))
-    # Names, unless part of a city name: "New York City", "Kansas City", "Washington, PA".
+    # Names, unless part of a city name: "New York City", "Kansas City", "Washington, PA",
+    # or of a street address: "1450 W. Washington".
     out, last = [], 0
     for m in _NAMES.finditer(t):
         after = t[m.end():]
-        if RX["city_suffix"].match(after):
+        if RX["city_suffix"].match(after) or RX["street_before"].search(t[:m.start()]):
             continue
         city = re.match(r"\s*,\s*([A-Z]{2})(?![A-Za-z])", after)
         if city and city.group(1) in STATE_CODES:
@@ -346,26 +363,37 @@ class Policy:
                 if onsite and bare and bare.group(1) in self.state_as_city:
                     probe = self.state_as_city[bare.group(1)]
                 hits = [m.span() for m in self.commute_re.finditer(probe)]
-                clash = False
+                clash = bare_city = False
                 for rx, code in self.commute_cities:
                     found = [m.span() for m in rx.finditer(probe)]
-                    if found and (not st or code in st):
+                    if found and code in st:
                         hits += found
+                    elif found and not st:
+                        # An entry written "City, ST" was written that way because the city
+                        # alone is ambiguous: "Ontario" with no state is as likely the
+                        # Canadian province as Ontario, California. A question, not a pass.
+                        bare_city = True
                     elif found:
                         clash = True        # "Carson or Austin, TX" against "Carson, CA"
                 if not hits:
-                    ambiguous = ambiguous or (clash and not owned)
+                    ambiguous = ambiguous or (clash and not owned) or bare_city
                     continue
                 # A far metro over the match voids it ("Walnut" inside "Walnut Creek").
                 outs = [m.span() for m in self.far_re.finditer(probe)]
                 if all(any(a < d and c < b for c, d in outs) for a, b in hits):
                     continue
-                # So does a foreign place BESIDE it when no US state is named: "Dublin,
-                # Ireland" is not the Dublin in an Ohio commute list. The match itself may
-                # be a foreign name too ("Dublin" alone), which settles nothing.
+                # So does a foreign country or region BESIDE it when no US state is named:
+                # "Dublin, Ireland" is not the Dublin in an Ohio commute list. The match
+                # itself may be a foreign name too ("Dublin" alone), which settles nothing,
+                # and a foreign CITY in a bare list of place names is another place
+                # ("Los Angeles, London, Sydney"), which does not qualify it either.
+                # In prose it still does: "Onsite in Singapore, reporting to Los Angeles".
                 trips = [m.span() for m in RX["travel_phrase"].finditer(probe)]
+                cities = ({m.span() for m in FOREIGN_CITIES.finditer(probe)}
+                          if RX["place_list"].match(probe) else set())
                 abroad = [m.span() for rx in (BLOCKED, BLOCKED_CODES) for m in rx.finditer(probe)
-                          if not any(a <= m.start() < b for a, b in trips)]
+                          if not any(a <= m.start() < b for a, b in trips)
+                          and m.span() not in cities]
                 if not tokens(probe) and not RX["us"].search(probe) and any(
                         not any(a < d and c < b for a, b in hits) for c, d in abroad):
                     continue
@@ -594,6 +622,17 @@ def _selftest():
     # exclusion, which used to raise IndexError here while Node answered unknown.
     check(ca.decide(["Austin, TX", "Irvine, CA"])[0] == "pass" and ca.decide("except CA")[0] == "unknown",
           "decide takes a list and survives an exclusion-only posting")
+    # A state name after a house number is a street; a foreign city beside a commute place
+    # is another place in a list, a foreign country beside it qualifies it; a bare city
+    # from a "City, ST" entry is a question.
+    check(tokenize("Torrance 1450 W. Washington Ave") == "Torrance 1450 W. Washington Ave"
+          and "WA" in tokens(tokenize("Washington, USA - Remote")),
+          "a street address is not a state; the state still is")
+    check(ca.decide("Los Angeles, London, Sydney")[0] == "pass"
+          and ca.decide("Santa Ana, San Jose, Costa Rica")[0] == "fail",
+          "foreign city beside a commute place lists it; a foreign country qualifies it")
+    check(ca.decide("Ontario")[0] == "unknown" and ca.decide("Ontario, CA")[0] == "pass",
+          "a bare city from a 'City, ST' commute entry is a question")
     houston = Policy({"home_state": {"code": "TX"}, "commute": {"signals": ["Houston", "Missouri City"]}}, "f")
     check(houston.commute_states == set(), "a state name inside a city name reaches no state")
     try:

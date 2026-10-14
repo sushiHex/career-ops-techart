@@ -32,7 +32,7 @@ import { pathToFileURL } from 'url';
 import path from 'path';
 import yaml from 'js-yaml';
 
-import { isMain } from './cli-guard.mjs';
+import { guardArgs, isMain } from './cli-guard.mjs';
 import { makeHttpCtx, fetchJson } from './providers/_http.mjs';
 import greenhouse from './providers/greenhouse.mjs';
 import lever from './providers/lever.mjs';
@@ -115,17 +115,24 @@ const SOURCES = {
 
 // ── CLI args ────────────────────────────────────────────────────────
 
-function parseArgs(argv) {
-  const args = argv.slice(2);
-  const valueOf = (flag) => {
-    const idx = args.indexOf(flag);
-    if (idx !== -1 && args[idx + 1] && !args[idx + 1].startsWith('--')) return args[idx + 1];
-    const kv = args.find(a => a.startsWith(flag + '='));
-    return kv ? kv.split('=').slice(1).join('=') : null;
-  };
-  const sinceDays = Number(valueOf('--since')) || 3;
-  const limit = Number(valueOf('--limit')) || Infinity;
-  const atsArg = valueOf('--ats');
+function parseArgs() {
+  const args = guardArgs({
+    name: 'scan-ats-full.mjs',
+    summary: 'reverse ATS discovery: fresh postings from public company directories',
+    flags: [
+      ['--since <days>', 'postings from the last N days (default 3)'],
+      ['--ats <list>', `comma-separated subset of sources (${Object.keys(SOURCES).join(', ')})`],
+      ['--limit <n>', 'max companies per ATS (default all)'],
+      ['--dry-run', 'preview without writing files'],
+      ['--liveness', 'Playwright-verify matches before writing'],
+      ['--verbose', 'log per-board fetch failures'],
+      ['--md-out <dir>', 'also write a dated markdown digest to <dir>'],
+    ],
+    notes: 'Without --dry-run this appends to data/pipeline.md and data/scan-history.tsv.',
+  });
+  const sinceDays = Number(args.value('--since')) || 3;
+  const limit = Number(args.value('--limit')) || Infinity;
+  const atsArg = args.value('--ats');
   const ats = atsArg ? atsArg.split(',').map(s => s.trim().toLowerCase()).filter(Boolean) : Object.keys(SOURCES);
   const unknown = ats.filter(a => !SOURCES[a]);
   if (unknown.length) {
@@ -136,10 +143,10 @@ function parseArgs(argv) {
     sinceDays,
     limit,
     ats,
-    dryRun: args.includes('--dry-run'),
-    liveness: args.includes('--liveness'),
-    verbose: args.includes('--verbose'),
-    mdOut: valueOf('--md-out'),
+    dryRun: args.has('--dry-run'),
+    liveness: args.has('--liveness'),
+    verbose: args.has('--verbose'),
+    mdOut: args.value('--md-out'),
   };
 }
 
@@ -218,7 +225,7 @@ async function filterLive(offers) {
 // ── Main ────────────────────────────────────────────────────────────
 
 async function main() {
-  const opts = parseArgs(process.argv);
+  const opts = parseArgs();
   const cutoff = Date.now() - opts.sinceDays * 86_400_000;
 
   if (!existsSync(PORTALS_PATH)) {

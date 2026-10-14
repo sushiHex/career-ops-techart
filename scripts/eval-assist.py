@@ -19,7 +19,7 @@ Run:
   python scripts/eval-assist.py                 # annotate every queued packet
   python scripts/eval-assist.py --report        # summary, ranked
 """
-import glob, importlib.util, json, math, os, re, sys
+import importlib.util, json, math, os, re, sys
 
 for _s in (sys.stdout, sys.stderr):
     try:
@@ -144,17 +144,13 @@ if __name__ == "__main__":
     ap.add_argument("--report", action="store_true",
                     help="print the ranked summary without rewriting any packet")
     args = ap.parse_args()
-    files = sorted(glob.glob(os.path.join(QUEUE, "*.json")))
     rows = []
-    for f in files:
-        p = json.load(open(f, encoding="utf-8"))
-        # Only packets. Score dumps are lists, and a sweep's own JSON left in the queue is
-        # a dict without a url; annotating either rewrites a file that is not a packet.
-        if not isinstance(p, dict) or not p.get("url"):
-            continue
+    # Only packets, by eval-prep's one definition of a packet: annotating a score dump or
+    # a sweep's own JSON would rewrite a file that is not one.
+    for f, p in _prep.queue_packets(QUEUE):
         p = annotate(p)
         if not args.report:
-            json.dump(p, open(f, "w", encoding="utf-8"), indent=1, ensure_ascii=False)
+            _prep.write_packet(f, p)
         rows.append((p, f))
 
     auto = [r for r in rows if r[0].get("suggested_disposition")]
@@ -178,17 +174,12 @@ if __name__ == "__main__":
     if auto and not args.report:
         # Retire them from the inbox and remove the packets, so a decided req does
         # not sit in the judgement queue and does not come back in the next triage.
-        out = os.path.join(ROOT, "dispositions.json")
-        prev = json.load(open(out, encoding="utf-8")) if os.path.exists(out) else []
-        seen = {d["url"] for d in prev}
-        for p, f in auto:
-            if p["url"] not in seen:
-                prev.append({"url": p["url"], "disposition": p["suggested_disposition"]})
-        json.dump(prev, open(out, "w", encoding="utf-8"), indent=1)
+        total = _prep.record_dispositions(
+            [{"url": p["url"], "disposition": p["suggested_disposition"]} for p, _ in auto])
         if args.retire:
             for _, f in auto:
                 os.remove(f)
             print(f"\nremoved {len(auto)} decided packet(s) from the queue")
-        print(f"dispositions.json now holds {len(prev)} entries")
+        print(f"dispositions.json now holds {total} entries")
         print("   retire from the inbox with:")
         print("   node pipeline-audit.mjs --prune --dispositions=dispositions.json")

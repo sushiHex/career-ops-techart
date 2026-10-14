@@ -18,7 +18,7 @@ Run:
   python scripts/eval-prep.py <url> [<url> ...]
   python scripts/eval-prep.py --from-triage triage.json --min 6
 """
-import glob, hashlib, importlib.util, json, os, re, sys
+import atexit, contextlib, glob, hashlib, importlib.util, io, json, os, re, shutil, sys, tempfile
 
 for _s in (sys.stdout, sys.stderr):
     try:
@@ -246,7 +246,8 @@ def comp_basis(pays, jd=""):
                        "so it cannot settle a total-comp floor on its own")
 
 
-# Board slugs that are not simply the company name title-cased.
+# Board slugs that are not simply the company name title-cased. A fallback: portal_employer()
+# answers first for any board portals.yml records, so this matters only for unrecorded ones.
 ORG_NAMES = {
     "openai": "OpenAI", "elevenlabs": "ElevenLabs", "nvidia": "NVIDIA",
     "ea": "EA", "wbd": "Warner Bros. Discovery", "hbo": "HBO", "ibm": "IBM",
@@ -254,6 +255,7 @@ ORG_NAMES = {
     "2kgames": "2K Games", "cddprojektred": "CD Projekt Red", "wetafx": "Weta FX",
     "ilm": "ILM", "dneg": "DNEG", "mpc": "MPC", "scanlinevfx": "Scanline VFX",
     "anthropic": "Anthropic", "xai": "xAI", "ssi": "SSI", "aws": "AWS",
+    "eyelinestudios": "Eyeline Studios", "lumalabs-ai": "Luma AI",
 }
 
 
@@ -263,7 +265,8 @@ def org_from_url(u):
                 r"(?:job-boards|boards)\.greenhouse\.io/([\w-]+)/",
                 r"greenhouse\.io/(?:embed/job_app\?for=)?([\w-]+)/jobs/",
                 r"//([\w-]+)\.wd\d+\.myworkdayjobs\.com/",
-                r"smartrecruiters\.com/([\w-]+)/"):
+                r"smartrecruiters\.com/([\w-]+)/", r"jobs\.gem\.com/([\w-]+)/",
+                r"apply\.workable\.com/([\w-]+)/"):
         m = re.search(pat, u or "", re.I)
         if m:
             return m.group(1)
@@ -272,10 +275,9 @@ def org_from_url(u):
     # Aggregators are excluded: builtin.com is not an employer, and naming it one
     # would put a job board in the company column.
     AGG = {"builtin", "linkedin", "indeed", "ziprecruiter", "glassdoor", "dice",
-           "otta", "wellfound", "angellist", "monster", "simplyhired", "lensa"}
-    GENERIC = {"www", "careers", "career", "jobs", "job", "boards", "board", "apply",
-               "explore", "hire", "hiring", "work", "com", "io", "ai", "co", "net",
-               "org", "dev", "gg", "us", "inc", "app", "my", "talent"}
+           "otta", "wellfound", "angellist", "monster", "simplyhired", "lensa",
+           "lnkd", "jobright", "himalayas"}
+    GENERIC = rr.HOST_NOISE | {"explore", "app", "my", "talent"}
     h = re.search(r"https?://([^/]+)", u or "")
     if h:
         labels = [l for l in h.group(1).lower().split(".") if l and l not in GENERIC]
@@ -284,16 +286,101 @@ def org_from_url(u):
     return ""
 
 
+_WD_URL = re.compile(r"//([a-z0-9-]+)\.wd\d+\.myworkdayjobs\.com/(?:[a-z]{2}-[a-z]{2}/)?([a-z0-9_-]+)",
+                     re.I)
+_TRACKER = {}
+
+
+def _tracker_rows():
+    """(raw line, cells) for every table row of data/applications.md, read once.
+
+    tracker_hits and tracker_spelling both parsed the whole file on every call, which
+    recomp made once per packet. Keyed on the path, size and mtime, so the selftest's
+    patched ROOT and a tracker rewritten mid-run both read fresh.
+    """
+    p = os.path.join(ROOT, "data", "applications.md")
+    try:
+        st = os.stat(p)
+    except OSError:
+        return []
+    key = (p, st.st_size, st.st_mtime_ns)
+    if _TRACKER.get("key") != key:
+        rows = [(l, [c.strip() for c in l.split("|")])
+                for l in open(p, encoding="utf-8", errors="replace") if l.startswith("|")]
+        _TRACKER.update(key=key, rows=rows)
+        return rows
+    return _TRACKER["rows"]
+
+
+def tracker_spelling(name):
+    """`name` as the tracker already spells that employer, else `name` unchanged.
+
+    portals.yml labels and tracker rows grew up separately: the label says "Disney Studios"
+    and eight tracker rows say "Disney". merge-tracker compares employers by normalised
+    name before it ever looks at a requisition id, so a second spelling is a second
+    employer to it, and its id guard never runs. Exact match first, then the one tracker
+    spelling that one name is a prefix of, most-used wins.
+    """
+    key = rr.name_key(name)
+    if not key:
+        return name
+    seen = {}
+    for _, c in _tracker_rows():
+        if len(c) > 4 and c[1].isdigit() and c[3]:
+            seen[c[3]] = seen.get(c[3], 0) + 1
+    exact = [n for n in seen if rr.name_key(n) == key]
+    if exact:
+        return max(exact, key=seen.get)
+    # A prefix counts only at a WORD boundary: "Disney Studios" is the tracker's "Disney",
+    # but "Metaphysic" must never become "Meta", which a character prefix would make it.
+    def word_prefixes(s):
+        w = re.findall(r"[A-Za-z0-9]+", s)
+        return {rr.name_key(" ".join(w[:k])) for k in range(1, len(w) + 1)}
+    mine = word_prefixes(name)
+    near = [n for n in seen if len(rr.name_key(n)) > 2
+            and (rr.name_key(n) in mine or key in word_prefixes(n))]
+    return max(near, key=seen.get) if near else name
+
+
+def portal_employer(slug=None, workday=None):
+    """The employer portals.yml records for a board slug or a Workday (tenant, site), or None.
+
+    portals.yml already says who each board belongs to; its label base is the name, spelled
+    the way the tracker spells that employer. A Workday tenant hostname is not a name
+    ("snapchat" is Snap, and "xboxgaming" is BOTH Blizzard and Activision, told apart only
+    by the site), and neither is a capitalised slug ("Shieldai"). So a hand-kept slug table
+    is needed only for boards nobody recorded. Two entries naming different employers for
+    one board return None rather than a guess.
+    """
+    if slug:
+        names = {e["base"] for e in rr.portals_index() if slug.lower() in e["boards"]}
+    else:
+        tenant, site = workday
+        names = {e["base"] for e in rr.portals_index()
+                 if e["workday"] and e["workday"][0].lower() == tenant
+                 and e["workday"][2].lower() == site}
+    return tracker_spelling(names.pop()) if len(names) == 1 else None
+
+
 def company_from(r):
-    """Best-effort employer name from the resolved ATS org slug."""
+    """The employer's name: portals.yml first, then the hand table, then the tracker."""
+    m = _WD_URL.search(r.get("url") or "")
+    if m and not r.get("org"):
+        # An unrecorded Workday tenant gets NO name rather than a capitalised hostname:
+        # eval-write refuses an unnamed packet, and a person naming it beats a confident
+        # wrong employer that merge-tracker would treat as a new company.
+        tenant = m.group(1).lower()
+        return portal_employer(workday=(tenant, m.group(2).lower())) or ORG_NAMES.get(tenant)
     org = (r.get("org") or r.get("discovered_board") or "").strip().lower()
     if not org:
         org = org_from_url(r.get("url") or "").lower()
     if not org:
         return None
-    if org in ORG_NAMES:
-        return ORG_NAMES[org]
-    return " ".join(w.capitalize() for w in re.split(r"[-_]+", org) if w) or None
+    # A capitalised slug ("Andurilindustries") is a new employer to every name-keyed
+    # lookup; the tracker usually already spells it, and its normalised key is the slug's.
+    return (portal_employer(slug=org) or ORG_NAMES.get(org)
+            or tracker_spelling(" ".join(w.capitalize() for w in re.split(r"[-_]+", org) if w))
+            or None)
 
 
 # Passed as `targets` to mean "no floor", which None cannot say: None means "read the
@@ -407,10 +494,9 @@ def tracker_hits(title, url=""):
     req as already-evaluated, and a real lead dismissed as a duplicate is never seen
     again.
     """
-    p = os.path.join(ROOT, "data", "applications.md")
-    if not (title and os.path.exists(p)):
+    if not title:
         return []
-    host = re.sub(r"^https?://(www\.)?", "", url or "").split("/")[0].lower()
+    host = rr.name_key(re.sub(r"^https?://(www\.)?", "", url or "").split("/")[0])
     STOP = ("senior", "staff", "principal", "lead", "engineer")
     words = [w for w in re.sub(r"[^a-z0-9 ]", " ", title.lower()).split() if len(w) > 3]
     key = [w for w in words if w not in STOP]
@@ -422,20 +508,16 @@ def tracker_hits(title, url=""):
         key = words or [w for w in re.sub(r"[^a-z0-9 ]", " ", title.lower()).split()]
     need = 2 if len(key) >= 2 else 1
     hits = []
-    for line in open(p, encoding="utf-8", errors="replace"):
-        if not line.startswith("|"):
-            continue
+    for line, cells in _tracker_rows():
         low = line.lower()
-        cells0 = [c.strip() for c in line.split("|")]
-        co = re.sub(r"[^a-z0-9]", "", cells0[3].lower()) if len(cells0) > 3 else ""
+        co = rr.name_key(cells[3]) if len(cells) > 3 else ""
         # Company gate: the tracker row's company must be recognisable in the posting
         # URL, or in the packet's own host. Without this the title words alone match
         # across unrelated employers.
-        same_co = bool(co) and (co[:8] in re.sub(r"[^a-z0-9]", "", host))
+        same_co = bool(co) and co[:8] in host
         if not same_co:
             continue
         if key and sum(1 for w in key if w in low) >= max(need, len(key) // 2):
-            cells = cells0
             if len(cells) > 5:
                 hits.append(f"#{cells[1]} {cells[3]} - {cells[4][:60]} ({cells[5]})")
     return hits[:4]
@@ -445,9 +527,9 @@ def prep(url):
     r = rr.resolve(url)
     lv, lw = location_verdict(r.get("location"), r.get("remote_txt"))
     title = r.get("title") or ""
-    slug = re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")[:60] or "untitled"
+    slug = slug_of(title)
     return {
-        "_instructions": "Fill every null below, then: node eval-write.mjs <this file>",
+        "_instructions": "Fill every null below, then: node eval-write.mjs <this file> --date=YYYY-MM-DD",
         "url": url, "ats": r.get("ats"), "live": r.get("live"),
         "resolver_note": r.get("note"),
         "title": title, "location": r.get("location"),
@@ -468,7 +550,11 @@ def prep(url):
         # fell back to the URL host, which is the ATS vendor ("ashbyhq"), not the
         # company. The slug is the employer's own board name and is right far more
         # often than it is wrong; confirm it when filling in the judgement.
-        "company": company_from(r), "num": None, "slug": slug, "status": None,
+        # The URL is merged in because a resolver result does not carry one, and a
+        # Workday employer exists ONLY in the tenant hostname: every NVIDIA, Salesforce
+        # and Disney packet was prepped with company None until 2026-10-08, and
+        # eval-write refuses an unnamed packet. reresolve() already passed it this way.
+        "company": company_from({**r, "url": url}), "num": None, "slug": slug, "status": None,
         "match_w_cv": None, "north_star": None, "comp_score": None,
         "cultural_signals": None, "red_flags_adj": 0,
         "verification_depth": "full-jd" if r.get("jd") else "listing",
@@ -547,6 +633,56 @@ def hard_gate(p):
     return None
 
 
+def write_packet(path, p):
+    """Write one packet the way every reader expects it: UTF-8, one-space indent."""
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(p, fh, indent=1, ensure_ascii=False)
+
+
+def slug_of(title):
+    """The filename slug for a posting title."""
+    return re.sub(r"[^a-z0-9]+", "-", (title or "").lower()).strip("-")[:60] or "untitled"
+
+
+def record_dispositions(disp):
+    """Append hard-gate dispositions to dispositions.json, once per url; return the total."""
+    out = os.path.join(ROOT, "dispositions.json")
+    prev = json.load(open(out, encoding="utf-8")) if os.path.exists(out) else []
+    seen = {d["url"] for d in prev}
+    prev += [d for d in disp if d["url"] not in seen]
+    json.dump(prev, open(out, "w", encoding="utf-8"), indent=1)
+    return len(prev)
+
+
+def queue_packets(queue=None):
+    """Yield (path, packet) for every PACKET in the queue, and nothing else.
+
+    The queue directory also holds files that are not packets: score dumps
+    (`_nvidia-0827-scores.json` is a list) and a sweep's own JSON (a dict with no url).
+    Each reader used to glob `*.json` itself, and only eval-assist and eval-blockers
+    filtered, so `--relocate` died on the first list it opened and the other three
+    readers were one stray file from the same crash. A rule written into some readers and
+    not the rest is the shape CLAUDE.md records three times over; one enumerator is the
+    structure in which it cannot recur. A packet is a dict carrying the url it was
+    prepped from. Unreadable files are skipped rather than fatal, since one bad file must
+    not stop the pass over the others.
+
+    The default is resolved at CALL time, never written `queue=OUT_DIR`. A default is
+    bound once, when the def runs, so the selftests' patch of OUT_DIR stopped reaching
+    the readers and the reresolve cases ran against the REAL queue with a mocked
+    resolver, rewriting a live packet's location with the mock's. reresolve_cases now
+    asserts the real queue is untouched, so that cannot pass silently again.
+    """
+    queue = queue or OUT_DIR
+    for f in sorted(glob.glob(os.path.join(queue, "*.json"))):
+        try:
+            p = json.load(open(f, encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if isinstance(p, dict) and p.get("url"):
+            yield f, p
+
+
 def list_queue():
     """Show the packets waiting on judgement, best first.
 
@@ -558,10 +694,8 @@ def list_queue():
     if not os.path.isdir(OUT_DIR):
         print("no queue"); return
     rows = []
-    for f in sorted(os.listdir(OUT_DIR)):
-        if not f.endswith(".json"):
-            continue
-        p = json.load(open(os.path.join(OUT_DIR, f), encoding="utf-8"))
+    for f, p in queue_packets():
+        f = os.path.basename(f)
         c = p.get("comp", {})
         rank = (2 if c.get("clears_target") else 1 if c.get("clears_floor") else 0,
                 1 if p.get("location_verdict") == "pass" else 0,
@@ -599,8 +733,7 @@ def relocate():
     already carry a judgement are left alone.
     """
     changed, disp = 0, []
-    for f in sorted(glob.glob(os.path.join(OUT_DIR, "*.json"))):
-        p = json.load(open(f, encoding="utf-8"))
+    for f, p in queue_packets():
         if p.get("match_w_cv") is not None:
             continue
         # Duplicates are recomputed too: the check was title-only and matched across
@@ -609,26 +742,21 @@ def relocate():
         dups = tracker_hits(p.get("title"), p.get("url", ""))
         if dups != p.get("possible_tracker_duplicates"):
             p["possible_tracker_duplicates"] = dups
-            json.dump(p, open(f, "w", encoding="utf-8"), indent=1, ensure_ascii=False)
+            write_packet(f, p)
         v, w = location_verdict(p.get("location"), p.get("remote_txt"))
         if v == p.get("location_verdict") and w == p.get("location_why"):
             continue
         print(f"  {str(p.get('location'))[:30]:30s} {p.get('location_verdict')} -> {v}  "
               f"({(p.get('title') or '')[:40]})")
         p["location_verdict"], p["location_why"] = v, w
-        json.dump(p, open(f, "w", encoding="utf-8"), indent=1, ensure_ascii=False)
+        write_packet(f, p)
         changed += 1
         if v == "fail":
             disp.append({"url": p["url"], "disposition": w})
             os.remove(f)
     print(f"\n{changed} packet(s) re-gated, {len(disp)} now fail on location")
     if disp:
-        out = os.path.join(ROOT, "dispositions.json")
-        prev = json.load(open(out, encoding="utf-8")) if os.path.exists(out) else []
-        seen = {d["url"] for d in prev}
-        prev += [d for d in disp if d["url"] not in seen]
-        json.dump(prev, open(out, "w", encoding="utf-8"), indent=1)
-        print(f"dispositions.json now holds {len(prev)}; retire with:")
+        print(f"dispositions.json now holds {record_dispositions(disp)}; retire with:")
         print("  node pipeline-audit.mjs --prune --dispositions=dispositions.json")
 
 
@@ -645,8 +773,7 @@ def reresolve():
     packets that cannot move without it.
     """
     stuck = []
-    for f in sorted(glob.glob(os.path.join(OUT_DIR, "*.json"))):
-        p = json.load(open(f, encoding="utf-8"))
+    for f, p in queue_packets():
         if p.get("match_w_cv") is not None:
             continue
         jd = p.get("jd_full") or ""
@@ -674,7 +801,7 @@ def reresolve():
             # used to share this branch. Deleting the packet is the one thing in this
             # function that cannot be undone, so it needs the stronger evidence.
             print(f"  UNKNWN  resolver returned no result  {(p.get('title') or '')[:38]}")
-            json.dump(p, open(f, "w", encoding="utf-8"), indent=1, ensure_ascii=False)
+            write_packet(f, p)
             changed += 1
             continue
         if r.get("live") is False:
@@ -694,26 +821,21 @@ def reresolve():
         if not loc:
             print(f"  jd {p.get('jd_chars', 0):5d}  (location unchanged)  "
                   f"{(p.get('title') or '')[:38]}")
-            json.dump(p, open(f, "w", encoding="utf-8"), indent=1, ensure_ascii=False)
+            write_packet(f, p)
             changed += 1
             continue
         v, w = location_verdict(loc, r.get("remote_txt"))
         p["location"], p["location_verdict"], p["location_why"] = loc, v, w
         print(f"  {str(loc)[:34]:34s} -> {v:7s} jd {p.get('jd_chars', 0):5d}  "
               f"{(p.get('title') or '')[:34]}")
-        json.dump(p, open(f, "w", encoding="utf-8"), indent=1, ensure_ascii=False)
+        write_packet(f, p)
         changed += 1
         if v == "fail":
             disp.append({"url": p["url"], "disposition": w})
             os.remove(f)
     print(f"\n{changed} packet(s) updated, {len(disp)} settled by a hard gate")
     if disp:
-        out = os.path.join(ROOT, "dispositions.json")
-        prev = json.load(open(out, encoding="utf-8")) if os.path.exists(out) else []
-        seen = {d["url"] for d in prev}
-        prev += [d for d in disp if d["url"] not in seen]
-        json.dump(prev, open(out, "w", encoding="utf-8"), indent=1)
-        print(f"dispositions.json now holds {len(prev)}; retire with:")
+        print(f"dispositions.json now holds {record_dispositions(disp)}; retire with:")
         print("  node pipeline-audit.mjs --prune --dispositions=dispositions.json")
 
 
@@ -728,8 +850,7 @@ def recomp():
     network.
     """
     changed = 0
-    for f in sorted(glob.glob(os.path.join(OUT_DIR, "*.json"))):
-        p = json.load(open(f, encoding="utf-8"))
+    for f, p in queue_packets():
         if p.get("match_w_cv") is not None or (p.get("comp") or {}).get("posted"):
             continue
         c = comp_verdict([], p.get("jd_full") or "")
@@ -737,26 +858,27 @@ def recomp():
             continue
         print(f"  {c['posted']:24s} {(p.get('title') or '')[:52]}")
         p["comp"] = c
-        json.dump(p, open(f, "w", encoding="utf-8"), indent=1, ensure_ascii=False)
+        write_packet(f, p)
         changed += 1
     print(f"\n{changed} packet(s) gained a band")
 
     named = 0
-    for f in sorted(glob.glob(os.path.join(OUT_DIR, "*.json"))):
-        p = json.load(open(f, encoding="utf-8"))
+    for f, p in queue_packets():
         if p.get("match_w_cv") is not None or p.get("company"):
             continue
         co = company_from(p)
         if not co:
             continue
         p["company"] = co
-        json.dump(p, open(f, "w", encoding="utf-8"), indent=1, ensure_ascii=False)
+        write_packet(f, p)
         named += 1
     print(f"{named} packet(s) gained an employer name")
 
 
 LOCATION_CASES = [
     # (location, ats_remote_flag, expected verdict, why this case exists)
+    ("Remote, Global", False, "pass",
+     "worldwide remote includes the US; it read as an unrecognised region"),
     ("Indiana - Remote", True, "fail",
      "Salesforce's format: state first, dash separator. The fifth spelling of state-scoped "
      "remote found on a real board, and like the other four it read as plain remote-US"),
@@ -844,6 +966,31 @@ LOCATION_CASES = [
      "Autodesk writes its country as the ISO-3 code. The country list held 'canada' but "
      "not 'CAN', so the bare word 'Remote' carried this through as a PASS and a Canadian "
      "role was reported as actionable under a hard no-relocation constraint"),
+    ("UK, Remote | Switzerland, Remote | Finland, Remote", True, "fail",
+     "NVIDIA JR2548194, AI Developer Tools. NVIDIA writes the United Kingdom as 'UK', "
+     "which is neither the spelled-out name nor the ISO-3 'GBR', so that one segment carried "
+     "no foreign marker and three foreign remote options read as 'unknown'"),
+    ("US, CA, Remote | UK, Remote", True, "pass",
+     "the same NVIDIA shape with a California remote option among them is reachable"),
+    ("Culver City, CA | UK, Remote", True, "pass",
+     "a SoCal site beside a UK remote option. Adding 'UK' as a marker failed this, because "
+     "the foreign rule recognised a US place only by the literal token US/USA"),
+    ("Irvine, CA | London, UK", False, "pass",
+     "a SoCal office beside a London one is inside the commute ceiling. This failed as "
+     "non-US BEFORE 2026-10-08 too, on 'london', for the same reason"),
+    ("Los Angeles, California | Remote - UK", True, "pass",
+     "the spelled-out state names the US place, and it passes on LA, NOT as remote-US: the "
+     "only remote option is in the UK", "SoCal"),
+    ("Global HQ, London", False, "fail",
+     "'Global' beside a place is not worldwide remote"),
+    ("Austin, Texas | Remote - UK", True, "fail",
+     "a foreign remote option must not carry a US office outside the commute through as "
+     "remote-US"),
+    ("Austin, TX | Remote - UK", True, "fail",
+     "the policy knows Austin as a metro outside the commute; the UK remote option must not "
+     "turn it into a pass"),
+    ("London, UK | New York, NY", False, "fail",
+     "a US place stops the string reading as foreign, and the commute rule still fails NY"),
     ("Toronto, ON, CAN", False, "fail", "ISO-3 country code with no remote entry"),
     ("Krakow, POL", False, "fail", "ISO-3 code for a country not spelled out in the string"),
     ("Dublin, IRL", False, "fail", "same, and 'IRL' is not the word 'ireland'"),
@@ -951,6 +1098,54 @@ LOCATION_CASES = [
      "a reachable hub among distant ones still clears, because the candidate can choose which office "
      "the in-office share is served at",
      "inside the commute ceiling"),
+    # Location spellings the shared grammar first read wrongly. Each is now a rule in
+    # presets/locations/_base-us.json or the tokeniser, pinned here and in location-core.mjs.
+    ("Torrance 1450 W. Washington Ave (hybrid, 3 days on-site)", False, "pass",
+     "an office written as a street address. 'Washington' after a house number and a "
+     "direction is the street, not Washington state; read as a state it failed a role "
+     "inside the commute", "inside the commute ceiling"),
+    ("Los Angeles, London, Sydney", False, "pass",
+     "a hub in a comma list of cities. A foreign CITY beside a commute place is another "
+     "place in the list, not a qualifier of it, so it must not void the Los Angeles match"),
+    ("Seattle, Boston, Los Angeles, Berlin", False, "pass",
+     "the same list shape with a trailing foreign city"),
+    ("Santa Ana, San Jose, Costa Rica", False, "fail",
+     "...while a foreign COUNTRY still qualifies the place: this is Santa Ana in Costa Rica, "
+     "not the Orange County city", "non-US"),
+    ("Venice, Italy", False, "fail", "the same rule for a commute name with a foreign twin"),
+    ("Onsite in Singapore, reporting to Los Angeles", False, "fail",
+     "a foreign city counts as another place only in a bare list of place names; in prose "
+     "it still voids the commute match"),
+    ("Office - Ontario/Canada", False, "fail",
+     "'Ontario' alone is the province here; the policy's 'Ontario, CA' entry must not pass "
+     "a bare Ontario", "non-US"),
+    ("Manitoba; Ontario; Nova Scotia", False, "unknown",
+     "a bare 'Ontario' with no state is a question, never a commute pass. The policy writes "
+     "it 'Ontario, CA' precisely because the city name alone is ambiguous"),
+    ("New York, USA - Remote", False, "fail",
+     "a state-scoped remote. The New York fold to the city must not fire before a country, "
+     "or the NY scope reads as a city mention and the row softens to unknown"),
+    ("New York, U.S.A. (Remote)", False, "fail", "the same scope, another spelling"),
+    ("New York City", False, "fail",
+     "the bare city, as several boards write it, is the out-of-range metro"),
+    ("Chicago, IL | Hybrid", False, "fail",
+     "a bare work-arrangement option names no place, so it cannot hold the posting open"),
+    ("Hybrid", False, "unknown", "...and on its own it is a placeholder", "placeholder"),
+    ("Anywhere", False, "pass", "a bare 'Anywhere' is a remote offer", "nationwide"),
+    ("Boston, MA, Chicago, IL, or Remote within Canada or United States", False, "pass",
+     "the remote alternative covers the whole US; the onsite cities before it are "
+     "alternatives, not a scope", "nationwide"),
+    ("Remote within the United States (Texas residents only)", False, "unknown",
+     "a restriction after 'within the US' keeps it out of the nationwide shortcut"),
+    ("Remote in US, restricted to Texas", False, "unknown",
+     "the shortcut fires only when the US ENDS the option; a blacklist of restriction words "
+     "after it missed 'restricted' and passed a Texas-only role"),
+    ("US Remote, must reside in one of 2 Texas counties", False, "unknown",
+     "a street needs a house number AND a direction; a bare number before a state name is "
+     "prose, and reading it as a street erased the Texas restriction"),
+    ("Remote, Texaſ", False, "unknown",
+     "a long s matched the state-name pattern case-insensitively and then missed the "
+     "lookup, raising KeyError; the Python patterns now use JavaScript's ASCII semantics"),
 ]
 
 
@@ -1056,15 +1251,49 @@ def selftest():
                   + f"\n      {why}")
     print(f"{bad} of {len(LOCATION_CASES)} location cases failed" if bad
           else f"all {len(LOCATION_CASES)} location cases pass")
+    # The cases below patch OUT_DIR to a temp dir and run readers that rewrite and DELETE
+    # packets. If a patch ever stops reaching a reader, they run against the real queue,
+    # which happened on 2026-10-08. So fingerprint the real queue's bytes around them.
+    # A concurrent writer (an eval-assist run, another prep) also changes the queue and
+    # will trip this; that is a FAIL worth reading, not a reason to look away.
+    def _real_queue():
+        out = {}
+        for f in glob.glob(os.path.join(OUT_DIR, "*.json")):
+            try:
+                out[f] = hashlib.sha1(open(f, "rb").read()).hexdigest()
+            except OSError:
+                out[f] = "unreadable"   # vanished or locked mid-run: recorded, not a crash
+        return out
+    before = _real_queue()
     bad += other_state_cases()
-    bad += comp_cases() + naming_cases() + reresolve_cases()
+    groups = (("comp", comp_cases), ("naming", naming_cases), ("reresolve", reresolve_cases),
+              ("queue", queue_cases))
+    bad += sum(fn() for _, fn in groups)
+    if _real_queue() != before:
+        bad += 1
+        print("FAIL  the selftest modified the REAL eval queue; a patch of OUT_DIR is not "
+              "reaching some reader")
     # A closing line, because test-all.mjs labels this run with whatever the LAST line of
     # output was. With three groups the label read "all naming cases pass", which says
-    # nothing about the two groups that matter most and would keep saying it if they were
-    # deleted. The gate itself still matches the location line above.
-    print(f"eval-prep selftest: {bad} failure(s) across location, comp, naming and "
-          f"reresolve cases")
+    # nothing about the two groups that matter most. Built from the group list, so a group
+    # added later cannot go unnamed, as the queue group briefly did.
+    print(f"eval-prep selftest: {bad} failure(s) across "
+          + ", ".join(["location"] + [name for name, _ in groups]) + " cases")
     return bad
+
+
+@contextlib.contextmanager
+def _patched(d, root=True):
+    """Point OUT_DIR (and ROOT, unless root=False) at a selftest dir, output silenced.
+
+    The cases below run readers that rewrite and DELETE packets; this is the one place
+    that redirects them, so a case cannot reach the real queue by forgetting a patch.
+    """
+    from unittest import mock
+    me = sys.modules[__name__]
+    with mock.patch.object(me, "OUT_DIR", d), mock.patch.object(me, "ROOT", d if root else me.ROOT), \
+            contextlib.redirect_stdout(io.StringIO()):
+        yield d
 
 
 def reresolve_cases():
@@ -1078,7 +1307,7 @@ def reresolve_cases():
     rewrites a file; this branch removes one, and it used to fire on a falsy resolver
     result as readily as on a real closure.
     """
-    import contextlib, io as _io, tempfile, unittest.mock as mock
+    from unittest import mock
     bad = 0
 
     def check(ok, msg):
@@ -1089,19 +1318,19 @@ def reresolve_cases():
 
     def run(result, **over):
         """One packet, one mocked resolver answer. Returns the packet, or None if deleted."""
-        d = tempfile.mkdtemp(prefix="evalprep-queue-")
-        f = os.path.join(d, "x.json")
-        packet = dict(url="https://careers.example.com/job/1194374/x", title="A Role",
-                      company="Example", live=True, location_verdict="unknown",
-                      match_w_cv=None, jd_full="plain text, no markup")
-        packet.update(over)
-        json.dump(packet, open(f, "w", encoding="utf-8"), indent=1)
-        me = sys.modules[__name__]
-        with mock.patch.object(me, "OUT_DIR", d), mock.patch.object(me, "ROOT", d), \
-                mock.patch.object(rr, "resolve", lambda *a, **k: result), \
-                contextlib.redirect_stdout(_io.StringIO()):
+        packet = {**dict(url="https://careers.example.com/job/1194374/x", title="A Role",
+                         company="Example", live=True, location_verdict="unknown",
+                         match_w_cv=None, jd_full="plain text, no markup"), **over}
+        with tempfile.TemporaryDirectory(prefix="evalprep-queue-") as d, _patched(d), \
+                mock.patch.object(rr, "resolve", lambda *a, **k: result):
+            f = os.path.join(d, "x.json")
+            with open(f, "w", encoding="utf-8") as fh:
+                json.dump(packet, fh, indent=1)
             reresolve()
-        return json.load(open(f, encoding="utf-8")) if os.path.exists(f) else None
+            if not os.path.exists(f):
+                return None
+            with open(f, encoding="utf-8") as fh:
+                return json.load(fh)
 
     # A packet stamped live=True the day it was built kept saying so through every later
     # refetch, because this loop wrote jd, location, comp and company and never `live`.
@@ -1125,11 +1354,55 @@ def reresolve_cases():
     return bad
 
 
+def queue_cases():
+    """Every queue reader must survive the non-packet files a real queue holds.
+
+    `--relocate` died on 2026-10-08 on `_nvidia-0827-scores.json`, a score dump that is a
+    LIST, because it globbed `*.json` itself and called .get() on whatever it opened. The
+    queue here is built with exactly those strays, and each reader is RUN over it, since an
+    enumerator that filters correctly proves nothing about a reader that bypasses it.
+    """
+    with tempfile.TemporaryDirectory(prefix="evalprep-strays-") as d:
+        return _queue_cases_in(d)
+
+
+def _queue_cases_in(d):
+    good = dict(url="https://careers.example.com/job/1234567/x", title="A Role",
+                company="Example", location="UK, Remote", location_verdict="unknown",
+                match_w_cv=None, comp={}, jd_full="plain")
+    json.dump(good, open(os.path.join(d, "a-packet.json"), "w", encoding="utf-8"))
+    json.dump([{"num": 1, "score": 4.1}], open(os.path.join(d, "_scores.json"), "w"))
+    json.dump({"tenant": "x", "rows": []}, open(os.path.join(d, "sweep.json"), "w"))
+    open(os.path.join(d, "torn.json"), "w").write("{not json")
+    bad = 0
+    got = [os.path.basename(f) for f, _ in queue_packets(d)]
+    if got != ["a-packet.json"]:
+        bad += 1
+        print(f"FAIL  queue_packets yielded {got}, expected only the packet")
+    for fn in (list_queue, relocate, recomp):
+        try:
+            # ROOT is redirected only for relocate, which writes dispositions.json there;
+            # recomp reads the candidate's comp targets from ROOT/config and needs the real one.
+            with _patched(d, root=fn is relocate):
+                fn()
+        except Exception as e:  # noqa: BLE001, the crash IS the failure being tested
+            bad += 1
+            print(f"FAIL  {fn.__name__}() crashed on a queue holding non-packets: {e!r}")
+    # relocate() ran the fixed gate over the packet, and "UK, Remote" now fails, so the
+    # packet must be gone and its disposition written. This also proves relocate reached
+    # the packet rather than passing by skipping everything.
+    if os.path.exists(os.path.join(d, "a-packet.json")):
+        bad += 1
+        print("FAIL  relocate() did not re-gate the one real packet in a queue of strays")
+    print(f"{bad} queue case(s) failed" if bad else "all queue cases pass")
+    return bad
+
+
 def _tmp_profile(body):
     """Write a throwaway profile.yml and return its path. Each call gets a fresh path so
     comp_targets' per-path cache cannot carry one case's answer into the next."""
-    import tempfile
     d = tempfile.mkdtemp(prefix="evalprep-profile-")
+    atexit.register(shutil.rmtree, d, True)
     p = os.path.join(d, "profile.yml").replace("\\", "/")
     open(p, "w", encoding="utf-8").write(body)
     return p
@@ -1337,8 +1610,7 @@ def naming_cases():
             print(f"FAIL  {msg}")
 
     def name(url, title="Senior AI Engineer"):
-        slug = re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")[:60] or "untitled"
-        return packet_name({"url": url, "slug": slug})
+        return packet_name({"url": url, "slug": slug_of(title)})
 
     # The exact shape CLAUDE.md warns about: two NVIDIA reqs one word apart in the title,
     # opposite location verdicts. Slugged from the title alone they were ONE file and the
@@ -1349,6 +1621,49 @@ def naming_cases():
     check(a != b, f"two reqs sharing a title slug must not share a filename: {a}")
     check("jr2620896" in a and "jr2301525" in b,
           f"the requisition id must reach the filename: {a} / {b}")
+    # The EMPLOYER on a Workday packet. The resolver's result carries no url and a Workday
+    # tenant is named only in the hostname, so prep() wrote company None for every NVIDIA,
+    # Salesforce and Disney req and eval-write refused them all. Asserted through prep()
+    # itself with the resolver's real shape, since company_from() alone was never wrong.
+    from unittest import mock
+    _wd = {"ats": "workday", "live": True, "title": "Senior AI Engineer",
+           "location": "US, CA, Remote", "pay": [], "jd": "x"}
+    # comp is not what this case tests, and computing it reads the configured floor.
+    with mock.patch.object(rr, "resolve", lambda *a, **k: dict(_wd)), \
+            mock.patch.object(sys.modules[__name__], "comp_verdict", lambda *a, **k: {}):
+        got = prep(NV + "Example-Role-01_JR2099999").get("company")
+    check(got == "NVIDIA", f"a Workday packet must name its employer from the tenant: {got!r}")
+    # ...and from portals.yml, by tenant AND site, never the hostname: xboxgaming is two
+    # employers, and an unrecorded tenant gets NO name rather than a capitalised host,
+    # since merge-tracker treats a misspelt employer as a new company.
+    # Run against a FAKE portals index and an empty tracker, so the cases hold in any
+    # checkout and cannot drift with the user's own portals.yml.
+    XB = "https://xboxgaming.wd1.myworkdayjobs.com/"
+    fake_portals = [dict(label=b + " (notes)", base=b, boards=set(), workday=(t, "wd1", s))
+                    for b, t, s in (("Blizzard Entertainment", "xboxgaming", "Blizzard_External_Careers"),
+                                    ("Activision", "xboxgaming", "External"),
+                                    ("Snap", "snapchat", "snap"))]
+    with tempfile.TemporaryDirectory(prefix="evalprep-wdname-") as _empty, \
+            mock.patch.object(rr, "portals_index", lambda: fake_portals), \
+            mock.patch.object(sys.modules[__name__], "ROOT", _empty):
+        for url, want in ((XB + "Blizzard_External_Careers/job/Irvine/X_R1000301", "Blizzard Entertainment"),
+                          (XB + "en-US/External/job/Santa-Monica/X_R1000302", "Activision"),
+                          ("https://snapchat.wd1.myworkdayjobs.com/snap/job/LA/X_R1000303", "Snap"),
+                          ("https://unrecorded.wd5.myworkdayjobs.com/Ext/job/X/Y_R1000001", None)):
+            got = company_from({"url": url})
+            check(got == want, f"Workday employer for {url[8:60]}: {got!r}, want {want!r}")
+    # The tracker's spelling wins only on a whole key or at a WORD boundary. Asserted
+    # against a fake tracker so the cases cannot drift with the real one.
+    with tempfile.TemporaryDirectory(prefix="evalprep-spell-") as _d:
+        os.makedirs(os.path.join(_d, "data"))
+        with open(os.path.join(_d, "data", "applications.md"), "w", encoding="utf-8") as fh:
+            for i, co in enumerate(("Meta", "Disney", "Anduril Industries"), 1):
+                fh.write(f"| {i} | 2026-10-13 | {co} | Role | 3.0/5 | Evaluated | x | [r](r) | n |\n")
+        with mock.patch.object(sys.modules[__name__], "ROOT", _d):
+            for spelt, want in (("Metaphysic", "Metaphysic"), ("Disney Studios", "Disney"),
+                                ("Andurilindustries", "Anduril Industries")):
+                got = tracker_spelling(spelt)
+                check(got == want, f"tracker spelling of {spelt!r}: {got!r}, want {want!r}")
     # Two EMPLOYERS posting the same title, which is the other half of the collision.
     x = name("https://job-boards.greenhouse.io/cresta/jobs/5055750430")
     y = name("https://job-boards.greenhouse.io/anthropic/jobs/4820222953")
@@ -1430,8 +1745,7 @@ if __name__ == "__main__":
             print(f"SKIP ({gated})  {(p['title'] or u)[:56]}")
             disp.append({"url": u, "disposition": gated}); continue
         name = packet_name(p)
-        json.dump(p, open(os.path.join(OUT_DIR, name), "w", encoding="utf-8"),
-                  indent=1, ensure_ascii=False)
+        write_packet(os.path.join(OUT_DIR, name), p)
         c = p["comp"]
         money = c["posted"] or "no band"
         gates = ("clears target" if c["clears_target"] else
@@ -1445,10 +1759,6 @@ if __name__ == "__main__":
         print(f"      -> batch/eval-queue/{name}")
 
     if disp:
-        out = os.path.join(ROOT, "dispositions.json")
-        prev = json.load(open(out, encoding="utf-8")) if os.path.exists(out) else []
-        seen = {d["url"] for d in prev}
-        prev += [d for d in disp if d["url"] not in seen]
-        json.dump(prev, open(out, "w", encoding="utf-8"), indent=1)
+        record_dispositions(disp)
         print(f"\n{len(disp)} req(s) settled by a hard gate -> dispositions.json")
         print("   retire them with: node pipeline-audit.mjs --prune --dispositions=dispositions.json")

@@ -1,0 +1,86 @@
+{
+  "_README": [
+    "Host-anchored requisition ids: company-hosted boards whose ids the generic rules cannot",
+    "see. role-matcher.mjs (Node) and scripts/eval-blockers.py (Python) both read this file,",
+    "because neither can import the other, and a rule held in one of them only is a posting the",
+    "other cannot recognise: until 2026-10-13 eval-blockers had none of these, so a packet on",
+    "these hosts could only ever be matched to its report by an exact url.",
+    "",
+    "CONTRACT, the same in both readers. `re` is a regular expression in the syntax JavaScript",
+    "and Python share, matched CASE-INSENSITIVELY (Python adds re.ASCII so \\w and \\d mean what",
+    "they mean in JavaScript) against the url TRIMMED with its query and fragment cut. Group 1",
+    "is the id, and the key is `<ns>:<id lowercased>`. Rules are tried in order and the first",
+    "match wins, BEFORE any generic rule: a rule that owns its host knows that host's id better",
+    "than a generic `/jobs/N` or `/<7+ digits>` rule, which otherwise claimed some spellings",
+    "first and keyed one Google posting two ways.",
+    "",
+    "Every rule is anchored at its own HOST, because two rows with EQUAL ids merge, so a loose",
+    "rule that hands two postings one id does the damage the id exists to prevent. That is",
+    "also why a four-digit floor is allowed here, where the host fixes the position, and never",
+    "in a generic rule, where four digits is a year.",
+    "",
+    "github.careers and atlassian.com are front ends over iCIMS, and their page id IS the iCIMS",
+    "requisition id, so all three spellings share one `icims:` key and the key drops the",
+    "portal, since one employer serves several. iCIMS numbers each customer from its own",
+    "counter, so that id is unique only WITHIN ONE EMPLOYER, which `per_employer` records.",
+    "Breezy carries it too: its key drops the board subdomain and nothing establishes that",
+    "its hex ids are unique across boards. A rule may omit it only when its host is one",
+    "employer's own (Apple, Google, EA), and every rule of one namespace must agree.",
+    "role-matcher's consumers compare ids within one company already (merge-tracker and",
+    "dedup-tracker filter by company first, eval-write keys on id plus company); a consumer",
+    "that compares across companies, as eval-blockers' report index does, must scope a",
+    "per_employer key by company or one employer's report answers for another's packet.",
+    "",
+    "`example` and `key` are a case every reader asserts: test-all checks role-matcher and",
+    "eval-blockers --selftest checks itself, so a rule added here is tested in both with",
+    "nothing else to edit. Ids in examples are placeholders."
+  ],
+  "rules": [
+    {
+      "ns": "apple",
+      "re": "^(?:https?://)?jobs\\.apple\\.com/[^?#]*?/details/(\\d{6,})",
+      "example": "https://jobs.apple.com/en-us/details/201190336-0001/example-role",
+      "key": "apple:201190336"
+    },
+    {
+      "ns": "google",
+      "re": "^(?:https?://)?(?:(?:www\\.)?google\\.com/about/careers/[^?#]*?|careers\\.google\\.com)/jobs/results/(\\d{6,})",
+      "example": "https://www.google.com/about/careers/applications/jobs/results/114723757451217499-example-role",
+      "key": "google:114723757451217499"
+    },
+    {
+      "ns": "icims",
+      "per_employer": true,
+      "re": "^(?:https?://)?(?:www\\.)?github\\.careers/careers-home/jobs/(\\d{3,})(?:[/?#]|$)",
+      "example": "https://www.github.careers/careers-home/jobs/1001?lang=en-us",
+      "key": "icims:1001"
+    },
+    {
+      "ns": "icims",
+      "per_employer": true,
+      "re": "^(?:https?://)?[\\w-]+\\.icims\\.com/jobs/(\\d{3,})(?:[/?#]|$)",
+      "example": "https://careers-example.icims.com/jobs/1001/example-role/job",
+      "key": "icims:1001"
+    },
+    {
+      "ns": "icims",
+      "per_employer": true,
+      "re": "^(?:https?://)?(?:www\\.)?atlassian\\.com/company/careers/details/(\\d{3,})(?:[/?#]|$)",
+      "example": "https://www.atlassian.com/company/careers/details/1002",
+      "key": "icims:1002"
+    },
+    {
+      "ns": "ea",
+      "re": "^(?:https?://)?jobs\\.ea\\.com/[^?#]*?/JobDetail/[^/?#]+/(\\d{4,})(?:[/?#]|$)",
+      "example": "https://jobs.ea.com/en_US/careers/JobDetail/Example-Role/200001",
+      "key": "ea:200001"
+    },
+    {
+      "ns": "breezy",
+      "per_employer": true,
+      "re": "^(?:https?://)?[\\w-]+\\.breezy\\.hr/p/([0-9a-f]{8,})",
+      "example": "https://example-studio.breezy.hr/p/3e7c3a9f0349-example-role",
+      "key": "breezy:3e7c3a9f0349"
+    }
+  ]
+}

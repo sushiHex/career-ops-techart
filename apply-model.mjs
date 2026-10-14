@@ -22,6 +22,21 @@
  */
 import { readFileSync, writeFileSync, existsSync, copyFileSync } from 'fs';
 import { join } from 'path';
+import { columnsOf, reportFileOf, setCell, trackerRows } from './tracker-rows.mjs';
+import { guardArgs } from './cli-guard.mjs';
+
+const args = guardArgs({
+  name: 'apply-model.mjs',
+  summary: 'apply the adopted scoring model to the tracker and reports',
+  flags: [
+    ['--apply', 'rewrite data/applications.md (default is a dry run)'],
+    ['--reports', 'with --apply, also annotate each report with the model output'],
+  ],
+  notes: 'Dry run by default. Nothing is written without --apply.',
+  writesByDefault: false,
+});
+const APPLY = args.has('--apply');
+const REPORTS = args.has('--reports');
 
 // Sibling modules resolve beside this file, so it runs from any directory; the
 // data it reads (data/, reports/) stays relative to where it is run.
@@ -29,9 +44,6 @@ const here = (f) => new URL(f, import.meta.url).href;
 const { parseScores, computeGlobal } = await import(here('audit-scores.mjs'));
 const { applyModel, loadPrefs, MODEL, persistedArrangement } = await import(here('score-model.mjs'));
 
-const args = process.argv.slice(2);
-const APPLY = args.includes('--apply');
-const REPORTS = args.includes('--reports');
 const TRACKER = join('data', 'applications.md');
 const TODAY = '2026-07-27';
 
@@ -49,32 +61,29 @@ if (!prefs.length) {
 }
 
 const lines = readFileSync(TRACKER, 'utf-8').split('\n');
-const out = [];
+const colmap = columnsOf(lines);
+const out = [...lines];
 const changes = [];
 const scored = [];
 const malformed = [];
 const invalid = [];
 let live = 0, unparsed = 0;
 
-for (const line of lines) {
-  if (!line.startsWith('|')) { out.push(line); continue; }
-  const c = line.split('|');
-  const cells = c.map((x) => x.trim());
-  if (cells.length < 8 || !/^\d+$/.test(cells[1] || '')) { out.push(line); continue; }
-
-  const rm = line.match(/\((?:\.\.\/)?reports\/([^)]+)\)/);
-  const p = rm ? join('reports', rm[1].split('/').pop()) : null;
-  if (!p || !existsSync(p)) { out.push(line); continue; }
+for (const row of trackerRows(lines, colmap)) {
+  const num = String(row.num);
+  const reportFile = reportFileOf(row.raw);
+  const p = reportFile ? join('reports', reportFile) : null;
+  if (!p || !existsSync(p)) continue;
 
   const text = readFileSync(p, 'utf-8');
   const s = parseScores(text);
   const base = s ? computeGlobal(s) : null;
+  const dead = DEAD.has(row.status);
   if (base === null || base > 5 || base < 0) {
-    if (!DEAD.has(cells[6])) unparsed++;
-    out.push(line);
+    if (!dead) unparsed++;
     continue;
   }
-  if (!DEAD.has(cells[6])) live++;
+  if (!dead) live++;
 
   // Prefer the arrangement the report already recorded over re-deriving it. eval-write
   // computes it from the packet's clean location and persists it here, then writes a
@@ -88,21 +97,20 @@ for (const line of lines) {
   let r;
   try {
     r = applyModel(base, {
-      text, company: cells[3], role: cells[4], prefs, arrangement: persistedArr,
+      text, company: row.company, role: row.role, prefs, arrangement: persistedArr,
     });
   } catch (e) {
-    invalid.push(`#${cells[1]} ${p}: ${e.message}`);
-    out.push(line);
+    invalid.push(`#${num} ${p}: ${e.message}`);
     continue;
   }
-  const shown = parseFloat(String(cells[5]).replace('/5', ''));
+  const shown = parseFloat(String(row.score).replace('/5', ''));
   const next = r.final.toFixed(1);
 
   const rec = {
-    num: cells[1], co: cells[3], role: cells[4], status: cells[6],
+    num, co: row.company, role: row.role, status: row.status,
     from: Number.isFinite(shown) ? shown : null, base: r.base, to: r.final,
     cf: r.compFactor, pf: r.prefFactor, af: r.arrFactor,
-    pref: r.pref, damped: r.damped, arr: r.arrangement, path: p, dead: DEAD.has(cells[6]),
+    pref: r.pref, damped: r.damped, arr: r.arrangement, path: p, dead,
     compStatus: r.compStatus,
   };
   // Annotation covers every scored row, not just the ones whose tracker cell
@@ -116,25 +124,23 @@ for (const line of lines) {
   // the unrounded final makes any exact .x5 case report as moving on every run.
   if (!Number.isFinite(shown) || Math.abs(shown - parseFloat(next)) >= 0.05) {
     changes.push({
-      num: cells[1], co: cells[3], role: cells[4], status: cells[6],
+      num, co: row.company, role: row.role, status: row.status,
       from: Number.isFinite(shown) ? shown : null, base: r.base, to: r.final,
       cf: r.compFactor, pf: r.prefFactor, af: r.arrFactor,
-      pref: r.pref, damped: r.damped, arr: r.arrangement, path: p, dead: DEAD.has(cells[6]),
+      pref: r.pref, damped: r.damped, arr: r.arrangement, path: p, dead,
     });
   }
 
-  // Rebuild the row with the score cell replaced, preserving original spacing.
-  // Guard first: a stray "|" inside a role or note shifts every later column, and
-  // blind index-5 assignment would then overwrite whatever landed there — silent
-  // corruption of the user's tracker. Only write into a cell that already looks
-  // like a score; anything else is left untouched and reported.
-  if (!/^\s*\d(\.\d+)?\/5\s*$/.test(c[5] ?? '')) {
-    malformed.push(`#${cells[1]} ${cells[3]} — column 5 is "${String(c[5]).trim().slice(0, 30)}", not a score`);
-    out.push(line);
+  // Rewrite the score cell, preserving original spacing. Guard first: a stray "|"
+  // inside a role or note shifts every later column, and blind assignment would
+  // then overwrite whatever landed in the score position — silent corruption of
+  // the user's tracker. Only write into a cell that already looks like a score;
+  // anything else is left untouched and reported.
+  if (!/^\d(\.\d+)?\/5$/.test(row.score ?? '')) {
+    malformed.push(`#${num} ${row.company} — column ${colmap.score} is "${String(row.score).slice(0, 30)}", not a score`);
     continue;
   }
-  c[5] = c[5].replace(/\S.*\S|\S/, `${next}/5`);
-  out.push(c.join('|'));
+  out[row.line] = setCell(row.raw, colmap, 'score', `${next}/5`);
 }
 
 const liveChanges = changes.filter((x) => !x.dead);

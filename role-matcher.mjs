@@ -1,15 +1,15 @@
 /**
- * role-matcher.mjs - Shared fuzzy role-title matching for tracker scripts.
+ * role-matcher.mjs - Posting identity for tracker scripts: requisition ids read
+ * from URLs and role cells (`extractJobId`, `rowIdReader`), the company key, and
+ * the fuzzy role-title match that decides only when neither row has an id.
  *
- * Both `merge-tracker.mjs` and `dedup-tracker.mjs` decide whether two
- * same-company tracker rows describe the same opening. Keeping this logic in
- * one module prevents the merge path from preserving rows that the later dedup
- * path would silently delete with weaker matching rules.
+ * merge-tracker, dedup-tracker, eval-write and verify-pipeline share it, so the
+ * merge path cannot keep rows that a later dedup would delete with weaker rules.
  */
 
 import { readFileSync } from 'fs';
 import { resolve } from 'path';
-import { REQ_ID, canonId } from './req-id-core.mjs';
+import { REQ_ID, canonId, reqIdGlobal } from './req-id-core.mjs';
 
 // Tokens that almost every role shares must not count as strong matching
 // signal. This set covers seniority, work mode, contract shape, locations, and
@@ -17,7 +17,7 @@ import { REQ_ID, canonId } from './req-id-core.mjs';
 export const ROLE_STOPWORDS = new Set([
   // seniority / level
   'junior', 'mid', 'middle', 'senior', 'staff', 'principal', 'lead', 'head',
-  'chief', 'associate', 'intern', 'entry', 'level',
+  'chief', 'associate', 'entry', 'level',
   // contract / mode
   'remote', 'hybrid', 'onsite', 'contract', 'contractor', 'freelance',
   'fulltime', 'parttime', 'permanent', 'temporary', 'intern', 'internship',
@@ -52,6 +52,17 @@ export const BASELINE_TOKENS = new Set([
   'platform', 'systems', 'services',
   'backend', 'frontend', 'full', 'stack', 'fullstack',
 ]);
+
+/**
+ * A company name as a comparable key: lowercase letters and digits only, so
+ * "Riot Games" and "riot-games" are one employer.
+ *
+ * @param {string} name
+ * @returns {string}
+ */
+export function companyKey(name) {
+  return String(name ?? '').toLowerCase().replace(/[^a-z0-9]/g, '');
+}
 
 /**
  * Convert a role title into content tokens used for fuzzy matching.
@@ -108,6 +119,22 @@ export function roleFuzzyMatch(a, b) {
 }
 
 /**
+ * Normalise a Workday requisition token to a comparable key.
+ *
+ * Workday appends a "-<n>" facet suffix to some slugs (P711740-2), which must go,
+ * but the same shape is how Sony writes the id itself (JR-119345). Stripping
+ * blindly turned that id into the bare prefix "jr", which would collide with every
+ * other Sony req. So only strip the trailing group when something with a digit in
+ * it survives.
+ */
+function normaliseReqId(tok) {
+  let s = String(tok);
+  const stripped = s.replace(/-\d+$/, '');
+  if (/\d/.test(stripped)) s = stripped;
+  return s.toLowerCase().replace(/[^a-z0-9]/g, '');
+}
+
+/**
  * Extract a stable job-posting identity from an ATS URL.
  *
  * Fuzzy title matching cannot reliably separate sibling roles at the same
@@ -125,22 +152,6 @@ export function roleFuzzyMatch(a, b) {
  * @param {string} url - Raw posting URL (typically from a report's `**URL:**`).
  * @returns {string|null} Namespaced job id (e.g. `gh:4223404714`, `wd:jr2357552`) or null.
  */
-/**
- * Normalise a Workday requisition token to a comparable key.
- *
- * Workday appends a "-<n>" facet suffix to some slugs (P711740-2), which must go,
- * but the same shape is how Sony writes the id itself (JR-119345). Stripping
- * blindly turned that id into the bare prefix "jr", which would collide with every
- * other Sony req. So only strip the trailing group when something with a digit in
- * it survives.
- */
-function normaliseReqId(tok) {
-  let s = String(tok);
-  const stripped = s.replace(/-\d+$/, '');
-  if (/\d/.test(stripped)) s = stripped;
-  return s.toLowerCase().replace(/[^a-z0-9]/g, '');
-}
-
 export function extractJobId(url) {
   if (!url || typeof url !== 'string') return null;
   const u = url.trim();
@@ -155,6 +166,12 @@ export function extractJobId(url) {
   // where Greenhouse actually puts it.
   const pathOnly = u.split(/[?#]/)[0];
   let m;
+  // Host-anchored forms FIRST: a rule that owns its host knows that host's id better
+  // than any generic rule below, and running it last let the generic `/jobs/N` and
+  // `/<7+ digits>` rules claim some spellings first, so one Google posting keyed as
+  // `id:` without its title slug and `google:` with it.
+  const hosted = hostedId(pathOnly);
+  if (hosted) return hosted;
   // Greenhouse: ?gh_jid=1194374 or /jobs/1194374 on a greenhouse host
   if ((m = u.match(/[?&]gh_jid=(\d{4,})/i))) return `gh:${m[1]}`;
   if ((m = pathOnly.match(/greenhouse\.io\/[^/]*?\/jobs\/(\d{4,})/i))) return `gh:${m[1]}`;
@@ -168,7 +185,7 @@ export function extractJobId(url) {
   // year-prefixed form entirely: _26WD161146 and _26WD91231-1 both returned
   // null, because the rule below requires a LETTER immediately after the
   // underscore and 26WD starts with digits. A null id is not a conflict, so
-  // jobIdsConflict() reported nothing, merge-tracker and dedup-tracker lost the
+  // the id guard reported nothing, merge-tracker and dedup-tracker lost the
   // job-id guard for every Autodesk row, and the fuzzy title fallback they fall
   // back to can merge two distinct requisitions or duplicate one.
   //
@@ -187,17 +204,40 @@ export function extractJobId(url) {
   // matching and proposed merging JR-119345 (Staff) into JR-105215 (Senior), two
   // genuinely different reqs that differ only by level.
   if ((m = pathOnly.match(/_([A-Za-z]{1,3}[-_]?\d{3,}[A-Za-z0-9-]*?)(?:\/|$)/))) return `wd:${normaliseReqId(m[1])}`;
-  // REQ-0850786 anywhere in the path. The JR alternative that used to sit beside
-  // it here is gone: it was a second, looser copy of the shared pattern above
-  // (four digits after JR, where four digits is also the DATE in a report
-  // filename slug), and a copy that merely agrees on today's examples is exactly
-  // the drift this round exists to remove.
+  // REQ-0850786 anywhere in the path. JR forms come only from the shared pattern
+  // above: four digits after JR is also the DATE in a report filename slug.
   if ((m = pathOnly.match(/\b(req-?\d{4,})\b/i))) return `wd:${m[1].toLowerCase().replace(/[^a-z0-9]/g, '')}`;
   // Riot / Netflix / generic ATS: /j/1194374, /job/1194374, /jobs/1194374
   if ((m = pathOnly.match(/\/j(?:ob)?s?\/(\d{5,})/i))) return `id:${m[1]}`;
   // Fallback: a long standalone numeric id segment in the path
   if ((m = pathOnly.match(/\/(\d{7,})(?:\/|$)/))) return `id:${m[1]}`;
   return workdayBareId(u);
+}
+
+/**
+ * Company-hosted boards whose ids the generic rules cannot see, found on 2026-10-08
+ * when dedup-tracker proposed deleting one team's Staff req as a duplicate of its Senior
+ * req: github.careers writes a FOUR-digit id, the generic
+ * `/jobs/N` rule wants five, both rows came back null, and the fuzzy title match
+ * decided alone. 102 tracker rows had no identity that day, clustered exactly where one
+ * employer posts many similar titles: Apple 13, GitHub 12, Google 6, EA 5.
+ *
+ * The rules are DATA in host-ids.json, which scripts/eval-blockers.py reads too, so the
+ * two cannot hold different lists. That file states the contract (case-insensitive, the
+ * query and fragment cut, group 1 lowercased under its namespace) and why each rule is
+ * anchored at its host. Its `per_employer` flag is not read here: every consumer of these
+ * ids compares within ONE company already (merge-tracker and dedup-tracker filter by
+ * company first, eval-write keys its index on id plus company).
+ */
+const HOSTED_ID = JSON.parse(readFileSync(new URL('./host-ids.json', import.meta.url), 'utf-8'))
+  .rules.map(r => [new RegExp(r.re, 'i'), r.ns]);
+
+function hostedId(pathOnly) {
+  for (const [re, ns] of HOSTED_ID) {
+    const m = pathOnly.match(re);
+    if (m) return `${ns}:${m[1].toLowerCase()}`;
+  }
+  return null;
 }
 
 /**
@@ -225,52 +265,93 @@ function workdayBareId(u) {
   return id ? `wd:${host[1].toLowerCase()}:${id[1]}` : null;
 }
 
-/**
- * Report whether two job ids prove two rows are distinct postings.
- *
- * Two rows are provably distinct only when BOTH carry a resolvable job id and
- * those ids differ. A null id (URL missing or unparsed) is inconclusive, not a
- * conflict, so callers fall back to fuzzy title matching for legacy rows.
- *
- * @param {string|null} a - First job id from {@link extractJobId}.
- * @param {string|null} b - Second job id.
- * @returns {boolean} True only when both ids exist and differ.
- */
-export function jobIdsConflict(a, b) {
-  return a != null && b != null && a !== b;
-}
-
-/**
- * Resolve the authoritative job id for a tracker row/addition via its linked
- * report file's `**URL:**` header line.
- *
- * Shared by `merge-tracker.mjs` and `dedup-tracker.mjs` so the report-read +
- * URL-extraction + job-id logic lives in exactly one place — the two callers
- * previously carried independent, near-identical copies of this that risked
- * drifting apart.
- *
- * @param {string} reportField - Markdown report cell, e.g. `[123](../reports/…md)`.
- * @param {string} trackerDir - Directory the report link is relative to (the
- *   tracker file's own directory).
- * @param {Map<string, string|null>} cache - Caller-owned cache of resolved
- *   report path → posting URL, so repeated lookups for the same report during
- *   one run only read the file once. Callers keep their own Map instance.
- * @returns {string|null} Namespaced job id, or null when it cannot be resolved.
- */
-export function jobIdFromReportField(reportField, trackerDir, cache) {
+function reportUrlLine(reportField, trackerDir, cache) {
   const m = String(reportField ?? '').match(/\]\(([^)]+)\)/);
   if (!m) return null;
   const p = resolve(trackerDir, m[1]);
   if (!cache.has(p)) {
-    let url = null;
+    // The WHOLE URL line is cached, not its first token. Older reports write the
+    // requisition beside a bare careers host, "**URL:** https://<tenant>.wd5.
+    // myworkdayjobs.com/<site> (<req id>)", and reading only
+    // `(\S+)` threw the id away. With no id that row conflicted with nothing, so on
+    // 2026-10-08 merge-tracker's fuzzy fallback folded a different requisition into it and
+    // overwrote a different requisition's row. `[ \t]*` rather than `\s*`, so an
+    // empty URL line can never borrow the line below it.
+    let line = null;
     try {
       const txt = readFileSync(p, 'utf-8');
-      const um = txt.match(/^\s*\*\*URL:\*\*\s*(\S+)/im) || txt.match(/\bURL:\s*(\S+)/i);
-      url = um ? um[1].trim() : null;
+      const um = txt.match(/^[ \t]*\*\*URL:\*\*[ \t]*(.*)$/im) || txt.match(/\bURL:[ \t]*(.*)$/im);
+      line = um ? um[1].trim() || null : null;
     } catch {
-      url = null;
+      line = null;
     }
-    cache.set(p, url);
+    cache.set(p, line);
   }
-  return extractJobId(cache.get(p));
+  return cache.get(p);
+}
+
+/** Every shared requisition id in free text, in extractJobId's `wd:` namespace so an id
+ *  read here compares equal to the same id read from a posting URL. */
+function reqIdsIn(text) {
+  return [...String(text ?? '').matchAll(reqIdGlobal())]
+    .map(m => `wd:${canonId(m[1]).toLowerCase()}`);
+}
+
+/**
+ * The identity of a tracker ROW: the SET of every requisition id its own records state.
+ *
+ * That is the id in the report's URL, any shared requisition id elsewhere on the URL
+ * line, and any in the row's role cell, where eval-write and most hand-written rows
+ * record it ("Senior Machine Learning Engineer (<req id>)"). A set rather than one id
+ * with a fixed priority, because the sources are different numbering systems for one
+ * posting: one row can carry an Eightfold id in its URL and a JR id in
+ * its role cell, and a row that recorded only the JR must still be recognised as the
+ * same posting. A single id chosen by priority made those two rows CONFLICT.
+ *
+ * @param {{report?: string, role?: string}} row - A tracker row or TSV addition.
+ * @returns {Set<string>} possibly empty
+ */
+function rowJobIds(row, trackerDir, cache) {
+  const ids = new Set();
+  const line = reportUrlLine(row?.report, trackerDir, cache);
+  if (line) {
+    const fromUrl = extractJobId(line.split(/\s+/)[0]);
+    if (fromUrl) ids.add(fromUrl);
+    for (const id of reqIdsIn(line)) ids.add(id);
+  }
+  for (const id of reqIdsIn(row?.role)) ids.add(id);
+  return ids;
+}
+
+/**
+ * A reader of row identities for one tracker, shared by merge-tracker and dedup-tracker.
+ *
+ * It owns the report-line cache, so callers keep no cache of their own, and it memoises
+ * each row's set by the TEXT that determines it (report link plus role cell), so the
+ * pairwise loops do not rebuild a set per comparison and an edited row cannot return a
+ * stale identity.
+ *
+ * @param {string} trackerDir - The directory report links are relative to.
+ * @returns {(row: {report?: string, role?: string}) => Set<string>}
+ */
+export function rowIdReader(trackerDir) {
+  const lines = new Map();
+  const sets = new Map();
+  return (row) => {
+    const key = `${row?.report ?? ''}\u0000${row?.role ?? ''}`;
+    if (!sets.has(key)) sets.set(key, rowJobIds(row, trackerDir, lines));
+    return sets.get(key);
+  };
+}
+
+/** Two rows are the same posting when their identity sets share an id. */
+export function idSetsOverlap(a, b) {
+  for (const id of a) if (b.has(id)) return true;
+  return false;
+}
+
+/** Two rows are PROVABLY distinct only when both have ids and share none. An empty set
+ *  is inconclusive, as a null id always was. */
+export function idSetsConflict(a, b) {
+  return a.size > 0 && b.size > 0 && !idSetsOverlap(a, b);
 }
