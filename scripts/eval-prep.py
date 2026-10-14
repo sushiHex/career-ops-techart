@@ -877,6 +877,8 @@ def recomp():
 
 LOCATION_CASES = [
     # (location, ats_remote_flag, expected verdict, why this case exists)
+    ("Remote, Global", False, "pass",
+     "worldwide remote includes the US; it read as an unrecognised region"),
     ("Indiana - Remote", True, "fail",
      "Salesforce's format: state first, dash separator. The fifth spelling of state-scoped "
      "remote found on a real board, and like the other four it read as plain remote-US"),

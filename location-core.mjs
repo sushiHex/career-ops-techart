@@ -672,6 +672,8 @@ const SELFTEST_OPTIONS = [
   ['Remote (US)', 'accept', 'unscoped, parenthesised'],
   ['US Remote', 'accept', 'unscoped, no punctuation at all'],
   ['Remote', 'accept', 'remote-anywhere'],
+  ['Remote, Global', 'accept', 'worldwide remote includes the US'],
+  ['Remote - Worldwide', 'accept', 'worldwide remote, dash-separated'],
   // The documented precedence case: an incidental foreign mention must not
   // outrank an explicit US-remote offer, and a prose field is not a scope.
   ['Remote, US (occasional travel to London)', 'accept', 'prose field is not a subdivision'],

@@ -422,7 +422,7 @@
     "preference_after": "^[^)|;]{0,30}?\\b(?:preferred|preference|a plus|ideal|nice to have)\\b",
     "context_before": "\\b(?:travel(?:ing|s)?|trips?|visits?|visiting|offices?|hq|headquarter\\w*|based out of)\\b[^)|;]{0,30}$",
     "negation_before": "\\b(?:not|no longer|never)\\s+$",
-    "nationwide": "\\b(?:nationwide|any (?:us |u\\.s\\. )?state|all (?:us |u\\.s\\. )?states|anywhere(?:\\s+(?:in|within|across)\\s+(?:the\\s+)?(?:us|u\\.s\\.a?\\.?|usa|united states|country|north america))?(?!\\s+(?:in|within|across|except|outside|but)\\b))(?![a-z0-9])",
+    "nationwide": "\\b(?:nationwide|global(?:ly)?|worldwide|any (?:us|u\\.s\\. )?state|all (?:us |u\\.s\\. )?states|anywhere(?:\\s+(?:in|within|across)\\s+(?:the\\s+)?(?:us|u\\.s\\.a?\\.?|usa|united states|country|north america))?(?!\\s+(?:in|within|across|except|outside|but)\\b))(?![a-z0-9])",
     "exclusion_lead": "(?:\\b(?:except(?:\\s+for)?|excluding|excludes|excl\\.?|other than|not available(?:\\s+(?:to|in))?|not eligible(?:\\s+(?:in|for))?|not open to|cannot hire in|can'?t hire in|not hiring in|anywhere but|all (?:us |u\\.s\\. )?states but|excluded(?:\\s+states)?\\s*:)|(?:^|[(,:\\u2013\\u2014-])\\s*outside(?:\\s+of)?)\\s*:?\\s*(?:the\\s+)?(?:following\\s+)?(?:(?:states?|locations?)(?:\\s+of)?\\s*:?\\s*)?(?:(?:residents|candidates|applicants|employees|those|people)\\s+(?:of|in|from|based in|located in|residing in)\\s+)?(?:in\\s+)?(?:the\\s+state\\s+of\\s+)?({LIST})",
     "exclusion_trail": "({LIST})\\s*(?:(?:residents|candidates|applicants|employees)\\s+)?(?:(?:is|are)\\s+)?(?:excluded|not eligible|ineligible)\\b",
     "weak_context": [
