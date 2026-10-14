@@ -33,6 +33,8 @@ import { resolve } from 'path';
  *   states the actual risk instead of a generic one. Scripts that preview by
  *   default and write behind --apply have the INVERTED failure: a mistyped
  *   --apply silently previews while the user believes the change landed.
+ * @param {boolean} [spec.positional] - False for a script that takes nothing but
+ *   its flags; anything else, a bare word or a "-1", is then refused too.
  * @param {string[]} [spec.argv] - Defaults to process.argv.slice(2).
  * @returns {{has: (flag: string) => boolean, value: (flag: string, fallback?: string) => string|undefined, argv: string[]}}
  */
@@ -55,8 +57,9 @@ export function guardArgs(spec) {
   }
 
   // Only flag-shaped tokens are validated; positional arguments are left to the
-  // caller, which knows whether it takes any.
-  const unknown = argv.filter(a => a.startsWith('-') && !known.has(a) && !/^-?\d/.test(a));
+  // caller, which knows whether it takes any, unless it said it takes none.
+  const unknown = argv.filter(a => !known.has(a)
+    && (spec.positional === false || (a.startsWith('-') && !/^-?\d/.test(a))));
   // A flag that takes a value ("--min-threshold 3") must not have its value
   // treated as an unknown flag; values are not flag-shaped, so they never are.
   if (unknown.length > 0) {

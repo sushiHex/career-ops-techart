@@ -17,6 +17,8 @@
 import { readFileSync, readdirSync, existsSync, mkdirSync, unlinkSync, statSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
+import { LEGACY_COLMAP, detectColumns, parseRow } from './tracker-rows.mjs';
+import { companyKey } from './role-matcher.mjs';
 
 const CAREER_OPS = dirname(fileURLToPath(import.meta.url));
 // Support both layouts: data/applications.md (boilerplate) and applications.md (original).
@@ -68,51 +70,11 @@ if (!existsSync(APPS_FILE)) {
 const content = readFileSync(APPS_FILE, 'utf-8');
 const lines = content.split('\n');
 
-// Map columns by header name so the checks work whether the tracker uses the
-// original 9-column layout or a customized one with an extra column (e.g. a
-// Location column after Role). Fixed-position indexing would otherwise read
-// Location where Score is expected and flag false errors. Falls back to the
-// legacy fixed layout when no recognizable header row is found.
-const LEGACY_COLMAP = { num: 1, date: 2, company: 3, role: 4, score: 5, status: 6, pdf: 7, report: 8, notes: 9 };
-const HEADER_ALIASES = {
-  '#': 'num', 'num': 'num', 'date': 'date', 'company': 'company', 'empresa': 'company',
-  'role': 'role', 'puesto': 'role', 'location': 'location', 'score': 'score',
-  'status': 'status', 'pdf': 'pdf', 'report': 'report', 'notes': 'notes',
-};
-function detectColumns(allLines) {
-  for (const line of allLines) {
-    if (!line.startsWith('|')) continue;
-    const cells = line.split('|').map(s => s.trim().toLowerCase());
-    if (!cells.includes('company') || !cells.includes('role')) continue;
-    const map = {};
-    cells.forEach((c, i) => { if (HEADER_ALIASES[c] != null) map[HEADER_ALIASES[c]] = i; });
-    if (['num', 'company', 'role', 'score', 'status'].every(k => map[k] != null)) return map;
-  }
-  return null;
-}
+// Columns are mapped by header name (tracker-rows.mjs), so a tracker with an
+// extra Location column is checked as correctly as the original 9-column one.
 const COLMAP = detectColumns(lines) || LEGACY_COLMAP;
 const MAX_IDX = Math.max(...Object.values(COLMAP));
-
-const entries = [];
-for (const line of lines) {
-  if (!line.startsWith('|')) continue;
-  const parts = line.split('|').map(s => s.trim());
-  if (parts.length <= MAX_IDX) continue;
-  const num = parseInt(parts[COLMAP.num]);
-  if (isNaN(num)) continue;
-  entries.push({
-    num,
-    date: parts[COLMAP.date],
-    company: parts[COLMAP.company],
-    role: parts[COLMAP.role],
-    location: COLMAP.location != null ? parts[COLMAP.location] : '',
-    score: parts[COLMAP.score],
-    status: parts[COLMAP.status],
-    pdf: parts[COLMAP.pdf],
-    report: parts[COLMAP.report],
-    notes: COLMAP.notes != null ? (parts[COLMAP.notes] || '') : '',
-  });
-}
+const entries = lines.filter(l => l.startsWith('|')).map(l => parseRow(l, COLMAP)).filter(Boolean);
 
 console.log(`\n📊 Checking ${entries.length} entries in applications.md\n`);
 
@@ -146,7 +108,7 @@ if (badStatuses === 0) ok('All statuses are canonical');
 const companyRoleMap = new Map();
 let dupes = 0;
 for (const e of entries) {
-  const key = e.company.toLowerCase().replace(/[^a-z0-9]/g, '') + '::' +
+  const key = companyKey(e.company) + '::' +
     e.role.toLowerCase().replace(/[^a-z0-9 ]/g, '');
   if (!companyRoleMap.has(key)) companyRoleMap.set(key, []);
   companyRoleMap.get(key).push(e);

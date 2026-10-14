@@ -15,11 +15,11 @@
  *   node eval-write.mjs batch/eval-queue/*.json
  *   node eval-write.mjs <packet> --dry-run
  */
-import { readFileSync, writeFileSync, readdirSync, existsSync, mkdirSync, unlinkSync } from 'fs';
+import { readFileSync, writeFileSync, readdirSync, mkdirSync, unlinkSync } from 'fs';
 import { basename, join } from 'path';
 import { applyModel, loadPrefs } from './score-model.mjs';
 import { REQ_ID_SRC } from './req-id-core.mjs';
-import { extractJobId } from './role-matcher.mjs';
+import { extractJobId, companyKey } from './role-matcher.mjs';
 
 const args = process.argv.slice(2);
 const DRY = args.includes('--dry-run');
@@ -115,7 +115,6 @@ const claimNum = () => {
  */
 const LOC_SEP = ' -- ';
 
-/** Two spellings of one posting URL are one req: case and a trailing slash are noise. */
 /** Two spellings of one posting URL are one req.
  *  SCHEME and HOST are folded; path, query and fragment are NOT. Lowercasing the whole
  *  URL conflates postings that differ only by case, and this comparison decides whether a
@@ -128,8 +127,6 @@ const normUrl = (u) => {
   const m = /^(https?:\/\/)([^/?#]+)(.*)$/i.exec(s);
   return m ? m[1].toLowerCase() + m[2].toLowerCase() + m[3] : s.toLowerCase();
 };
-/** "Fixtureco, Inc." and "Fixtureco" are one employer. */
-const normCo = (c) => String(c).toLowerCase().replace(/[^a-z0-9]+/g, '');
 
 // A UUID is cut out before the bare-number alternative runs: an Ashby or Lever posting
 // id ends in a twelve-hex group that is often all digits, and "...-113241621221" was
@@ -155,10 +152,11 @@ const UUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi
  * parameter carrying a req-shaped token is not this posting's requisition.
  * Last match wins, because the requisition sits at the end of an ATS path.
  */
+const REQ_LABEL_RE = new RegExp(`${REQ_ID_SRC}|[_/-](\\d{7,})(?![0-9])`, 'gi');
 const reqLabel = (url) => {
   const path = String(url || '').trim().replace(/[?#].*$/, '').replace(UUID_RE, '');
   let last = null;
-  for (const m of path.matchAll(new RegExp(`${REQ_ID_SRC}|[_/-](\\d{7,})(?![0-9])`, 'gi'))) {
+  for (const m of path.matchAll(REQ_LABEL_RE)) {
     last = m[1] || m[2];
   }
   return last;
@@ -187,7 +185,7 @@ function sameReq(path, p) {
   try { t = readFileSync(path, 'utf8'); } catch { return false; }
   const theirUrl = machineUrl(t), theirCo = machineCo(t);
   if (theirUrl && p.url) return normUrl(theirUrl) === normUrl(p.url);
-  return !!theirCo && normCo(theirCo) === normCo(p.company);
+  return !!theirCo && companyKey(theirCo) === companyKey(p.company);
 }
 
 /**
@@ -233,7 +231,7 @@ function indexReport(file, url, company) {
   if (!REPORT_INDEX.byUrl.has(u)) REPORT_INDEX.byUrl.set(u, file);
   const id = extractJobId(url);
   if (!id || !company) return;
-  const k = `${id}|${normCo(company)}`;
+  const k = `${id}|${companyKey(company)}`;
   if (!REPORT_INDEX.byReqCo.has(k)) REPORT_INDEX.byReqCo.set(k, file);
 }
 
@@ -265,7 +263,7 @@ function priorReport(p) {
     if (byUrl) return byUrl;
     const id = extractJobId(p.url);
     if (id && p.company) {
-      const hit = ix.byReqCo.get(`${id}|${normCo(p.company)}`);
+      const hit = ix.byReqCo.get(`${id}|${companyKey(p.company)}`);
       if (hit) return hit;
     }
   }
@@ -482,13 +480,13 @@ verified: "${DATE} ${p.ats} API"
   // Anchor on the separator, not \b. Workday URLs end "..._17372837" and underscore
   // is a word character, so \b never matches before the digits and the id was
   // silently dropped, which is what let the fuzzy fallback over-merge in the first
-  // place. The pattern itself is reqLabel() above, shared with the rest of Node.
+  // place. The pattern itself is reqLabel() above.
   const reqId = reqLabel(p.url);
   const roleCell = reqId && !p.title.includes(reqId)
     ? `${cell(p.title)} (${reqId})` : cell(p.title);
   const tsv = [N, DATE, cell(p.company), roleCell, p.status,
     `${m.final.toFixed(1)}/5`, '❌',
-    `[${N}](reports/${N}-${p.slug}-${DATE}.md)`, note].join('\t');
+    `[${N}](${file})`, note].join('\t');
 
   console.log(`${DRY ? 'DRY  ' : 'WROTE'} ${N}  ${m.final.toFixed(2)}  ` +
     `${String(p.status).padEnd(9)} ${p.company} - ${String(p.title).slice(0, 46)}`);

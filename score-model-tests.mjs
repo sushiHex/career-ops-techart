@@ -9,14 +9,19 @@
  *
  * Run: node score-model-tests.mjs
  */
-import { mkdtempSync, writeFileSync } from 'fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { fileURLToPath } from 'url';
 
+// Every directory these tests create lives under one root, removed when the run ends.
+const TMP = mkdtempSync(join(tmpdir(), 'score-model-tests-'));
+process.on('exit', () => rmSync(TMP, { recursive: true, force: true }));
+
 // No installed configuration may reach these tests, not even the model's import-time read
 // of the profile: a malformed profile would otherwise fail the suite that checks the rules.
-process.env.CAREER_OPS_CONFIG_DIR = mkdtempSync(join(tmpdir(), 'score-model-noconfig-'));
+process.env.CAREER_OPS_CONFIG_DIR = join(TMP, 'noconfig');
+mkdirSync(process.env.CAREER_OPS_CONFIG_DIR);
 const M = await import(new URL('./score-model.mjs', import.meta.url).href);
 const { compBand, arrangement, locationText, MODEL,
         normaliseArrangement, persistedArrangement } = M;
@@ -259,32 +264,35 @@ t('pref: a higher preference scores strictly above a lower one', () => {
 t('pref: a longer name is not shadowed by a shorter prefix', () =>
   eq(prefFactor('Initech Games', 'Engineer', PREFS).pref, 0.6));
 
+/** loadPrefs over a throwaway profile.yml holding `yml`; the directory is removed after. */
+function prefsFrom(yml) {
+  const dir = mkdtempSync(join(tmpdir(), 'copref-'));
+  try {
+    writeFileSync(join(dir, 'profile.yml'), yml, 'utf-8');
+    return M.loadPrefs(dir);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
 // The ordering guarantee lives in loadPrefs, so test loadPrefs itself, with the
 // short name deliberately listed FIRST so an unsorted implementation fails.
 t('loadPrefs: sorts longest-first so a short key cannot shadow a long one', () => {
-  const dir = mkdtempSync(join(tmpdir(), 'copref-'));
-  writeFileSync(join(dir, 'profile.yml'),
-    'company_preference:\n  Initech: 0.3\n  Initech Games: 0.6\n\nother_key: 1\n', 'utf-8');
-  const prefs = M.loadPrefs(dir);
+  const prefs = prefsFrom('company_preference:\n  Initech: 0.3\n  Initech Games: 0.6\n\nother_key: 1\n');
   const games = M.preference('Initech Games', prefs);
   const plain = M.preference('Initech', prefs);
   return games === 0.6 && plain === 0.3 ? true : `Initech Games -> ${games}, Initech -> ${plain}`;
 });
 
 t('loadPrefs: tier comments and blank lines do not truncate the block', () => {
-  const dir = mkdtempSync(join(tmpdir(), 'copref2-'));
-  writeFileSync(join(dir, 'profile.yml'),
-    'company_preference:\n  # tier one\n  Alpha: 1.0\n\n  # tier two\n  Beta: 0.5\n\nnext_key: x\n', 'utf-8');
-  const prefs = M.loadPrefs(dir);
+  const prefs = prefsFrom(
+    'company_preference:\n  # tier one\n  Alpha: 1.0\n\n  # tier two\n  Beta: 0.5\n\nnext_key: x\n');
   return prefs.length === 2 && M.preference('Beta', prefs) === 0.5
     ? true : `parsed ${prefs.length} entries, Beta -> ${M.preference('Beta', prefs)}`;
 });
 
 t('loadPrefs: a following top-level key is not swallowed into the block', () => {
-  const dir = mkdtempSync(join(tmpdir(), 'copref3-'));
-  writeFileSync(join(dir, 'profile.yml'),
-    'company_preference:\n  Alpha: 1.0\n\nauto_pdf_score_threshold: 4.0\n', 'utf-8');
-  const prefs = M.loadPrefs(dir);
+  const prefs = prefsFrom('company_preference:\n  Alpha: 1.0\n\nauto_pdf_score_threshold: 4.0\n');
   return prefs.length === 1 ? true : `parsed ${prefs.length} entries, expected 1`;
 });
 
@@ -439,7 +447,7 @@ t('the persisted arrangement is read from the Machine Summary, YAML-style', () =
 // per-track alternate_ranges with their own `minimum:` one level deeper; reading the
 // first `minimum:` in the block would gate every req against another track's number.
 const profileDir = (yml) => {
-  const d = mkdtempSync(join(tmpdir(), 'cand-'));
+  const d = mkdtempSync(join(TMP, 'cand-'));
   writeFileSync(join(d, 'profile.yml'), yml);
   return d;
 };
@@ -458,7 +466,7 @@ t('config: a NESTED per-track minimum is never read as the floor', () => {
 });
 
 t('config: no profile means no floor and NO gate, not a gate at a default', () => {
-  const c = M.loadCandidate(mkdtempSync(join(tmpdir(), 'cand-')));
+  const c = M.loadCandidate(mkdtempSync(join(TMP, 'cand-')));
   const v = M.compVerdict({ lo: 100, hi: 120, basis: 'total' }, { ...MODEL, COMP_FLOOR: c.compFloorK });
   return c.compFloorK === null && v.status === 'no-floor' && v.factor === 1
     ? true : `candidate=${JSON.stringify(c)} verdict=${JSON.stringify(v)}`;

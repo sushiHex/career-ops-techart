@@ -19,7 +19,7 @@ Run:
   python scripts/eval-assist.py                 # annotate every queued packet
   python scripts/eval-assist.py --report        # summary, ranked
 """
-import glob, importlib.util, json, math, os, re, sys
+import importlib.util, json, math, os, re, sys
 
 for _s in (sys.stdout, sys.stderr):
     try:
@@ -174,17 +174,12 @@ if __name__ == "__main__":
     if auto and not args.report:
         # Retire them from the inbox and remove the packets, so a decided req does
         # not sit in the judgement queue and does not come back in the next triage.
-        out = os.path.join(ROOT, "dispositions.json")
-        prev = json.load(open(out, encoding="utf-8")) if os.path.exists(out) else []
-        seen = {d["url"] for d in prev}
-        for p, f in auto:
-            if p["url"] not in seen:
-                prev.append({"url": p["url"], "disposition": p["suggested_disposition"]})
-        json.dump(prev, open(out, "w", encoding="utf-8"), indent=1)
+        total = _prep.record_dispositions(
+            [{"url": p["url"], "disposition": p["suggested_disposition"]} for p, _ in auto])
         if args.retire:
             for _, f in auto:
                 os.remove(f)
             print(f"\nremoved {len(auto)} decided packet(s) from the queue")
-        print(f"dispositions.json now holds {len(prev)} entries")
+        print(f"dispositions.json now holds {total} entries")
         print("   retire from the inbox with:")
         print("   node pipeline-audit.mjs --prune --dispositions=dispositions.json")

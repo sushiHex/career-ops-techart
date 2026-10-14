@@ -17,7 +17,7 @@ import { REQ_ID, canonId, reqIdGlobal } from './req-id-core.mjs';
 export const ROLE_STOPWORDS = new Set([
   // seniority / level
   'junior', 'mid', 'middle', 'senior', 'staff', 'principal', 'lead', 'head',
-  'chief', 'associate', 'intern', 'entry', 'level',
+  'chief', 'associate', 'entry', 'level',
   // contract / mode
   'remote', 'hybrid', 'onsite', 'contract', 'contractor', 'freelance',
   'fulltime', 'parttime', 'permanent', 'temporary', 'intern', 'internship',
@@ -52,6 +52,17 @@ export const BASELINE_TOKENS = new Set([
   'platform', 'systems', 'services',
   'backend', 'frontend', 'full', 'stack', 'fullstack',
 ]);
+
+/**
+ * A company name as a comparable key: lowercase letters and digits only, so
+ * "Riot Games" and "riot-games" are one employer.
+ *
+ * @param {string} name
+ * @returns {string}
+ */
+export function companyKey(name) {
+  return String(name ?? '').toLowerCase().replace(/[^a-z0-9]/g, '');
+}
 
 /**
  * Convert a role title into content tokens used for fuzzy matching.
@@ -108,6 +119,22 @@ export function roleFuzzyMatch(a, b) {
 }
 
 /**
+ * Normalise a Workday requisition token to a comparable key.
+ *
+ * Workday appends a "-<n>" facet suffix to some slugs (P711740-2), which must go,
+ * but the same shape is how Sony writes the id itself (JR-119345). Stripping
+ * blindly turned that id into the bare prefix "jr", which would collide with every
+ * other Sony req. So only strip the trailing group when something with a digit in
+ * it survives.
+ */
+function normaliseReqId(tok) {
+  let s = String(tok);
+  const stripped = s.replace(/-\d+$/, '');
+  if (/\d/.test(stripped)) s = stripped;
+  return s.toLowerCase().replace(/[^a-z0-9]/g, '');
+}
+
+/**
  * Extract a stable job-posting identity from an ATS URL.
  *
  * Fuzzy title matching cannot reliably separate sibling roles at the same
@@ -125,22 +152,6 @@ export function roleFuzzyMatch(a, b) {
  * @param {string} url - Raw posting URL (typically from a report's `**URL:**`).
  * @returns {string|null} Namespaced job id (e.g. `gh:4223404714`, `wd:jr2357552`) or null.
  */
-/**
- * Normalise a Workday requisition token to a comparable key.
- *
- * Workday appends a "-<n>" facet suffix to some slugs (P711740-2), which must go,
- * but the same shape is how Sony writes the id itself (JR-119345). Stripping
- * blindly turned that id into the bare prefix "jr", which would collide with every
- * other Sony req. So only strip the trailing group when something with a digit in
- * it survives.
- */
-function normaliseReqId(tok) {
-  let s = String(tok);
-  const stripped = s.replace(/-\d+$/, '');
-  if (/\d/.test(stripped)) s = stripped;
-  return s.toLowerCase().replace(/[^a-z0-9]/g, '');
-}
-
 export function extractJobId(url) {
   if (!url || typeof url !== 'string') return null;
   const u = url.trim();
@@ -193,11 +204,8 @@ export function extractJobId(url) {
   // matching and proposed merging JR-119345 (Staff) into JR-105215 (Senior), two
   // genuinely different reqs that differ only by level.
   if ((m = pathOnly.match(/_([A-Za-z]{1,3}[-_]?\d{3,}[A-Za-z0-9-]*?)(?:\/|$)/))) return `wd:${normaliseReqId(m[1])}`;
-  // REQ-0850786 anywhere in the path. The JR alternative that used to sit beside
-  // it here is gone: it was a second, looser copy of the shared pattern above
-  // (four digits after JR, where four digits is also the DATE in a report
-  // filename slug), and a copy that merely agrees on today's examples is exactly
-  // the drift this round exists to remove.
+  // REQ-0850786 anywhere in the path. JR forms come only from the shared pattern
+  // above: four digits after JR is also the DATE in a report filename slug.
   if ((m = pathOnly.match(/\b(req-?\d{4,})\b/i))) return `wd:${m[1].toLowerCase().replace(/[^a-z0-9]/g, '')}`;
   // Riot / Netflix / generic ATS: /j/1194374, /job/1194374, /jobs/1194374
   if ((m = pathOnly.match(/\/j(?:ob)?s?\/(\d{5,})/i))) return `id:${m[1]}`;

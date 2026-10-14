@@ -24,7 +24,7 @@ import urllib.request, urllib.error, urllib.parse
 _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
-from _httpctx import CTX, is_tls_failure
+from _httpctx import tls_context, is_tls_failure
 # Ashby's posting API is opt-in per organisation, so a 404 from it settles nothing. The
 # board page carries every posting in window.__appData, and find-ats.py and
 # providers/ashby.mjs both already fall back to it. Share the one brace matcher.
@@ -163,12 +163,11 @@ ATS_IN_PATH = re.compile(
 GH_SLUG = re.compile(
     r"boards-api\.greenhouse\.io/v1/boards/([\w-]+)"
     r"|(?:job-boards|boards)\.greenhouse\.io/(?:embed/job_board(?:/js)?\?for=)?([\w-]+)")
-# Any ATS board slug a portals.yml entry declares, one group, for naming an employer by
-# its board: Greenhouse, Ashby, Lever, Workable and SmartRecruiters. (A Workday tenant is
-# recorded separately, in `workday`.)
+# The other providers' board slugs, for naming an employer by its board: Ashby, Lever,
+# Workable and SmartRecruiters. Greenhouse's come from GH_SLUG, which knows the embed
+# spelling; a Workday tenant is recorded separately, in `workday`.
 BOARD_SLUG = re.compile(
-    r"(?:boards-api\.greenhouse\.io/v1/boards/|(?:job-boards|boards)\.greenhouse\.io/"
-    r"|jobs\.ashbyhq\.com/|jobs\.lever\.co/|apply\.workable\.com/|jobs\.smartrecruiters\.com/)"
+    r"(?:jobs\.ashbyhq\.com/|jobs\.lever\.co/|apply\.workable\.com/|jobs\.smartrecruiters\.com/)"
     r"([\w-]+)")
 # The snippet a company-hosted careers page uses to embed its Greenhouse board. BOTH
 # spellings have to be here. The standard loader is
@@ -202,12 +201,6 @@ def discover_board(page_html):
     return None
 
 
-# Both public SmartRecruiters URL shapes. The `/postings/` segment is not exotic: this
-# pipeline MINTS it, because providers/smartrecruiters.mjs rewrites the API's own `ref`
-# into jobs.smartrecruiters.com/{company}/postings/{id}. The pattern used to read
-# ([\w-]+)/(\d+), which cannot cross the slash before `postings`, so every URL the scan
-# wrote for itself fell through to "no API for this host" while
-# api.smartrecruiters.com/v1/companies/{company}/postings/{id} answered 200 for it.
 # The prefix every host-shaped adapter carries, so that its host must BE this url's host
 # rather than a host mentioned somewhere along it. `ou` cuts the query and the fragment,
 # which is not enough on its own: a tracking url can carry the embedded address in its
@@ -216,7 +209,19 @@ def discover_board(page_html):
 # its board routes earlier. A new adapter that forgets this is caught by the
 # structural check in --selftest, not by hoping someone notices.
 OUTER_HOST = r"^https?://(?:www\.)?"
+REMOTE = re.compile(r"\bremote\b", re.I)
 
+
+def says_remote(*texts):
+    """True when any of `texts` names remote work."""
+    return any(REMOTE.search(t or "") for t in texts)
+
+# Both public SmartRecruiters URL shapes. The `/postings/` segment is not exotic: this
+# pipeline MINTS it, because providers/smartrecruiters.mjs rewrites the API's own `ref`
+# into jobs.smartrecruiters.com/{company}/postings/{id}. The pattern used to read
+# ([\w-]+)/(\d+), which cannot cross the slash before `postings`, so every URL the scan
+# wrote for itself fell through to "no API for this host" while
+# api.smartrecruiters.com/v1/companies/{company}/postings/{id} answered 200 for it.
 SR_URL = (re.compile(OUTER_HOST + r"jobs\.smartrecruiters\.com/([\w-]+)/(?:postings/)?([\w-]+)"),
           re.compile(OUTER_HOST + r"careers\.smartrecruiters\.com/([\w-]+)/[^/]*/(?:postings/)?([\w-]+)"))
 
@@ -307,14 +312,13 @@ def portals_index():
         first = name_key(base.split()[0]) if base.split() else ""
         if len(first) > 2:
             loose.add(first)
-        slugs = [a or b for a, b in GH_SLUG.findall(block)]
+        slugs = list(dict.fromkeys(a or b for a, b in GH_SLUG.findall(block) if a or b))
         wd = WD_TENANT_URL.search(block)
         _PORTALS.append(dict(
-            label=label, base=base.strip(), keys=keys, loose=loose,
-            slugs=list(dict.fromkeys(s for s in slugs if s)),
+            label=label, base=base.strip(), keys=keys, loose=loose, slugs=slugs,
             # Every ATS board slug the entry declares, lowercased, so a caller holding a
             # slug (eval-prep naming a packet's employer) can find the entry's label.
-            boards={m.lower() for m in BOARD_SLUG.findall(block)},
+            boards={m.lower() for m in slugs + BOARD_SLUG.findall(block)},
             workday=(wd.group(1), wd.group(2), wd.group(3)) if wd else None))
     return _PORTALS
 
@@ -529,15 +533,16 @@ def board_fetch(url):
     The GitHub and Atlassian adapters read a 1.5 to 2.4 MB board to answer about ONE
     posting, and verify-report-urls resolves reports one at a time, so a run re-downloaded
     the same board once per report (13 GitHub reports cost about 39 MB). Only a 200 with
-    a body is kept, so a failed read is retried; the selftest clears this before every
-    mocked fetch so one case's board cannot answer the next.
+    a body is kept, so a failed read is retried. Keyed on the fetch function too, so a
+    selftest's patched fetch never reads a board an earlier fetch filled.
     """
-    if url not in _BOARDS:
+    key = (fetch, url)
+    if key not in _BOARDS:
         st, body = fetch(url)
         if st != 200 or not body:
             return st, body
-        _BOARDS[url] = (st, body)
-    return _BOARDS[url]
+        _BOARDS[key] = (st, body)
+    return _BOARDS[key]
 
 
 def fetch(url, timeout=25, accept=None):
@@ -570,7 +575,7 @@ def fetch(url, timeout=25, accept=None):
     hdrs = {**HDRS, "Accept": accept} if accept else HDRS
     try:
         r = urllib.request.Request(url, headers=hdrs)
-        with urllib.request.urlopen(r, timeout=timeout, context=CTX) as resp:
+        with urllib.request.urlopen(r, timeout=timeout, context=tls_context()) as resp:
             return resp.status, resp.read().decode("utf-8", "replace")
     except urllib.error.HTTPError as e:
         # See the docstring: 405 and 406 describe the request, so ask again as a plain
@@ -578,7 +583,7 @@ def fetch(url, timeout=25, accept=None):
         if e.code in (405, 406) and hdrs:
             try:
                 bare = urllib.request.Request(url)
-                with urllib.request.urlopen(bare, timeout=timeout, context=CTX) as resp:
+                with urllib.request.urlopen(bare, timeout=timeout, context=tls_context()) as resp:
                     return resp.status, resp.read().decode("utf-8", "replace")
             except urllib.error.HTTPError as e2:
                 return e2.code, ""
@@ -618,7 +623,7 @@ def post(url, payload):
     try:
         r = urllib.request.Request(url, data=body, method="POST",
                                    headers={**HDRS, "Content-Type": "application/json"})
-        with urllib.request.urlopen(r, timeout=25, context=CTX) as resp:
+        with urllib.request.urlopen(r, timeout=25, context=tls_context()) as resp:
             return resp.status, resp.read().decode("utf-8", "replace")
     except urllib.error.HTTPError as e:
         return e.code, ""
@@ -669,7 +674,7 @@ def workday_reslug(tenant, wd, site, path):
     if not m:
         return None, False
     rid = m.group(1)
-    base = f"https://{tenant}.{wd}.myworkdayjobs.com/wday/cxs/{tenant}/{site}"
+    base = cxs_base(tenant, wd, site)
     st, body = post(base + "/jobs",
                     {"appliedFacets": {}, "limit": 20, "offset": 0, "searchText": rid})
     if st != 200 or not body:
@@ -698,14 +703,13 @@ def clean(h):
     and the lane-signal scan. Unescape first, then strip, and unescape once more for
     the entities (&amp;, &nbsp;) that only surface after the tags are gone.
     """
-    import html as H
     s = h or ""
     for _ in range(2):                     # some payloads are escaped twice
         if "&lt;" not in s and "&amp;lt;" not in s:
             break
-        s = H.unescape(s)
+        s = html.unescape(s)
     s = TAG.sub(" ", s)
-    s = H.unescape(s)
+    s = html.unescape(s)
     return re.sub(r"\s+", " ", s.replace("\xa0", " ")).strip()
 
 
@@ -818,8 +822,7 @@ def ashby_from_page(page_html, org, jid):
                 location=" | ".join(locs), jd=txt,
                 pay=pays(txt) or pays(k_band(comp)), comp_summary=comp or None,
                 embedded=True, listed=bool(p.get("isListed", True)),
-                remote_txt=bool(re.search(r"\bremote\b",
-                                          work + " " + " ".join(locs), re.I)))
+                remote_txt=says_remote(work, *locs))
 
 
 def greenhouse_record(d, board, **extra):
@@ -876,7 +879,7 @@ def greenhouse_record(d, board, **extra):
                 pay=pays(txt),
                 remote_txt=(remote_meta.strip().lower() in ("yes", "true")
                             if remote_meta else
-                            bool(re.search(r"\bremote\b", txt, re.I))),
+                            says_remote(txt)),
                 **extra)
 
 
@@ -895,18 +898,23 @@ def workday_record(info, **extra):
     jd = clean(info.get("jobDescription", ""))
     return dict(ats="workday", live=bool(info.get("canApply")), title=info.get("title"),
                 location=" | ".join(locs), pay=pays(jd), jd=jd,
-                remote_txt=any(re.search(r"\bremote\b", l, re.I) for l in locs),
+                remote_txt=says_remote(*locs),
                 **extra)
 
 
-def workday_detail(base, ep, what, **extra):
-    """Fetch one CXS detail path under `base` and turn it into a verdict.
+def cxs_base(tenant, wd, site):
+    """The CXS API root for one Workday (tenant, data centre, site)."""
+    return f"https://{tenant}.{wd}.myworkdayjobs.com/wday/cxs/{tenant}/{site}"
+
+
+def cxs_record(st, body, what, **extra):
+    """One fetched CXS detail response as a verdict.
 
     `need` names the NESTED field the verdict is taken from, because the verdict is
-    bool(canApply) and `{"jobPostingInfo": {}}` at HTTP 200 satisfied a top-level check
-    and then CLOSED a posting nobody had read.
+    bool(canApply): a WAF's `{}` at HTTP 200 used to CLOSE the posting, and
+    `{"jobPostingInfo": {}}` satisfied a top-level check and then closed a posting nobody
+    had read.
     """
-    st, body = fetch(f"{base}/{ep}")
     if st != 200 or not body:
         return dict(ats="workday", live=None, status=st,
                     note=f"{what}: the CXS detail request answered HTTP {st}, so the "
@@ -915,6 +923,11 @@ def workday_detail(base, ep, what, **extra):
     if d is UNREADABLE:
         return unreadable("workday", st, what)
     return workday_record(d.get("jobPostingInfo", {}) or {}, **extra)
+
+
+def workday_detail(base, ep, what, **extra):
+    """Fetch one CXS detail path under `base` and turn it into a verdict."""
+    return cxs_record(*fetch(f"{base}/{ep}"), what, **extra)
 
 
 def workday_by_req(entry, rid):
@@ -940,7 +953,7 @@ def workday_by_req(entry, rid):
     in CLAUDE.md, where a tenant answers 436 at offset 0 and 0 at every offset after.
     """
     label, tenant, wd, site = entry
-    base = f"https://{tenant}.{wd}.myworkdayjobs.com/wday/cxs/{tenant}/{site}"
+    base = cxs_base(tenant, wd, site)
     # Compare CANONICAL ids, not substrings. `rid in externalPath` accepts R185011 while
     # resolving R13733 and then returns that other requisition's title, location and
     # liveness as this posting's; it also misses R-13733 against R13733, which is the same
@@ -1215,7 +1228,7 @@ def google_record(page, jid, st=200):
         return unknown("ds:0 record not in the known shape")
     return dict(ats="google", live=True, title=rec[1], org="google",
                 location=" | ".join(dict.fromkeys(locs)) or None, jd=jd, pay=pays(jd),
-                remote_txt=any(re.search(r"\bremote\b", L, re.I) for L in locs))
+                remote_txt=says_remote(*locs))
 
 
 def board_owns_host(listing, url):
@@ -1404,7 +1417,7 @@ def greenhouse_claim(u, allow_inference):
             if guessed:
                 good, listing = None, ""
                 for b in boards:
-                    bst, blist = fetch(f"https://boards-api.greenhouse.io/v1/boards/{b}/jobs")
+                    bst, blist = board_fetch(f"https://boards-api.greenhouse.io/v1/boards/{b}/jobs")
                     if bst == 200:
                         good, listing = b, blist
                         break
@@ -1617,7 +1630,7 @@ def resolve(url):
     m = re.search(OUTER_HOST + r"jobs\.ashbyhq\.com/([\w-]+)/([0-9a-f-]{16,})", ou)
     if m:
         org, jid = m.group(1), m.group(2)
-        st, body = fetch(f"https://api.ashbyhq.com/posting-api/job-board/{org}?includeCompensation=true")
+        st, body = board_fetch(f"https://api.ashbyhq.com/posting-api/job-board/{org}?includeCompensation=true")
         if st == 200 and body:
             d = jload(body, need=("jobs",))
             if d is UNREADABLE:
@@ -1660,7 +1673,7 @@ def resolve(url):
         if got:
             got["status"] = st
             return got
-        bst, bpage = fetch(f"https://jobs.ashbyhq.com/{org}")
+        bst, bpage = board_fetch(f"https://jobs.ashbyhq.com/{org}")
         rows = _ashby_embed.postings(bpage, org) if bst == 200 else []
         for r in rows:
             if str(r.get("id", "")).lower() == jid.lower():
@@ -1673,10 +1686,7 @@ def resolve(url):
                             pay=pays(k_band(r.get("comp") or "")), embedded=True, status=st,
                             comp_summary=r.get("comp") or None,
                             note="read from the embedded board; the listing carries no JD",
-                            remote_txt=bool(re.search(
-                                r"\bremote\b",
-                                (r.get("workplace") or "") + " " + (r.get("location") or ""),
-                                re.I)))
+                            remote_txt=says_remote(r.get("workplace"), r.get("location")))
         if rows:
             # The board page parsed and this id is not on it. Same evidence, same verdict
             # as the API path above.
@@ -1708,8 +1718,7 @@ def resolve(url):
                         location=" | ".join(locs),
                         pay=pays(txt), jd=txt,
                         workplace=d.get("workplaceType"),
-                        remote_txt=bool(re.search(r"\bremote\b", " ".join(locs), re.I))
-                                   or bool(re.search(r"\bremote\b", txt, re.I)))
+                        remote_txt=says_remote(*locs, txt))
         return dict(ats="lever", live=unresolved(st), status=st,
                     note=gone_note(st))
 
@@ -1732,32 +1741,18 @@ def resolve(url):
                          f"its 404 would be about the fabricated path, not the posting")
     if m:
         tenant, wd, site, path = m.groups()
-        st, body = fetch(f"https://{tenant}.{wd}.myworkdayjobs.com/wday/cxs/{tenant}/{site}/{path}")
+        base = cxs_base(tenant, wd, site)
+        st, body = fetch(f"{base}/{path}")
         if st == 200 and body:
-            # Without jobPostingInfo there is no canApply, and bool(None) is False, so a
-            # WAF's `{}` at HTTP 200 used to CLOSE the posting rather than admit it had
-            # not been read. The NESTED spelling is the same bug one level down:
-            # `{"jobPostingInfo": {}}` satisfied a top-level `jobPostingInfo` check and
-            # then closed the posting on an empty record. The verdict below is
-            # bool(canApply), so canApply is what has to have been read.
-            d = jload(body, need=("jobPostingInfo.canApply",))
-            if d is UNREADABLE:
-                return unreadable("workday", st, "the CXS detail response")
-            return workday_record(d.get("jobPostingInfo", {}) or {})
+            return cxs_record(st, body, "the CXS detail response")
         if st == 403:
             # Stale slug, not a closure. Ask the tenant for the current path.
             ep, searched = workday_reslug(tenant, wd, site, path)
             if ep:
-                st2, body2 = fetch(f"https://{tenant}.{wd}.myworkdayjobs.com/wday/cxs/{tenant}/{site}/{ep}")
+                st2, body2 = fetch(f"{base}/{ep}")
                 if st2 == 200 and body2:
-                    # Same nested declaration as the direct path: the re-slugged branch
-                    # issues the same bool(canApply) verdict off the same record.
-                    d2 = jload(body2, need=("jobPostingInfo.canApply",))
-                    if d2 is UNREADABLE:
-                        return unreadable("workday", st2,
-                                          "the re-slugged CXS detail response")
-                    return workday_record(d2.get("jobPostingInfo", {}) or {},
-                                          reslugged=True)
+                    return cxs_record(st2, body2, "the re-slugged CXS detail response",
+                                      reslugged=True)
             # Search saw nothing carrying this req id, which for Workday means the
             # posting is no longer in the active index. That verdict rests entirely on
             # the search having RUN: if CXS refused it, timed out or returned something
@@ -1820,7 +1815,7 @@ def resolve(url):
             return dict(ats=ats, live=True, title=j.get("name"), jd=txt,
                         org=(domain or ehost).split(".")[0],
                         location=" | ".join(j.get("locations") or [j.get("location", "")]),
-                        pay=pays(txt), remote_txt=bool(re.search(r"\bremote\b", txt, re.I)))
+                        pay=pays(txt), remote_txt=says_remote(txt))
         if declared:
             return dict(ats=ats, live=unresolved(st), status=st, note=gone_note(st))
         return dict(ats=ats, live=None, status=st,
@@ -1848,7 +1843,7 @@ def resolve(url):
                         org=company,
                         location=", ".join([p for p in parts if p]), jd=txt, pay=pays(txt),
                         remote_txt=bool(loc.get("remote")) or
-                                   bool(re.search(r"\bremote\b", txt, re.I)))
+                                   says_remote(txt))
         return dict(ats="smartrecruiters", live=unresolved(st), status=st,
                     note=gone_note(st))
 
@@ -1874,7 +1869,7 @@ def resolve(url):
                         location=" | ".join(locs) or None, jd=txt, pay=pays(txt),
                         req_id=d.get("jobNumber") or d.get("reqId"), level=lvl or None,
                         remote_txt=bool(d.get("homeOffice")) or
-                                   bool(re.search(r"\bremote\b", txt, re.I)))
+                                   says_remote(txt))
         # 410 joins 404 here for the same reason it does everywhere else: Apple's detail
         # page answering either is Apple saying the posting is not there, and the branch
         # below would otherwise report a stated removal as "re-check the parser".
@@ -1906,7 +1901,7 @@ def resolve(url):
                         title=html.unescape(title.group(1)).strip() if title else None,
                         location=loc.group(1).strip() if loc else None,
                         jd=txt, pay=pays(txt),
-                        remote_txt=bool(re.search(r"\bremote\b", txt, re.I)))
+                        remote_txt=says_remote(txt))
         # Decline ONLY when a page was actually read and DISPROVED the platform. The shape
         # `/job/<slug>/<digits>` is a common layout rather than a SuccessFactors signature:
         # it also matches builtin.com, whose row was answered "not retrievable" by an
@@ -1961,7 +1956,7 @@ def resolve(url):
     m = re.search(OUTER_HOST + r"([\w-]+)\.breezy\.hr/p/([0-9a-f]+)", ou)
     if m:
         org, pid = m.group(1), m.group(2)
-        st, body = fetch(f"https://{org}.breezy.hr/json")
+        st, body = board_fetch(f"https://{org}.breezy.hr/json")
         if st == 200 and body:
             board = jload(body, want=list)
             if board is UNREADABLE:
@@ -1978,24 +1973,22 @@ def resolve(url):
             for j in postings:
                 if str(j.get("id", "")).lower() != pid.lower():
                     continue
+                places = j.get("locations") or [j.get("location") or {}]
+                name = lambda v: v.get("name") if isinstance(v, dict) else v
                 locs = []
-                for L in (j.get("locations") or [j.get("location") or {}]):
-                    parts = [(L.get("city") or {}).get("name") if isinstance(L.get("city"), dict) else L.get("city"),
-                             (L.get("state") or {}).get("name") if isinstance(L.get("state"), dict) else L.get("state"),
-                             (L.get("country") or {}).get("name") if isinstance(L.get("country"), dict) else L.get("country")]
-                    s = ", ".join([x for x in parts if x])
+                for L in places:
+                    s = ", ".join(x for x in (name(L.get(k)) for k in ("city", "state", "country")) if x)
                     if L.get("is_remote"):
                         s = (s + " | Remote").strip(" |")
                     if s:
                         locs.append(s)
                 sal = j.get("salary") or {}
                 paytxt = " ".join(str(sal.get(k, "")) for k in ("min", "max", "currency"))
+                jd = clean(j.get("description", "") or "")
                 return dict(ats="breezy", live=True, title=j.get("name"), org=org,
                             location=" | ".join(dict.fromkeys(locs)) or None,
-                            jd=clean(j.get("description", "") or ""),
-                            pay=pays(paytxt) or pays(clean(j.get("description", "") or "")),
-                            remote_txt=any((L or {}).get("is_remote")
-                                           for L in (j.get("locations") or [j.get("location") or {}])))
+                            jd=jd, pay=pays(paytxt) or pays(jd),
+                            remote_txt=any((L or {}).get("is_remote") for L in places))
             return dict(ats="breezy", live=False, note="absent from board = closed")
         return dict(ats="breezy", live=None, status=st, note="board not retrievable")
 
@@ -2030,8 +2023,7 @@ def resolve(url):
                 return dict(ats="github", live=True, title=d.get("title"), org="github",
                             location=" | ".join(dict.fromkeys(locs)) or None,
                             jd=txt, pay=pays(txt),
-                            remote_txt=bool(re.search(r"\bremote\b",
-                                                     " ".join(locs) + " " + str(d.get("location_type") or ""), re.I)))
+                            remote_txt=says_remote(*locs, str(d.get("location_type") or "")))
             if not rows or (total is not None and seen >= total):
                 break
         # `total` is latched on page one and `seen` only grows, so this holds exactly when
@@ -2086,7 +2078,7 @@ def resolve(url):
             return dict(ats="atlassian", live=True, title=j.get("title"), org="atlassian",
                         location=" | ".join(dict.fromkeys(locs)) or None, jd=jd,
                         pay=(pays(clean(page)) if pst == 200 and page else []) or pays(jd),
-                        remote_txt=any(re.search(r"\bremote\b", L, re.I) for L in locs))
+                        remote_txt=says_remote(*locs))
         # The closure needs a board that plausibly IS the whole board. It carried 351
         # postings on 2026-10-08 in one unpaged array; a stub or a truncated answer that
         # still parses would otherwise close every row it happens to omit.
@@ -2124,10 +2116,7 @@ def resolve(url):
         tenant, jid = m.group(1), m.group(2)
         st, body = fetch(f"https://{tenant}.icims.com/jobs/{jid}/job?in_iframe=1",
                          accept=HTML_ACCEPT)
-        # No explicit GONE branch: the tail below already returns live=unresolved(st),
-        # which IS False for 404 and 410. A mutation showed the branch that used to sit
-        # here could be deleted without any case noticing, which is the definition of a
-        # line that is not doing anything.
+        # 404 and 410 close through the unresolved(st) tail below.
         if st == 200 and body:
             t = re.search(r"<title[^>]*>(.*?)</title>", body, re.S | re.I)
             title = clean(t.group(1)) if t else ""
@@ -2143,7 +2132,7 @@ def resolve(url):
                             title=title.split(" in ")[0].split(" | ")[0].strip(),
                             jd=txt, pay=pays(txt),
                             location=(loc.group(1).split("\\n")[0].strip() if loc else None),
-                            remote_txt=bool(re.search(r"\bremote\b", txt, re.I)))
+                            remote_txt=says_remote(txt))
             return unreadable("icims", st, "the iframe view (it loaded and named no job)")
         return dict(ats="icims", live=unresolved(st), status=st, note=gone_note(st))
 
@@ -2163,7 +2152,7 @@ def resolve(url):
     # eval-blockers.py already states in as many words. Without it `?utm_campaign=JR48085`
     # is taken as the req, workday_by_req() then reports a clean miss as live=False, and
     # inbox-liveness --mark retires a row on the strength of a marketing tag.
-    rid = WD_REQ_ID.search(u.split("?")[0].split("#")[0])
+    rid = WD_REQ_ID.search(ou)
     if wd and rid:
         got = workday_by_req(wd, rid.group(0))
         if got is not None:
@@ -2353,7 +2342,6 @@ def behaviour_cases():
             print(f"FAIL  {msg}")
 
     def with_fetch(fake, url):
-        _BOARDS.clear()
         with mock.patch.object(sys.modules[__name__], "fetch", fake):
             return resolve(url)
 

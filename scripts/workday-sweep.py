@@ -571,7 +571,7 @@ def _selftest():
     # Run against a FIXTURE tracker, never the user's own data/applications.md, and with
     # fictional employers: the property under test is company-scoped keying, which needs
     # only that two tenants land on the same bare number, not which real employers do.
-    import tempfile
+    import shutil, tempfile
     fx = os.path.join(tempfile.mkdtemp(prefix="wdsweep-"), "applications.md")
     with open(fx, "w", encoding="utf-8") as fh:
         fh.write("| # | Date | Company | Role | Score | Status | PDF | Report | Notes |\n"
@@ -587,6 +587,7 @@ def _selftest():
             fh.write(f"| {n} | 2026-08-01 | {co} | {role} | 4.0/5 | Evaluated | x | "
                      f"[{n}](reports/{n:03d}.md) | fixture |\n")
     known = tracked_urls(fx)
+    shutil.rmtree(os.path.dirname(fx), ignore_errors=True)
     if len(known) < 5:
         bad += 1
         print(f"  FAIL tracked_urls returned only {len(known)} req ids; dedup would be a no-op")

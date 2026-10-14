@@ -7,7 +7,8 @@
  * - 8-col: num\tdate\tcompany\trole\tstatus\tscore\tpdf\treport (no notes)
  * - Pipe-delimited (markdown table row): | col | col | ... |
  *
- * Dedup: company normalized + role fuzzy match + report number match
+ * Dedup: same company, then the same report number, a shared requisition id, or
+ * (when neither side has ids that conflict) a fuzzy role match.
  * If duplicate with higher score → update in-place, update report link
  * Validates status against states.yml (rejects non-canonical, logs warning)
  *
@@ -21,7 +22,8 @@ import { execFileSync } from 'child_process';
 import { createHash, randomUUID } from 'crypto';
 import { tmpdir } from 'os';
 import { normalizeReportLink as normalizeLink } from './tracker-links.mjs';
-import { roleFuzzyMatch, rowIdReader, idSetsOverlap, idSetsConflict } from './role-matcher.mjs';
+import { roleFuzzyMatch, rowIdReader, idSetsOverlap, idSetsConflict, companyKey } from './role-matcher.mjs';
+import { LEGACY_COLMAP, detectColumns, parseRow, parseScore, reportNumOf } from './tracker-rows.mjs';
 import { guardArgs } from './cli-guard.mjs';
 
 const CAREER_OPS = dirname(fileURLToPath(import.meta.url));
@@ -387,85 +389,11 @@ function validateStatus(status) {
   return 'Evaluated';
 }
 
-/**
- * Normalize company names for duplicate lookup during tracker merges.
- *
- * Company names can contain spaces, punctuation, or branding variants in the
- * tracker and incoming TSV rows. Removing non-alphanumeric characters gives the
- * merge step a stable same-company key before it compares report numbers or
- * fuzzy role titles.
- *
- * @param {string} name - Company name from the tracker or addition row.
- * @returns {string} Lowercase alphanumeric company key.
- */
-function normalizeCompany(name) {
-  return name.toLowerCase().replace(/[^a-z0-9]/g, '');
-}
-
-/**
- * Extract the bracketed report number from a Markdown report link.
- *
- * Report-number equality is an exact duplicate signal, but only after company
- * equality is confirmed by the caller. This helper reads links such as
- * `[123](../reports/123-company-role-date.md)` and returns the numeric id.
- *
- * @param {string} reportStr - Raw report cell from applications.md or TSV input.
- * @returns {number|null} Parsed report number, or null when absent.
- */
-function extractReportNum(reportStr) {
-  const m = reportStr.match(/\[(\d+)\]/);
-  return m ? parseInt(m[1]) : null;
-}
-
 // A row's identity SET (role-matcher.mjs rowIdReader), memoised for this run.
 const jobIdsForRow = rowIdReader(TRACKER_DIR);
 
-/**
- * Parse a score cell into a numeric value for score-upgrade decisions.
- *
- * The merge path compares old and new scores to decide whether to update an
- * existing duplicate row. Markdown bolding and `/5` suffixes are presentation
- * details, so only the first numeric value is used.
- *
- * @param {string} s - Raw score cell such as `4.2/5`.
- * @returns {number} Parsed score, or 0 when no numeric value is present.
- */
-function parseScore(s) {
-  const m = s.replace(/\*\*/g, '').match(/([\d.]+)/);
-  return m ? parseFloat(m[1]) : 0;
-}
-
-// Column layout for the applications.md table. The tracker may use the original
-// 9-column layout, or a customized one with an extra/reordered column (e.g. a
-// Location column after Role). We map columns by header NAME rather than fixed
-// position so both work — fixed-position indexing would otherwise read, say,
-// Location where it expects Score. Falls back to the legacy layout when no
-// recognizable header row is found.
-const LEGACY_COLMAP = { num: 1, date: 2, company: 3, role: 4, score: 5, status: 6, pdf: 7, report: 8, notes: 9 };
+// The tracker's column layout (tracker-rows.mjs), detected from its header below.
 let COLMAP = LEGACY_COLMAP;
-
-const HEADER_ALIASES = {
-  '#': 'num', 'num': 'num', 'date': 'date', 'company': 'company', 'empresa': 'company',
-  'role': 'role', 'puesto': 'role', 'location': 'location', 'score': 'score',
-  'status': 'status', 'pdf': 'pdf', 'report': 'report', 'notes': 'notes',
-};
-
-// Scan the table for a header row and build a header-name → column-index map.
-// Indexing matches `line.split('|')` (leading empty cell before the first pipe),
-// the same split parseAppLine uses. Returns null — caller keeps the legacy
-// layout — unless the essential columns are all present, so a stray pipe line
-// can't yield a bogus mapping.
-function detectColumns(lines) {
-  for (const line of lines) {
-    if (!line.startsWith('|')) continue;
-    const cells = line.split('|').map(s => s.trim().toLowerCase());
-    if (!cells.includes('company') || !cells.includes('role')) continue;
-    const map = {};
-    cells.forEach((c, i) => { if (HEADER_ALIASES[c] != null) map[HEADER_ALIASES[c]] = i; });
-    if (['num', 'company', 'role', 'score', 'status'].every(k => map[k] != null)) return map;
-  }
-  return null;
-}
 
 // Build a tracker row string matching the detected layout (with or without the
 // optional Location column) so writes round-trip through the same schema.
@@ -476,36 +404,14 @@ function buildRow(o) {
   return `| ${o.num} | ${o.date} | ${o.company} | ${o.role} | ${o.score} | ${o.status} | ${o.pdf} | ${o.report} | ${o.notes} |`;
 }
 
-/**
- * Parse one Markdown applications.md table row into a tracker object.
- *
- * Header/separator rows and malformed rows return null. Valid rows preserve the
- * original raw line so the merge logic can locate and replace the exact tracker
- * line when a higher-scored re-evaluation arrives.
- *
- * @param {string} line - One line from applications.md.
- * @returns {object|null} Parsed tracker row, or null for non-data rows.
- */
+/** A tracker data row, or null; row #0 is never an application. */
 function parseAppLine(line) {
-  const parts = line.split('|').map(s => s.trim());
-  const maxIdx = Math.max(...Object.values(COLMAP));
-  if (parts.length <= maxIdx) return null;
-  const num = parseInt(parts[COLMAP.num]);
-  if (isNaN(num) || num === 0) return null;
-  return {
-    num,
-    date: parts[COLMAP.date],
-    company: parts[COLMAP.company],
-    role: parts[COLMAP.role],
-    location: COLMAP.location != null ? parts[COLMAP.location] : '',
-    score: parts[COLMAP.score],
-    status: parts[COLMAP.status],
-    pdf: parts[COLMAP.pdf],
-    report: parts[COLMAP.report],
-    notes: COLMAP.notes != null ? (parts[COLMAP.notes] || '') : '',
-    raw: line,
-  };
+  const row = parseRow(line, COLMAP);
+  return row && row.num !== 0 ? row : null;
 }
+
+const TSV_SCORE = /^(?:\d+\.?\d*\/5|N\/A|DUP)$/;
+const TSV_STATUS = /^(evaluated|applied|responded|interview|offer|rejected|discarded|skip|evaluada|aplicado|respondido|entrevista|oferta|rechazado|descartado|no aplicar|cerrada|duplicado|repost|condicional|hold|monitor)/i;
 
 /**
  * Parse a TSV file content into a structured addition object.
@@ -554,29 +460,12 @@ function parseTsvContent(content, filename) {
       return null;
     }
 
-    // Detect column order: some TSVs have (status, score), others have (score, status)
-    // Heuristic: if col4 looks like a score and col5 looks like a status, they're swapped
+    // Status comes before score, except in TSVs that wrote them the other way
+    // round: swap only when col4 reads as a score AND col5 as a status.
     const col4 = parts[4].trim();
     const col5 = parts[5].trim();
-    const col4LooksLikeScore = /^\d+\.?\d*\/5$/.test(col4) || col4 === 'N/A' || col4 === 'DUP';
-    const col5LooksLikeScore = /^\d+\.?\d*\/5$/.test(col5) || col5 === 'N/A' || col5 === 'DUP';
-    const col4LooksLikeStatus = /^(evaluated|applied|responded|interview|offer|rejected|discarded|skip|evaluada|aplicado|respondido|entrevista|oferta|rechazado|descartado|no aplicar|cerrada|duplicado|repost|condicional|hold|monitor)/i.test(col4);
-    const col5LooksLikeStatus = /^(evaluated|applied|responded|interview|offer|rejected|discarded|skip|evaluada|aplicado|respondido|entrevista|oferta|rechazado|descartado|no aplicar|cerrada|duplicado|repost|condicional|hold|monitor)/i.test(col5);
-
-    let statusCol, scoreCol;
-    if (col4LooksLikeStatus && !col4LooksLikeScore) {
-      // Standard format: col4=status, col5=score
-      statusCol = col4; scoreCol = col5;
-    } else if (col4LooksLikeScore && col5LooksLikeStatus) {
-      // Swapped format: col4=score, col5=status
-      statusCol = col5; scoreCol = col4;
-    } else if (col5LooksLikeScore && !col4LooksLikeScore) {
-      // col5 is definitely score → col4 must be status
-      statusCol = col4; scoreCol = col5;
-    } else {
-      // Default: standard format (status before score)
-      statusCol = col4; scoreCol = col5;
-    }
+    const swapped = TSV_SCORE.test(col4) && TSV_STATUS.test(col5);
+    const [statusCol, scoreCol] = swapped ? [col5, col4] : [col4, col5];
 
     addition = {
       num: parseInt(parts[0]),
@@ -716,8 +605,8 @@ for (const file of tsvFiles) {
   // 3. A fuzzy title match, never across conflicting ids
   // Deliberately NOT by row number: the TSV num is the report number, an independent
   // sequence, so that match folded unrelated reqs together (test-all pins it).
-  const reportNum = extractReportNum(addition.report);
-  const normCompany = normalizeCompany(addition.company);
+  const reportNum = reportNumOf(addition.report);
+  const normCompany = companyKey(addition.company);
   let duplicate = null;
 
   if (reportNum) {
@@ -727,8 +616,8 @@ for (const file of tsvFiles) {
     // Without the company guard, a NewCo TSV with report [1] silently overwrites
     // the existing tracker row [1] belonging to an unrelated company.
     duplicate = existingApps.find(app => {
-      const existingReportNum = extractReportNum(app.report);
-      return existingReportNum === reportNum && normalizeCompany(app.company) === normCompany;
+      const existingReportNum = reportNumOf(app.report);
+      return existingReportNum === reportNum && companyKey(app.company) === normCompany;
     });
   }
 
@@ -739,7 +628,7 @@ for (const file of tsvFiles) {
     // domain but differ in specialty/seniority (e.g. "Principal ML Engineer,
     // Agentic AI" vs "Senior ML Engineer"), so it is used only as a fallback and
     // is never allowed to merge a pair whose ids conflict.
-    const sameCompany = existingApps.filter(app => normalizeCompany(app.company) === normCompany);
+    const sameCompany = existingApps.filter(app => companyKey(app.company) === normCompany);
     const additionIds = jobIdsForRow(addition);
 
     if (additionIds.size) {
@@ -792,20 +681,9 @@ for (const file of tsvFiles) {
   }
 }
 
-// Insert new lines after the header (line index of first data row)
-if (newLines.length > 0) {
-  // Find header separator (|---|...) and insert after it
-  let insertIdx = -1;
-  for (let i = 0; i < appLines.length; i++) {
-    if (isSeparatorRow(appLines[i])) {
-      insertIdx = i + 1;
-      break;
-    }
-  }
-  if (insertIdx >= 0) {
-    appLines.splice(insertIdx, 0, ...newLines);
-  }
-}
+// Insert new lines right after the header separator (|---|...).
+const separatorIdx = appLines.findIndex(isSeparatorRow);
+if (separatorIdx >= 0) appLines.splice(separatorIdx + 1, 0, ...newLines);
 
 // Write back
 if (!DRY_RUN) {
@@ -822,7 +700,7 @@ if (!DRY_RUN) {
   writeFileAtomic(APPS_FILE, appLines.join('\n'));
 
   // Move processed files to merged/
-  if (!existsSync(MERGED_DIR)) mkdirSync(MERGED_DIR, { recursive: true });
+  mkdirSync(MERGED_DIR, { recursive: true });
   for (const file of tsvFiles) {
     renameSync(join(ADDITIONS_DIR, file), join(MERGED_DIR, file));
   }

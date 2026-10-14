@@ -26,7 +26,9 @@ const NODE = process.execPath;
 // at an empty directory for this whole run, children included, so the suite sees no
 // configuration at all: a result must not depend on whose profile, location policy or
 // lane vocabulary happens to be installed. Tests that need a config build their own.
-process.env.CAREER_OPS_CONFIG_DIR = mkdtempSync(join(tmpdir(), 'career-ops-noconfig-'));
+const NO_CONFIG = mkdtempSync(join(tmpdir(), 'career-ops-noconfig-'));
+process.env.CAREER_OPS_CONFIG_DIR = NO_CONFIG;
+process.on('exit', () => rmSync(NO_CONFIG, { recursive: true, force: true }));
 
 let passed = 0;
 let failed = 0;
@@ -1651,6 +1653,7 @@ try {
     } else {
       fail('dedup-tracker did not refuse an unrecognised flag — a typo can rewrite the tracker');
     }
+    rmSync(dirname(tmpTracker), { recursive: true, force: true });
   }
 
   // ── Score units: the tracker states FINAL, not BASE ───────────────
@@ -3155,6 +3158,31 @@ console.log('\n🧪 Testing verify-board reports NOT CHECKED, not a silent pass,
   rmSync(noTrackerTmp, { recursive: true, force: true });
 }
 
+// One merge-tracker fixture: a tracker holding `rows`, report files and TSV additions,
+// merged in a temp dir. Returns the merged tracker text, or null if merge-tracker crashed;
+// `inspect(trackerPath)`, when given, runs after the merge and before the dir is removed.
+const TRACKER_HEAD = '# Applications Tracker\n\n' +
+  '| # | Date | Company | Role | Score | Status | PDF | Report | Notes |\n' +
+  '|---|------|---------|------|-------|--------|-----|--------|-------|\n';
+const mergeFixture = (prefix, { rows, reports = {}, tsvs = {}, inspect }) => {
+  const dir = mkdtempSync(join(tmpdir(), prefix));
+  try {
+    for (const d of ['data', 'reports', 'additions']) mkdirSync(join(dir, d));
+    const tracker = join(dir, 'data', 'applications.md');
+    writeFileSync(tracker, TRACKER_HEAD + rows.map(r => `${r}\n`).join(''));
+    for (const [f, body] of Object.entries(reports)) writeFileSync(join(dir, 'reports', f), `${body}\n`);
+    for (const [f, body] of Object.entries(tsvs)) writeFileSync(join(dir, 'additions', f), `${body}\n`);
+    const r = run(NODE, ['merge-tracker.mjs'], {
+      env: { ...process.env, CAREER_OPS_TRACKER: tracker, CAREER_OPS_ADDITIONS: join(dir, 'additions') },
+    });
+    if (r === null) return null;
+    inspect?.(tracker);
+    return readFileSync(tracker, 'utf-8');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+};
+
 // ── MERGE-TRACKER FUZZY DEDUP (#751 / #721 family) ──────────────
 // roleFuzzyMatch over-matched whenever the token overlap dominated the
 // SMALLER side: two distinct roles sharing a long prefix ("Full-Stack
@@ -3166,36 +3194,24 @@ console.log('\n🧪 Testing verify-board reports NOT CHECKED, not a silent pass,
 // distinct specialties fall below the 0.6 threshold.
 console.log('\n🧪 Testing merge-tracker fuzzy dedup (distinct roles vs reposts)...');
 try {
-  const mergeTmp = mkdtempSync(join(tmpdir(), 'career-ops-merge-'));
-  try {
-    mkdirSync(join(mergeTmp, 'data'));
-    mkdirSync(join(mergeTmp, 'reports'));
-    const additionsDir = join(mergeTmp, 'additions');
-    mkdirSync(additionsDir);
-    const tracker = join(mergeTmp, 'data', 'applications.md');
-    writeFileSync(tracker,
-      '# Applications Tracker\n\n' +
-      '| # | Date | Company | Role | Score | Status | PDF | Report | Notes |\n' +
-      '|---|------|---------|------|-------|--------|-----|--------|-------|\n' +
-      '| 1 | 2026-01-04 | StreamCo | Full Stack Engineer 5, Ads Reporting | 4.4/5 | Evaluated | ❌ | [1](../reports/001-streamco-2026-01-04.md) | existing |\n' +
-      '| 2 | 2026-01-04 | Uber | Senior Software Engineer, Consumer Fulfillment (UberEats) | 4.2/5 | Evaluated | ❌ | [2](../reports/002-uber-2026-01-04.md) | existing |\n');
-    for (const n of ['001-streamco-2026-01-04', '002-uber-2026-01-04', '003-streamco-2026-01-05', '004-uber-2026-01-05', '005-streamco-2026-01-06']) {
-      writeFileSync(join(mergeTmp, 'reports', `${n}.md`), '# fixture\n');
-    }
-    // Two DISTINCT roles (long shared prefix / shared brand token) + one true repost (score bump).
-    writeFileSync(join(additionsDir, '003-streamco.tsv'),
-      '3\t2026-01-05\tStreamCo\tFull-Stack Engineer 5, AI Insights & Visualizations\tEvaluated\t4.6/5\t❌\t[3](reports/003-streamco-2026-01-05.md)\tdistinct role\n');
-    writeFileSync(join(additionsDir, '004-uber.tsv'),
-      '4\t2026-01-05\tUber\tSenior Software Engineer, UberEats Feed\tEvaluated\t4.1/5\t❌\t[4](reports/004-uber-2026-01-05.md)\tdistinct team (#751)\n');
-    writeFileSync(join(additionsDir, '005-streamco.tsv'),
-      '5\t2026-01-06\tStreamCo\tFull Stack Engineer 5, Ads Reporting\tEvaluated\t4.5/5\t❌\t[5](reports/005-streamco-2026-01-06.md)\trepost\n');
-
-    const mergeResult = run(NODE, ['merge-tracker.mjs'], { env: { ...process.env, CAREER_OPS_TRACKER: tracker, CAREER_OPS_ADDITIONS: additionsDir } });
-    if (mergeResult === null) {
+  {
+    const merged = mergeFixture('career-ops-merge-', {
+      rows: [
+        '| 1 | 2026-01-04 | StreamCo | Full Stack Engineer 5, Ads Reporting | 4.4/5 | Evaluated | ❌ | [1](../reports/001-streamco-2026-01-04.md) | existing |',
+        '| 2 | 2026-01-04 | Uber | Senior Software Engineer, Consumer Fulfillment (UberEats) | 4.2/5 | Evaluated | ❌ | [2](../reports/002-uber-2026-01-04.md) | existing |',
+      ],
+      reports: Object.fromEntries(['001-streamco-2026-01-04', '002-uber-2026-01-04', '003-streamco-2026-01-05',
+        '004-uber-2026-01-05', '005-streamco-2026-01-06'].map(n => [`${n}.md`, '# fixture'])),
+      // Two DISTINCT roles (long shared prefix / shared brand token) + one true repost (score bump).
+      tsvs: {
+        '003-streamco.tsv': '3\t2026-01-05\tStreamCo\tFull-Stack Engineer 5, AI Insights & Visualizations\tEvaluated\t4.6/5\t❌\t[3](reports/003-streamco-2026-01-05.md)\tdistinct role',
+        '004-uber.tsv': '4\t2026-01-05\tUber\tSenior Software Engineer, UberEats Feed\tEvaluated\t4.1/5\t❌\t[4](reports/004-uber-2026-01-05.md)\tdistinct team (#751)',
+        '005-streamco.tsv': '5\t2026-01-06\tStreamCo\tFull Stack Engineer 5, Ads Reporting\tEvaluated\t4.5/5\t❌\t[5](reports/005-streamco-2026-01-06.md)\trepost',
+      },
+    });
+    if (merged === null) {
       fail('merge-tracker.mjs crashed during fuzzy dedup regression test');
     } else {
-      const merged = readFileSync(tracker, 'utf-8');
-
       // Distinct role sharing a long prefix must be ADDED, not folded into the existing row.
       if (merged.includes('AI Insights & Visualizations') && merged.includes('Ads Reporting')) {
         pass('distinct roles with shared prefix kept as separate rows');
@@ -3218,8 +3234,6 @@ try {
         fail(`repost handling broken: ${adsRows.length} 'Ads Reporting' rows, expected 1 updated to 4.5/5`);
       }
     }
-  } finally {
-    rmSync(mergeTmp, { recursive: true, force: true });
   }
 } catch (e) {
   fail(`merge-tracker fuzzy dedup tests crashed: ${e.message}`);
@@ -3321,28 +3335,6 @@ try {
     pass('fuzzy no longer matches the distinct pair (extra safety layer)');
   }
 
-  // One merge-tracker fixture: a tracker holding `rows`, report files and TSV additions,
-  // merged in a temp dir. Returns the merged tracker text, or null if merge-tracker crashed.
-  const TRACKER_HEAD = '# Applications Tracker\n\n' +
-    '| # | Date | Company | Role | Score | Status | PDF | Report | Notes |\n' +
-    '|---|------|---------|------|-------|--------|-----|--------|-------|\n';
-  const mergeFixture = (prefix, { rows, reports = {}, tsvs = {} }) => {
-    const dir = mkdtempSync(join(tmpdir(), prefix));
-    try {
-      for (const d of ['data', 'reports', 'additions']) mkdirSync(join(dir, d));
-      const tracker = join(dir, 'data', 'applications.md');
-      writeFileSync(tracker, TRACKER_HEAD + rows.map(r => `${r}\n`).join(''));
-      for (const [f, body] of Object.entries(reports)) writeFileSync(join(dir, 'reports', f), `${body}\n`);
-      for (const [f, body] of Object.entries(tsvs)) writeFileSync(join(dir, 'additions', f), `${body}\n`);
-      const r = run(NODE, ['merge-tracker.mjs'], {
-        env: { ...process.env, CAREER_OPS_TRACKER: tracker, CAREER_OPS_ADDITIONS: join(dir, 'additions') },
-      });
-      return r === null ? null : readFileSync(tracker, 'utf-8');
-    } finally {
-      rmSync(dir, { recursive: true, force: true });
-    }
-  };
-
   // integration: merge-tracker must ADD a distinct-job-id role, not clobber the existing one
   {
     const m = mergeFixture('career-ops-jobid-', {
@@ -3436,41 +3428,24 @@ try {
 // recoverable.
 console.log('\n🧪 Testing merge-tracker backup-on-write...');
 try {
-  const bTmp = mkdtempSync(join(tmpdir(), 'career-ops-merge-bak-'));
-  try {
-    mkdirSync(join(bTmp, 'data'));
-    mkdirSync(join(bTmp, 'reports'));
-    const bAdds = join(bTmp, 'additions');
-    mkdirSync(bAdds);
-    const bTracker = join(bTmp, 'data', 'applications.md');
-    const original =
-      '# Applications Tracker\n\n' +
-      '| # | Date | Company | Role | Score | Status | PDF | Report | Notes |\n' +
-      '|---|------|---------|------|-------|--------|-----|--------|-------|\n' +
-      '| 1 | 2026-01-04 | BackupCo | Widget Engineer | 4.0/5 | Evaluated | ❌ | [1](../reports/001-backupco.md) | original row |\n';
-    writeFileSync(bTracker, original);
-    writeFileSync(join(bTmp, 'reports', '001-backupco.md'), '# fixture\n');
-    writeFileSync(join(bTmp, 'reports', '002-backupco.md'), '# fixture\n');
-    writeFileSync(join(bAdds, '002-backupco.tsv'),
-      '2\t2026-01-05\tBackupCo\tGadget Engineer\tEvaluated\t4.1/5\t❌\t[2](reports/002-backupco.md)\tnew row\n');
-
-    const bMerge = run(NODE, ['merge-tracker.mjs'], { env: { ...process.env, CAREER_OPS_TRACKER: bTracker, CAREER_OPS_ADDITIONS: bAdds } });
-    if (bMerge === null) {
-      fail('merge-tracker crashed during backup test');
-    } else if (!existsSync(`${bTracker}.bak`)) {
-      fail('merge-tracker did not write a .bak snapshot before the destructive write');
-    } else if (readFileSync(`${bTracker}.bak`, 'utf-8') !== original) {
-      fail('merge-tracker .bak does not match the pre-merge tracker content');
-    } else {
-      const merged = readFileSync(bTracker, 'utf-8');
-      if (merged.includes('Gadget Engineer') && merged.includes('Widget Engineer')) {
-        pass('merge-tracker writes a pre-merge .bak and still applies the merge');
-      } else {
-        fail('merge-tracker merge did not apply after backup');
-      }
-    }
-  } finally {
-    rmSync(bTmp, { recursive: true, force: true });
+  const row = '| 1 | 2026-01-04 | BackupCo | Widget Engineer | 4.0/5 | Evaluated | ❌ | [1](../reports/001-backupco.md) | original row |';
+  let bak = null;
+  const merged = mergeFixture('career-ops-merge-bak-', {
+    rows: [row],
+    reports: { '001-backupco.md': '# fixture', '002-backupco.md': '# fixture' },
+    tsvs: { '002-backupco.tsv': '2\t2026-01-05\tBackupCo\tGadget Engineer\tEvaluated\t4.1/5\t❌\t[2](reports/002-backupco.md)\tnew row' },
+    inspect: (tracker) => { if (existsSync(`${tracker}.bak`)) bak = readFileSync(`${tracker}.bak`, 'utf-8'); },
+  });
+  if (merged === null) {
+    fail('merge-tracker crashed during backup test');
+  } else if (bak === null) {
+    fail('merge-tracker did not write a .bak snapshot before the destructive write');
+  } else if (bak !== `${TRACKER_HEAD}${row}\n`) {
+    fail('merge-tracker .bak does not match the pre-merge tracker content');
+  } else if (merged.includes('Gadget Engineer') && merged.includes('Widget Engineer')) {
+    pass('merge-tracker writes a pre-merge .bak and still applies the merge');
+  } else {
+    fail('merge-tracker merge did not apply after backup');
   }
 } catch (e) {
   fail(`merge-tracker backup test crashed: ${e.message}`);
@@ -3482,33 +3457,16 @@ try {
 // update it in-place instead of appending NewCo as a new row.
 console.log('\n🧪 Testing merge-tracker report-number cross-company collision (#912)...');
 try {
-  const col912Tmp = mkdtempSync(join(tmpdir(), 'career-ops-merge-912-'));
-  try {
-    mkdirSync(join(col912Tmp, 'data'));
-    mkdirSync(join(col912Tmp, 'reports'));
-    const col912Additions = join(col912Tmp, 'additions');
-    mkdirSync(col912Additions);
-
-    const col912Tracker = join(col912Tmp, 'data', 'applications.md');
-    writeFileSync(col912Tracker,
-      '# Applications Tracker\n\n' +
-      '| # | Date | Company | Role | Score | Status | PDF | Report | Notes |\n' +
-      '|---|------|---------|------|-------|--------|-----|--------|-------|\n' +
-      '| 1 | 2026-01-01 | OtherCo | Staff Engineer | 4.0/5 | Evaluated | ❌ | [1](../reports/001-otherco-2026-01-01.md) | original |\n');
-    writeFileSync(join(col912Tmp, 'reports', '001-otherco-2026-01-01.md'), '# fixture\n');
-    writeFileSync(join(col912Tmp, 'reports', '001-newco-2026-01-05.md'), '# fixture\n');
-
-    // NewCo TSV also carries report number [1] — cross-company collision
-    writeFileSync(join(col912Additions, '001-newco.tsv'),
-      '1\t2026-01-05\tNewCo\tNew Role\tEvaluated\t2.7/5\t❌\t[1](reports/001-newco-2026-01-05.md)\tcollision\n');
-
-    const col912Result = run(NODE, ['merge-tracker.mjs'], {
-      env: { ...process.env, CAREER_OPS_TRACKER: col912Tracker, CAREER_OPS_ADDITIONS: col912Additions },
+  {
+    const col912Merged = mergeFixture('career-ops-merge-912-', {
+      rows: ['| 1 | 2026-01-01 | OtherCo | Staff Engineer | 4.0/5 | Evaluated | ❌ | [1](../reports/001-otherco-2026-01-01.md) | original |'],
+      reports: { '001-otherco-2026-01-01.md': '# fixture', '001-newco-2026-01-05.md': '# fixture' },
+      // NewCo TSV also carries report number [1] — cross-company collision
+      tsvs: { '001-newco.tsv': '1\t2026-01-05\tNewCo\tNew Role\tEvaluated\t2.7/5\t❌\t[1](reports/001-newco-2026-01-05.md)\tcollision' },
     });
-    if (col912Result === null) {
+    if (col912Merged === null) {
       fail('merge-tracker crashed during report-number collision test (#912)');
     } else {
-      const col912Merged = readFileSync(col912Tracker, 'utf-8');
       const col912Rows = col912Merged.split('\n').filter(l => l.startsWith('| ') && !l.startsWith('| #') && !l.startsWith('|---'));
       const expectedOtherCoRow = '| 1 | 2026-01-01 | OtherCo | Staff Engineer | 4.0/5 | Evaluated | ❌ | [1](../reports/001-otherco-2026-01-01.md) | original |';
 
@@ -3531,8 +3489,6 @@ try {
         fail('report-number collision (#912): NewCo entry was swallowed or has incorrect data');
       }
     }
-  } finally {
-    rmSync(col912Tmp, { recursive: true, force: true });
   }
 } catch (e) {
   fail(`merge-tracker report-number collision test crashed: ${e.message}`);
@@ -5255,23 +5211,31 @@ const evalPacket = (over = {}) => JSON.stringify({
   live: true, num: null, ...over,
 }, null, 1);
 
+// One eval-write sandbox: a temp dir holding reports/ and batch/eval-queue/. `packet`
+// writes a queue packet and returns its path; `run` runs eval-write there, with `env`
+// added to the environment, and never throws.
+const evalWriteFixture = (prefix) => {
+  const dir = mkdtempSync(join(tmpdir(), prefix));
+  mkdirSync(join(dir, 'reports'));
+  mkdirSync(join(dir, 'batch', 'eval-queue'), { recursive: true });
+  const packet = (name, over) => {
+    const p = join(dir, 'batch', 'eval-queue', name);
+    writeFileSync(p, evalPacket(over));
+    return p;
+  };
+  const run = (argv, env = {}) => {
+    try {
+      return { code: 0, out: execFileSync(NODE, [join(ROOT, 'eval-write.mjs'), ...argv],
+        { cwd: dir, encoding: 'utf-8', timeout: 30000, env: { ...process.env, ...env } }) };
+    } catch (e) { return { code: e.status ?? 1, out: `${e.stdout || ''}${e.stderr || ''}` }; }
+  };
+  return { dir, packet, run };
+};
+
 console.log('\n🧪 Testing eval-write refuses to certify a posting it could not verify...');
 try {
-  const liveTmp = mkdtempSync(join(tmpdir(), 'career-ops-eval-write-live-'));
+  const { dir: liveTmp, packet, run: runWrite } = evalWriteFixture('career-ops-eval-write-live-');
   try {
-    mkdirSync(join(liveTmp, 'reports'));
-    mkdirSync(join(liveTmp, 'batch', 'eval-queue'), { recursive: true });
-    const packet = (name, over) => {
-      const p = join(liveTmp, 'batch', 'eval-queue', name);
-      writeFileSync(p, evalPacket(over));
-      return p;
-    };
-    const runWrite = (argv) => {
-      try {
-        return { code: 0, out: execFileSync(NODE, [join(ROOT, 'eval-write.mjs'), ...argv],
-          { cwd: liveTmp, encoding: 'utf-8', timeout: 30000 }) };
-      } catch (e) { return { code: e.status ?? 1, out: `${e.stdout || ''}${e.stderr || ''}` }; }
-    };
     const wroteSlug = (slug) => readdirSync(join(liveTmp, 'reports')).some(f => f.includes(slug));
 
     const unknown = runWrite([packet('unknown.json',
@@ -5341,32 +5305,20 @@ try {
 
 console.log('\n🧪 Testing eval-write allocates report numbers instead of demanding them...');
 try {
-  const numTmp = mkdtempSync(join(tmpdir(), 'career-ops-eval-write-num-'));
+  const { dir: numTmp, packet, run: runNum } = evalWriteFixture('career-ops-eval-write-num-');
   try {
-    mkdirSync(join(numTmp, 'reports'));
-    mkdirSync(join(numTmp, 'batch', 'eval-queue'), { recursive: true });
     // 600 is the highest finished report; 603 is a live reserve-report-num.mjs
     // sentinel, a slot another window is holding, so neither may be handed out
     // and the first allocation is 604.
     writeFileSync(join(numTmp, 'reports', '600-seed-fixture-2026-09-19.md'), '# 600 seed\n');
     writeFileSync(join(numTmp, 'reports', '603-RESERVED.md'), '');
-    const pk = (name, over) => {
-      const p = join(numTmp, 'batch', 'eval-queue', name);
-      // Each packet here stands for a DIFFERENT req, so each needs its own url.
-      // The fixture used to leave them all on the shared default, which was
-      // invisible while the prior-report search was prefiltered to one title slug
-      // and one date; eval-write now searches by requisition identity across the
-      // whole reports directory, and under that these were correctly one req.
-      // `over` still wins, so the rerun case below keeps its url by keeping its slug.
-      writeFileSync(p, evalPacket({ url: `https://example.invalid/fixture/job/${over.slug}`, ...over }));
-      return p;
-    };
-    const runNum = (argv) => {
-      try {
-        return { code: 0, out: execFileSync(NODE, [join(ROOT, 'eval-write.mjs'), ...argv],
-          { cwd: numTmp, encoding: 'utf-8', timeout: 30000 }) };
-      } catch (e) { return { code: e.status ?? 1, out: `${e.stdout || ''}${e.stderr || ''}` }; }
-    };
+    // Each packet here stands for a DIFFERENT req, so each needs its own url.
+    // The fixture used to leave them all on the shared default, which was
+    // invisible while the prior-report search was prefiltered to one title slug
+    // and one date; eval-write now searches by requisition identity across the
+    // whole reports directory, and under that these were correctly one req.
+    // `over` still wins, so the rerun case below keeps its url by keeping its slug.
+    const pk = (name, over) => packet(name, { url: `https://example.invalid/fixture/job/${over.slug}`, ...over });
 
     // Both packets in ONE invocation, which is where a naive max+1 hands the
     // same number out twice.
@@ -5489,21 +5441,8 @@ try {
 // never to dedup reqs by title.
 console.log('\n🧪 Testing eval-write keys report identity on the req, not the title...');
 try {
-  const idTmp = mkdtempSync(join(tmpdir(), 'career-ops-eval-write-id-'));
+  const { dir: idTmp, packet: pk, run: runId } = evalWriteFixture('career-ops-eval-write-id-');
   try {
-    mkdirSync(join(idTmp, 'reports'));
-    mkdirSync(join(idTmp, 'batch', 'eval-queue'), { recursive: true });
-    const pk = (name, over) => {
-      const p = join(idTmp, 'batch', 'eval-queue', name);
-      writeFileSync(p, evalPacket(over));
-      return p;
-    };
-    const runId = (argv) => {
-      try {
-        return { code: 0, out: execFileSync(NODE, [join(ROOT, 'eval-write.mjs'), ...argv],
-          { cwd: idTmp, encoding: 'utf-8', timeout: 30000 }) };
-      } catch (e) { return { code: e.status ?? 1, out: `${e.stdout || ''}${e.stderr || ''}` }; }
-    };
     const reportsFor = (slug) => readdirSync(join(idTmp, 'reports'))
       .filter(f => f.endsWith(`-${slug}-2026-09-19.md`));
 
@@ -5562,25 +5501,19 @@ try {
 // honours it.
 console.log('\n🧪 Testing eval-write gates comp only on a verified total band...');
 try {
-  const compTmp = mkdtempSync(join(tmpdir(), 'career-ops-eval-write-comp-'));
+  const { dir: compTmp, packet, run: runWrite } = evalWriteFixture('career-ops-eval-write-comp-');
   try {
-    mkdirSync(join(compTmp, 'reports'));
     mkdirSync(join(compTmp, 'config'));
     // The floor is configuration now, so this fixture supplies its own, as a real
     // setup would. 200 is a fixture value.
     writeFileSync(join(compTmp, 'config', 'profile.yml'),
       'compensation:\n  minimum: "USD 200K"\n');
-    mkdirSync(join(compTmp, 'batch', 'eval-queue'), { recursive: true });
     const SUB = '$120,000 - $150,000';   // well under the fixture's $200K total-comp floor
     const write = (slug, comp) => {
-      const p = join(compTmp, 'batch', 'eval-queue', `${slug}.json`);
-      writeFileSync(p, evalPacket({ slug, comp, url: `https://example.invalid/j/${slug}` }));
-      try {
-        // This fixture's own floor, not the suite-wide empty config directory.
-        execFileSync(NODE, [join(ROOT, 'eval-write.mjs'), p, '--date=2026-09-19'],
-          { cwd: compTmp, encoding: 'utf-8', timeout: 30000,
-            env: { ...process.env, CAREER_OPS_CONFIG_DIR: join(compTmp, 'config') } });
-      } catch { /* the assertions below read the disk, not the exit code */ }
+      // This fixture's own floor, not the suite-wide empty config directory. The
+      // assertions below read the disk, not the exit code.
+      runWrite([packet(`${slug}.json`, { slug, comp, url: `https://example.invalid/j/${slug}` }), '--date=2026-09-19'],
+        { CAREER_OPS_CONFIG_DIR: join(compTmp, 'config') });
       const f = readdirSync(join(compTmp, 'reports')).find(x => x.includes(`-${slug}-`));
       const body = f ? readFileSync(join(compTmp, 'reports', f), 'utf-8') : '';
       return { body, final: Number((body.match(/^final:\s*([\d.]+)/m) || [])[1]) };
@@ -5893,17 +5826,11 @@ try {
 
 console.log('\n🧪 Testing eval-write labels the tracker role cell from the shared pattern...');
 try {
-  const labTmp = mkdtempSync(join(tmpdir(), 'career-ops-eval-write-label-'));
+  const { dir: labTmp, packet, run: runWrite } = evalWriteFixture('career-ops-eval-write-label-');
   try {
-    mkdirSync(join(labTmp, 'reports'));
-    mkdirSync(join(labTmp, 'batch', 'eval-queue'), { recursive: true });
     const runLabel = (name, over) => {
-      const p = join(labTmp, 'batch', 'eval-queue', name);
-      writeFileSync(p, evalPacket(over));
-      try {
-        execFileSync(NODE, [join(ROOT, 'eval-write.mjs'), p, '--date=2026-09-19'],
-          { cwd: labTmp, encoding: 'utf-8', timeout: 30000 });
-      } catch (e) { return `RUN FAILED: ${e.stdout || ''}${e.stderr || ''}`; }
+      const r = runWrite([packet(name, over), '--date=2026-09-19']);
+      if (r.code !== 0) return `RUN FAILED: ${r.out}`;
       const dir = join(labTmp, 'batch', 'tracker-additions');
       const tsv = readdirSync(dir).filter(x => x.includes(over.slug));
       return tsv.length ? readFileSync(join(dir, tsv[0]), 'utf-8') : '';
@@ -5957,18 +5884,9 @@ try {
 // rule 3.
 console.log('\n🧪 Testing eval-write finds a prior report by req, not by title and date...');
 try {
-  const dupTmp = mkdtempSync(join(tmpdir(), 'career-ops-eval-write-dup-'));
+  const { dir: dupTmp, packet, run: runWrite } = evalWriteFixture('career-ops-eval-write-dup-');
   try {
-    mkdirSync(join(dupTmp, 'reports'));
-    mkdirSync(join(dupTmp, 'batch', 'eval-queue'), { recursive: true });
-    const runDup = (name, date, over) => {
-      const p = join(dupTmp, 'batch', 'eval-queue', name);
-      writeFileSync(p, evalPacket(over));
-      try {
-        return execFileSync(NODE, [join(ROOT, 'eval-write.mjs'), p, `--date=${date}`],
-          { cwd: dupTmp, encoding: 'utf-8', timeout: 30000 });
-      } catch (e) { return `${e.stdout || ''}${e.stderr || ''}`; }
-    };
+    const runDup = (name, date, over) => runWrite([packet(name, over), `--date=${date}`]).out;
     const URL_A = 'https://example.invalid/fixture/job/900001';
 
     runDup('first.json', '2026-09-01', { slug: 'alpha-title', url: URL_A });
@@ -6010,7 +5928,9 @@ try {
     // so it cannot be pulled in and called directly. Same idiom the requisition-pattern
     // scan uses: when behaviour cannot observe a rule, assert the rule.
     const ewSrc = readFileSync('eval-write.mjs', 'utf8');
-    const nu = ewSrc.slice(ewSrc.indexOf('const normUrl'), ewSrc.indexOf('const normCo'));
+    const nuAt = ewSrc.indexOf('const normUrl');
+    const nuEnd = nuAt < 0 ? -1 : ewSrc.indexOf('\n};', nuAt);
+    const nu = nuEnd < 0 ? '' : ewSrc.slice(nuAt, nuEnd);
     if (/m\[1\]\.toLowerCase\(\)\s*\+\s*m\[2\]\.toLowerCase\(\)\s*\+\s*m\[3\]/.test(nu)
         && !/m\[3\]\.toLowerCase/.test(nu)) {
       pass('eval-write normUrl folds scheme and host and leaves the path alone');

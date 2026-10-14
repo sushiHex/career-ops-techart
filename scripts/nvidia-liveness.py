@@ -16,7 +16,7 @@ Design notes (learned the hard way):
 Usage:  python scripts/nvidia-liveness.py JR2231011 JR2508244 [--json]
 """
 import sys, json, time, random, os, re, urllib.request, urllib.error
-from _httpctx import CTX, is_tls_failure
+from _httpctx import tls_context, is_tls_failure
 
 # Repo root, so the stored-slug fallback works from any working directory.
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -38,7 +38,7 @@ def _req(url, data=None, tries=5):
             r = urllib.request.Request(
                 url, data=(json.dumps(data).encode() if data is not None else None),
                 headers=HDRS, method=("POST" if data is not None else "GET"))
-            with urllib.request.urlopen(r, timeout=25, context=CTX) as resp:
+            with urllib.request.urlopen(r, timeout=25, context=tls_context()) as resp:
                 return True, resp.status, json.loads(resp.read().decode("utf-8", "replace"))
         except urllib.error.HTTPError as e:
             last = e.code

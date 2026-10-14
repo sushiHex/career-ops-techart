@@ -19,7 +19,7 @@ Run:
   python scripts/workday-peek.py <posting-url> [<posting-url> ...] [--json]
 """
 import json, os, re, subprocess, sys, urllib.request, urllib.error
-from _httpctx import CTX, is_tls_failure
+from _httpctx import tls_context, is_tls_failure
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/125.0 Safari/537.36")
@@ -45,7 +45,7 @@ def cxs_url(url):
 def get(url):
     try:
         r = urllib.request.Request(url, headers=HDRS)
-        with urllib.request.urlopen(r, timeout=25, context=CTX) as resp:
+        with urllib.request.urlopen(r, timeout=25, context=tls_context()) as resp:
             return resp.status, json.loads(resp.read().decode("utf-8", "replace"))
     except urllib.error.HTTPError as e:
         return e.code, None

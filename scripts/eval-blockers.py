@@ -94,6 +94,7 @@ def _load(mod_name, filename):
 _wd = _load("wdsweep", "workday-sweep.py")
 REQ_ID = _wd.REQ_ID
 tracked_key = _wd.tracked_key
+queue_packets = _wd._prep.queue_packets
 
 # Greenhouse puts the id in the query string, which is the one place a job
 # identity legitimately lives there. Ashby and Lever use a canonical UUID as a
@@ -147,8 +148,9 @@ def req_key(url, company):
     Tried in order: the shared Workday pattern, a Greenhouse gh_jid, an
     Ashby/Lever UUID. The order is immaterial in practice because the three key
     spaces cannot collide (hex holds no R or W, and a Greenhouse numeric id has
-    no letter prefix); role-matcher.mjs runs the host-specific rules first and
-    produces the same key for every url in reports/ and the queue.
+    no letter prefix). This is narrower than role-matcher.mjs, which also reads
+    host-anchored ids (Apple, Google, iCIMS, EA, Breezy) first; a url on those
+    hosts can go unmatched here, which reads as unreported and keeps the packet.
 
     Query and fragment are cut before the Workday pass, the rule jobKey()
     follows: a tracking parameter carrying a req-shaped token is not this
@@ -320,20 +322,11 @@ PRUNE_STATES = ("reported", "closed")
 
 
 def load_rows(queue=QUEUE, ix=None):
-    """Every packet in the queue with its blocker. Score dumps are skipped."""
-    if ix is None:
+    """Every packet in the queue with its blocker. The report index is read only if there is one."""
+    packets = list(queue_packets(queue))
+    if packets and ix is None:
         ix = report_index()
-    rows = []
-    for f in sorted(glob.glob(os.path.join(queue, "*.json"))):
-        try:
-            p = json.load(open(f, encoding="utf-8"))
-        except (OSError, ValueError):
-            continue
-        if not isinstance(p, dict):
-            # Score dumps (batch/eval-queue/_*-scores.json) are lists, not packets.
-            continue
-        rows.append((blocker(p, ix), p, f))
-    return rows
+    return [(blocker(p, ix), p, f) for f, p in packets]
 
 
 def free_path(dest_dir, base):
@@ -460,12 +453,7 @@ def main(argv=None):
             continue
         print(f"\n{k.upper()} ({len(sel)})")
         print("-" * 92)
-        # NOT SCORED is not scored zero. `lane_balance` is written by eval-assist.py, which
-        # is a separate step, so a freshly prepped packet has no such key at all and this
-        # printed a flat `lane 0` for every row: "Principal Engineer, Duo Agent Platform"
-        # read as having no lane vocabulary whatever. Unscored rows sort LAST rather than
-        # tying with genuine zeros, and print `-`, which is the answer that sends someone
-        # to run eval-assist instead of dismissing the row.
+        # Unscored rows sort last and print `-`, never `0`; lane_key says why.
         sel.sort(key=lambda r: lane_key(r[1]))
         for b, p, f in sel:
             c = (p.get("comp") or {}).get("posted") or "no band"
@@ -506,15 +494,6 @@ def selftest():
             fails.append(label)
             print(f"  FAIL {label}: got {got!r}, want {want!r}")
 
-    # A packet nobody has lane-scored must not tie with one scored zero, and must not
-    # outrank a scored row either. Sorted, not just displayed, because the READY list is
-    # read top-down and an unscored row sitting among the zeros is a row that gets skipped.
-    # `filled` means judged with no report behind it, so eval-write still has to run. It
-    # belongs in the pending half and must never be pruned, and those two facts have to
-    # agree: they did not, and the summary read as "nothing left to do".
-    # A judged packet whose liveness was never settled is NOT ready for eval-write:
-    # eval-write.mjs gates on `live !== true` and would refuse it, so telling the user to
-    # run it points at the wrong remediation. The blocker is the liveness.
     # Scheme and host fold; path, query and fragment do not. This lookup runs before the
     # requisition match, so conflating two postings that differ only by case made an
     # unevaluated packet read as `reported`, and --prune then moved it out of the queue.
@@ -528,16 +507,25 @@ def selftest():
 
     check("judged + live true -> filled",
           blocker({"match_w_cv": 3, "live": True}, ({}, {})), "filled")
+    # A judged packet whose liveness was never settled is NOT ready for eval-write:
+    # eval-write.mjs gates on `live !== true` and would refuse it, so telling the user to
+    # run it points at the wrong remediation. The blocker is the liveness.
     check("judged + liveness never settled -> liveness-unknown",
           blocker({"match_w_cv": 3, "live": None}, ({}, {})), "liveness-unknown")
     check("judged + closed is still closed",
           blocker({"match_w_cv": 3, "live": False}, ({}, {})), "closed")
 
+    # `filled` means judged with no report behind it, so eval-write still has to run. It
+    # belongs in the pending half and must never be pruned, and those two facts have to
+    # agree: they did not, and the summary read as "nothing left to do".
     check("filled counts as pending work", "filled" in PENDING, True)
     check("filled is never pruned", "filled" in PRUNE_STATES, False)
     check("every pruned state is a finished one",
           [s for s in PRUNE_STATES if s in PENDING], [])
 
+    # A packet nobody has lane-scored must not tie with one scored zero, and must not
+    # outrank a scored row either. Sorted, not just displayed, because the READY list is
+    # read top-down and an unscored row sitting among the zeros is a row that gets skipped.
     check("an unscored packet sorts after a genuine zero",
           sorted([{"lane_balance": 0}, {}, {"lane_balance": 3.7}], key=lane_key),
           [{"lane_balance": 3.7}, {"lane_balance": 0}, {}])
@@ -581,13 +569,11 @@ def selftest():
     check("report exists + judgement filled -> reported",
           blocker(_packet(url=NV_PACKET, company="AcmeCorp", match_w_cv=4.2), ix),
           "reported")
-    check("report exists + judgement empty -> reported",
-          blocker(_packet(url=NV_PACKET, company="AcmeCorp"), ix), "reported")
 
     # Identity, by each of the three key spaces. Every packet url below differs
     # textually from the report's, which is the whole point: a url join alone
     # misses a Workday re-slug and any tracking parameter.
-    check("identity: Workday req id across a re-slug",
+    check("identity: Workday req id across a re-slug, judgement empty",
           blocker(_packet(url=NV_PACKET, company="AcmeCorp"), ix), "reported")
     check("identity: greenhouse gh_jid across hosts",
           blocker(_packet(url=GH_PACKET, company="Globex"), ix), "reported")

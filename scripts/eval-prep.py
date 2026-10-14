@@ -18,7 +18,7 @@ Run:
   python scripts/eval-prep.py <url> [<url> ...]
   python scripts/eval-prep.py --from-triage triage.json --min 6
 """
-import contextlib, glob, hashlib, importlib.util, json, os, re, sys, tempfile
+import atexit, contextlib, glob, hashlib, importlib.util, io, json, os, re, shutil, sys, tempfile
 
 for _s in (sys.stdout, sys.stderr):
     try:
@@ -246,7 +246,8 @@ def comp_basis(pays, jd=""):
                        "so it cannot settle a total-comp floor on its own")
 
 
-# Board slugs that are not simply the company name title-cased.
+# Board slugs that are not simply the company name title-cased. A fallback: portal_employer()
+# answers first for any board portals.yml records, so this matters only for unrecorded ones.
 ORG_NAMES = {
     "openai": "OpenAI", "elevenlabs": "ElevenLabs", "nvidia": "NVIDIA",
     "ea": "EA", "wbd": "Warner Bros. Discovery", "hbo": "HBO", "ibm": "IBM",
@@ -254,8 +255,6 @@ ORG_NAMES = {
     "2kgames": "2K Games", "cddprojektred": "CD Projekt Red", "wetafx": "Weta FX",
     "ilm": "ILM", "dneg": "DNEG", "mpc": "MPC", "scanlinevfx": "Scanline VFX",
     "anthropic": "Anthropic", "xai": "xAI", "ssi": "SSI", "aws": "AWS",
-    # Only boards portals.yml does not record belong here; portal_employer() names the
-    # rest from the file that already says who each board belongs to.
     "eyelinestudios": "Eyeline Studios", "lumalabs-ai": "Luma AI",
 }
 
@@ -278,9 +277,7 @@ def org_from_url(u):
     AGG = {"builtin", "linkedin", "indeed", "ziprecruiter", "glassdoor", "dice",
            "otta", "wellfound", "angellist", "monster", "simplyhired", "lensa",
            "lnkd", "jobright", "himalayas"}
-    GENERIC = {"www", "careers", "career", "jobs", "job", "boards", "board", "apply",
-               "explore", "hire", "hiring", "work", "com", "io", "ai", "co", "net",
-               "org", "dev", "gg", "us", "inc", "app", "my", "talent"}
+    GENERIC = rr.HOST_NOISE | {"explore", "app", "my", "talent"}
     h = re.search(r"https?://([^/]+)", u or "")
     if h:
         labels = [l for l in h.group(1).lower().split(".") if l and l not in GENERIC]
@@ -378,11 +375,9 @@ def company_from(r):
         org = org_from_url(r.get("url") or "").lower()
     if not org:
         return None
-    if org in ORG_NAMES:
-        return ORG_NAMES[org]
     # A capitalised slug ("Andurilindustries") is a new employer to every name-keyed
     # lookup; the tracker usually already spells it, and its normalised key is the slug's.
-    return (portal_employer(slug=org)
+    return (portal_employer(slug=org) or ORG_NAMES.get(org)
             or tracker_spelling(" ".join(w.capitalize() for w in re.split(r"[-_]+", org) if w))
             or None)
 
@@ -498,10 +493,9 @@ def tracker_hits(title, url=""):
     req as already-evaluated, and a real lead dismissed as a duplicate is never seen
     again.
     """
-    p = os.path.join(ROOT, "data", "applications.md")
-    if not (title and os.path.exists(p)):
+    if not title:
         return []
-    host = re.sub(r"^https?://(www\.)?", "", url or "").split("/")[0].lower()
+    host = rr.name_key(re.sub(r"^https?://(www\.)?", "", url or "").split("/")[0])
     STOP = ("senior", "staff", "principal", "lead", "engineer")
     words = [w for w in re.sub(r"[^a-z0-9 ]", " ", title.lower()).split() if len(w) > 3]
     key = [w for w in words if w not in STOP]
@@ -513,17 +507,16 @@ def tracker_hits(title, url=""):
         key = words or [w for w in re.sub(r"[^a-z0-9 ]", " ", title.lower()).split()]
     need = 2 if len(key) >= 2 else 1
     hits = []
-    for line, cells0 in _tracker_rows():
+    for line, cells in _tracker_rows():
         low = line.lower()
-        co = re.sub(r"[^a-z0-9]", "", cells0[3].lower()) if len(cells0) > 3 else ""
+        co = rr.name_key(cells[3]) if len(cells) > 3 else ""
         # Company gate: the tracker row's company must be recognisable in the posting
         # URL, or in the packet's own host. Without this the title words alone match
         # across unrelated employers.
-        same_co = bool(co) and (co[:8] in re.sub(r"[^a-z0-9]", "", host))
+        same_co = bool(co) and co[:8] in host
         if not same_co:
             continue
         if key and sum(1 for w in key if w in low) >= max(need, len(key) // 2):
-            cells = cells0
             if len(cells) > 5:
                 hits.append(f"#{cells[1]} {cells[3]} - {cells[4][:60]} ({cells[5]})")
     return hits[:4]
@@ -1234,7 +1227,7 @@ def _patched(d, root=True):
     The cases below run readers that rewrite and DELETE packets; this is the one place
     that redirects them, so a case cannot reach the real queue by forgetting a patch.
     """
-    import io, unittest.mock as mock
+    from unittest import mock
     me = sys.modules[__name__]
     with mock.patch.object(me, "OUT_DIR", d), mock.patch.object(me, "ROOT", d if root else me.ROOT), \
             contextlib.redirect_stdout(io.StringIO()):
@@ -1252,7 +1245,7 @@ def reresolve_cases():
     rewrites a file; this branch removes one, and it used to fire on a falsy resolver
     result as readily as on a real closure.
     """
-    import unittest.mock as mock
+    from unittest import mock
     bad = 0
 
     def check(ok, msg):
@@ -1346,8 +1339,8 @@ def _queue_cases_in(d):
 def _tmp_profile(body):
     """Write a throwaway profile.yml and return its path. Each call gets a fresh path so
     comp_targets' per-path cache cannot carry one case's answer into the next."""
-    import tempfile
     d = tempfile.mkdtemp(prefix="evalprep-profile-")
+    atexit.register(shutil.rmtree, d, True)
     p = os.path.join(d, "profile.yml").replace("\\", "/")
     open(p, "w", encoding="utf-8").write(body)
     return p
@@ -1571,12 +1564,12 @@ def naming_cases():
     # tenant is named only in the hostname, so prep() wrote company None for every NVIDIA,
     # Salesforce and Disney req and eval-write refused them all. Asserted through prep()
     # itself with the resolver's real shape, since company_from() alone was never wrong.
-    import unittest.mock as _mock
+    from unittest import mock
     _wd = {"ats": "workday", "live": True, "title": "Senior AI Engineer",
            "location": "US, CA, Remote", "pay": [], "jd": "x"}
     # comp is not what this case tests, and computing it reads the configured floor.
-    with _mock.patch.object(rr, "resolve", lambda *a, **k: dict(_wd)), \
-            _mock.patch.object(sys.modules[__name__], "comp_verdict", lambda *a, **k: {}):
+    with mock.patch.object(rr, "resolve", lambda *a, **k: dict(_wd)), \
+            mock.patch.object(sys.modules[__name__], "comp_verdict", lambda *a, **k: {}):
         got = prep(NV + "Example-Role-01_JR2099999").get("company")
     check(got == "NVIDIA", f"a Workday packet must name its employer from the tenant: {got!r}")
     # ...and from portals.yml, by tenant AND site, never the hostname: xboxgaming is two
@@ -1590,8 +1583,8 @@ def naming_cases():
                                     ("Activision", "xboxgaming", "External"),
                                     ("Snap", "snapchat", "snap"))]
     with tempfile.TemporaryDirectory(prefix="evalprep-wdname-") as _empty, \
-            _mock.patch.object(rr, "portals_index", lambda: fake_portals), \
-            _mock.patch.object(sys.modules[__name__], "ROOT", _empty):
+            mock.patch.object(rr, "portals_index", lambda: fake_portals), \
+            mock.patch.object(sys.modules[__name__], "ROOT", _empty):
         for url, want in ((XB + "Blizzard_External_Careers/job/Irvine/X_R1000301", "Blizzard Entertainment"),
                           (XB + "en-US/External/job/Santa-Monica/X_R1000302", "Activision"),
                           ("https://snapchat.wd1.myworkdayjobs.com/snap/job/LA/X_R1000303", "Snap"),
@@ -1605,7 +1598,7 @@ def naming_cases():
         with open(os.path.join(_d, "data", "applications.md"), "w", encoding="utf-8") as fh:
             for i, co in enumerate(("Meta", "Disney", "Anduril Industries"), 1):
                 fh.write(f"| {i} | 2026-10-13 | {co} | Role | 3.0/5 | Evaluated | x | [r](r) | n |\n")
-        with _mock.patch.object(sys.modules[__name__], "ROOT", _d):
+        with mock.patch.object(sys.modules[__name__], "ROOT", _d):
             for spelt, want in (("Metaphysic", "Metaphysic"), ("Disney Studios", "Disney"),
                                 ("Andurilindustries", "Anduril Industries")):
                 got = tracker_spelling(spelt)

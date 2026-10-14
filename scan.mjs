@@ -144,19 +144,16 @@ function compileTitleKeyword(keyword) {
   if (!body) return () => false;
   const escaped = body.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/\s+/g, '\\s+');
   const tail = isStem ? '' : '(?=$|[^a-z0-9])';
-  return (title) => new RegExp(`(^|[^a-z0-9])${escaped}${tail}`, 'i').test(title);
+  // Built once per keyword. Building it per call cost about 2s a scan: every one of
+  // ~22,000 titles against ~130 keywords, and twice over for each rejected title.
+  const re = new RegExp(`(^|[^a-z0-9])${escaped}${tail}`, 'i');
+  return (title) => re.test(title);
 }
 
+/** True when a title passes portals.yml `title_filter`; buildTitleExplainer says why. */
 export function buildTitleFilter(titleFilter) {
-  const positive = (titleFilter?.positive || []).map(compileTitleKeyword);
-  const negative = (titleFilter?.negative || []).map(compileTitleKeyword);
-
-  return (title) => {
-    const text = String(title ?? '');
-    const hasPositive = positive.length === 0 || positive.some(match => match(text));
-    const hasNegative = negative.some(match => match(text));
-    return hasPositive && !hasNegative;
-  };
+  const explain = buildTitleExplainer(titleFilter);
+  return (title) => explain(title).pass;
 }
 
 /**
@@ -432,11 +429,6 @@ async function searchForNewUrl(page, offer) {
 
 // ── Dedup ───────────────────────────────────────────────────────────
 
-const PERMANENT_SCAN_HISTORY_STATUSES = new Set([
-  'skipped_invalid_url',
-  'skipped_blocked_host',
-]);
-
 function daysBetweenIsoDates(start, end) {
   if (!/^\d{4}-\d{2}-\d{2}$/.test(start) || !/^\d{4}-\d{2}-\d{2}$/.test(end)) return null;
   const startDate = new Date(`${start}T00:00:00Z`);
@@ -446,7 +438,7 @@ function daysBetweenIsoDates(start, end) {
 }
 
 export function shouldDedupScanHistoryRow({ firstSeen, status = 'added' }, { recheckAfterDays = null, today = new Date().toISOString().slice(0, 10) } = {}) {
-  if (PERMANENT_SCAN_HISTORY_STATUSES.has(status)) return true;
+  // Only an `added` row expires; a skip (skipped_invalid_url, skipped_blocked_host) is permanent.
   if (status !== 'added') return true;
   if (recheckAfterDays == null) return true;
   const ageDays = daysBetweenIsoDates(firstSeen, today);
@@ -516,6 +508,8 @@ export function canonicalCompany(value) {
     .trim();
 }
 
+// Zillow's P711740 is the form role-matcher.mjs composes beside the shared pattern, and a
+// trailing "-1" facet suffix belongs to the id before it, or "JR2292444-1" leaves a "1".
 const ROLE_ID_TOKEN = String.raw`(?:(?:${REQ_ID_SRC}|(?<![A-Za-z0-9])(?:REQ[-_ ]?\d{4,}|P\d{5,}|\d{5,})(?![A-Za-z0-9]))(?:-\d{1,2}(?![A-Za-z0-9]))?)`;
 const ROLE_PAREN_WITH_ID = new RegExp(String.raw`\((?=[^)]*${ROLE_ID_TOKEN})[^)]*\)`, 'gi');
 const ROLE_BARE_ID = new RegExp(ROLE_ID_TOKEN, 'gi');
@@ -544,8 +538,6 @@ const ROLE_BARE_ID = new RegExp(ROLE_ID_TOKEN, 'gi');
  * often writes the team beside it, "(Industrial Engineering, JR2878530)", and a
  * board title carries neither.
  */
-// Zillow's P711740 is the form role-matcher.mjs composes beside the shared pattern, and a
-// trailing "-1" facet suffix belongs to the id before it, or "JR2292444-1" leaves a "1".
 export function canonicalRole(value) {
   return String(value ?? '')
     .toLowerCase()
@@ -885,7 +877,6 @@ async function main() {
   const config = rawConfig && typeof rawConfig === 'object' ? rawConfig : {};
   const companies = Array.isArray(config.tracked_companies) ? config.tracked_companies : [];
   const boards = Array.isArray(config.job_boards) ? config.job_boards : [];
-  const titleFilter = buildTitleFilter(config.title_filter);
   const explainTitle = buildTitleExplainer(config.title_filter);
   const locationDecider = buildLocationDecider(effectiveLocationFilter(config.location_filter));
   const salaryFilter = buildSalaryFilter(config.salary_filter);
@@ -1014,14 +1005,14 @@ async function main() {
       totalFound += jobs.length;
 
       for (const job of jobs) {
-        if (!titleFilter(job.title)) {
+        const why = explainTitle(job.title);
+        if (!why.pass) {
           totalFilteredTitle++;
           // Only NEGATIVE-keyword kills are logged. "No positive matched" is
           // ~97% of rejections and is mostly genuine off-domain noise, but a
           // negative keyword vetoing a title is the dangerous class: bare
           // "Marketing" silently killed "Senior Technical Marketing Engineer",
           // a req that went on to reach interview, on every scan for months.
-          const why = explainTitle(job.title);
           if (why.reason.startsWith('negative')) {
             titleVetoes.push({ company: job.company, title: job.title, reason: why.reason, url: job.url });
           }
