@@ -308,6 +308,7 @@ def _tracker_rows():
         rows = [(l, [c.strip() for c in l.split("|")])
                 for l in open(p, encoding="utf-8", errors="replace") if l.startswith("|")]
         _TRACKER.update(key=key, rows=rows)
+        return rows
     return _TRACKER["rows"]
 
 
@@ -526,9 +527,9 @@ def prep(url):
     r = rr.resolve(url)
     lv, lw = location_verdict(r.get("location"), r.get("remote_txt"))
     title = r.get("title") or ""
-    slug = re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")[:60] or "untitled"
+    slug = slug_of(title)
     return {
-        "_instructions": "Fill every null below, then: node eval-write.mjs <this file>",
+        "_instructions": "Fill every null below, then: node eval-write.mjs <this file> --date=YYYY-MM-DD",
         "url": url, "ats": r.get("ats"), "live": r.get("live"),
         "resolver_note": r.get("note"),
         "title": title, "location": r.get("location"),
@@ -632,6 +633,17 @@ def hard_gate(p):
     return None
 
 
+def write_packet(path, p):
+    """Write one packet the way every reader expects it: UTF-8, one-space indent."""
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(p, fh, indent=1, ensure_ascii=False)
+
+
+def slug_of(title):
+    """The filename slug for a posting title."""
+    return re.sub(r"[^a-z0-9]+", "-", (title or "").lower()).strip("-")[:60] or "untitled"
+
+
 def record_dispositions(disp):
     """Append hard-gate dispositions to dispositions.json, once per url; return the total."""
     out = os.path.join(ROOT, "dispositions.json")
@@ -730,14 +742,14 @@ def relocate():
         dups = tracker_hits(p.get("title"), p.get("url", ""))
         if dups != p.get("possible_tracker_duplicates"):
             p["possible_tracker_duplicates"] = dups
-            json.dump(p, open(f, "w", encoding="utf-8"), indent=1, ensure_ascii=False)
+            write_packet(f, p)
         v, w = location_verdict(p.get("location"), p.get("remote_txt"))
         if v == p.get("location_verdict") and w == p.get("location_why"):
             continue
         print(f"  {str(p.get('location'))[:30]:30s} {p.get('location_verdict')} -> {v}  "
               f"({(p.get('title') or '')[:40]})")
         p["location_verdict"], p["location_why"] = v, w
-        json.dump(p, open(f, "w", encoding="utf-8"), indent=1, ensure_ascii=False)
+        write_packet(f, p)
         changed += 1
         if v == "fail":
             disp.append({"url": p["url"], "disposition": w})
@@ -789,7 +801,7 @@ def reresolve():
             # used to share this branch. Deleting the packet is the one thing in this
             # function that cannot be undone, so it needs the stronger evidence.
             print(f"  UNKNWN  resolver returned no result  {(p.get('title') or '')[:38]}")
-            json.dump(p, open(f, "w", encoding="utf-8"), indent=1, ensure_ascii=False)
+            write_packet(f, p)
             changed += 1
             continue
         if r.get("live") is False:
@@ -809,14 +821,14 @@ def reresolve():
         if not loc:
             print(f"  jd {p.get('jd_chars', 0):5d}  (location unchanged)  "
                   f"{(p.get('title') or '')[:38]}")
-            json.dump(p, open(f, "w", encoding="utf-8"), indent=1, ensure_ascii=False)
+            write_packet(f, p)
             changed += 1
             continue
         v, w = location_verdict(loc, r.get("remote_txt"))
         p["location"], p["location_verdict"], p["location_why"] = loc, v, w
         print(f"  {str(loc)[:34]:34s} -> {v:7s} jd {p.get('jd_chars', 0):5d}  "
               f"{(p.get('title') or '')[:34]}")
-        json.dump(p, open(f, "w", encoding="utf-8"), indent=1, ensure_ascii=False)
+        write_packet(f, p)
         changed += 1
         if v == "fail":
             disp.append({"url": p["url"], "disposition": w})
@@ -846,7 +858,7 @@ def recomp():
             continue
         print(f"  {c['posted']:24s} {(p.get('title') or '')[:52]}")
         p["comp"] = c
-        json.dump(p, open(f, "w", encoding="utf-8"), indent=1, ensure_ascii=False)
+        write_packet(f, p)
         changed += 1
     print(f"\n{changed} packet(s) gained a band")
 
@@ -858,7 +870,7 @@ def recomp():
         if not co:
             continue
         p["company"] = co
-        json.dump(p, open(f, "w", encoding="utf-8"), indent=1, ensure_ascii=False)
+        write_packet(f, p)
         named += 1
     print(f"{named} packet(s) gained an employer name")
 
@@ -1548,8 +1560,7 @@ def naming_cases():
             print(f"FAIL  {msg}")
 
     def name(url, title="Senior AI Engineer"):
-        slug = re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")[:60] or "untitled"
-        return packet_name({"url": url, "slug": slug})
+        return packet_name({"url": url, "slug": slug_of(title)})
 
     # The exact shape CLAUDE.md warns about: two NVIDIA reqs one word apart in the title,
     # opposite location verdicts. Slugged from the title alone they were ONE file and the
@@ -1684,8 +1695,7 @@ if __name__ == "__main__":
             print(f"SKIP ({gated})  {(p['title'] or u)[:56]}")
             disp.append({"url": u, "disposition": gated}); continue
         name = packet_name(p)
-        json.dump(p, open(os.path.join(OUT_DIR, name), "w", encoding="utf-8"),
-                  indent=1, ensure_ascii=False)
+        write_packet(os.path.join(OUT_DIR, name), p)
         c = p["comp"]
         money = c["posted"] or "no band"
         gates = ("clears target" if c["clears_target"] else

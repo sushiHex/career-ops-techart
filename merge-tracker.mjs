@@ -23,18 +23,11 @@ import { createHash, randomUUID } from 'crypto';
 import { tmpdir } from 'os';
 import { normalizeReportLink as normalizeLink } from './tracker-links.mjs';
 import { roleFuzzyMatch, rowIdReader, idSetsOverlap, idSetsConflict, companyKey } from './role-matcher.mjs';
-import { LEGACY_COLMAP, detectColumns, parseRow, parseScore, reportNumOf } from './tracker-rows.mjs';
+import { columnsOf, isSeparatorRow, parseRow, parseScore, reportNumOf, SCORE_CELL, trackerPath } from './tracker-rows.mjs';
 import { guardArgs } from './cli-guard.mjs';
 
 const CAREER_OPS = dirname(fileURLToPath(import.meta.url));
-// Support both layouts: data/applications.md (boilerplate) and applications.md (original).
-// CAREER_OPS_TRACKER overrides the path (used by tests and non-standard layouts).
-const APPS_FILE_RAW = process.env.CAREER_OPS_TRACKER
-  ? process.env.CAREER_OPS_TRACKER
-  : existsSync(join(CAREER_OPS, 'data/applications.md'))
-    ? join(CAREER_OPS, 'data/applications.md')
-    : join(CAREER_OPS, 'applications.md');
-const APPS_FILE = canonicalizeTrackerPath(APPS_FILE_RAW);
+const APPS_FILE = canonicalizeTrackerPath(trackerPath(CAREER_OPS));
 const TRACKER_DIR = dirname(APPS_FILE);
 // CAREER_OPS_ADDITIONS overrides the additions dir (used by tests, mirrors CAREER_OPS_TRACKER).
 const ADDITIONS_DIR = process.env.CAREER_OPS_ADDITIONS
@@ -49,6 +42,7 @@ const args = guardArgs({
     ['--verify', 'check the tracker without merging'],
     ['--migrate', 'rewrite existing report links relative to the tracker file'],
   ],
+  positional: false,
   notes: 'Without --dry-run this REWRITES data/applications.md. A backup is written to applications.md.bak.',
 });
 const DRY_RUN = args.has('--dry-run');
@@ -392,9 +386,6 @@ function validateStatus(status) {
 // A row's identity SET (role-matcher.mjs rowIdReader), memoised for this run.
 const jobIdsForRow = rowIdReader(TRACKER_DIR);
 
-// The tracker's column layout (tracker-rows.mjs), detected from its header below.
-let COLMAP = LEGACY_COLMAP;
-
 // Build a tracker row string matching the detected layout (with or without the
 // optional Location column) so writes round-trip through the same schema.
 function buildRow(o) {
@@ -410,7 +401,6 @@ function parseAppLine(line) {
   return row && row.num !== 0 ? row : null;
 }
 
-const TSV_SCORE = /^(?:\d+\.?\d*\/5|N\/A|DUP)$/;
 const TSV_STATUS = /^(evaluated|applied|responded|interview|offer|rejected|discarded|skip|evaluada|aplicado|respondido|entrevista|oferta|rechazado|descartado|no aplicar|cerrada|duplicado|repost|condicional|hold|monitor)/i;
 
 /**
@@ -464,7 +454,7 @@ function parseTsvContent(content, filename) {
     // round: swap only when col4 reads as a score AND col5 as a status.
     const col4 = parts[4].trim();
     const col5 = parts[5].trim();
-    const swapped = TSV_SCORE.test(col4) && TSV_STATUS.test(col5);
+    const swapped = SCORE_CELL.test(col4) && TSV_STATUS.test(col5);
     const [statusCol, scoreCol] = swapped ? [col5, col4] : [col4, col5];
 
     addition = {
@@ -527,26 +517,17 @@ if (MIGRATE) {
 }
 
 const appLines = appContent.split('\n');
-// Detect the tracker's column layout via header names so parsing and writing
-// both work whether the table uses the original 9-column layout or a customized
-// one (e.g. with a Location column after Role). Falls back to the legacy layout.
-COLMAP = detectColumns(appLines) || LEGACY_COLMAP;
+// Columns by header name (tracker-rows.mjs), so a tracker with a Location column
+// parses and writes as correctly as the original layout.
+const COLMAP = columnsOf(appLines);
 if (COLMAP.location != null) console.log('🧭 Detected Location column.');
 const existingApps = [];
 let maxNum = 0;
 
-// A markdown separator row is pipes, dashes, colons and spaces ONLY. Testing for
-// `includes('---')` instead skipped any DATA row containing three dashes anywhere
-// — which report links do, because slugifying a role like "Engineer 5 - Model
-// Runtime" yields "engineer-5---model-runtime". Two live rows were invisible
-// to this loop, so a re-evaluation of either would not have
-// found the existing entry and would have been appended as a DUPLICATE, breaking
-// the one rule this script exists to enforce. Same for `includes('Empresa')`,
-// which would skip any row whose notes mentioned the word.
-const isSeparatorRow = (l) => /^\s*\|[\s:|-]*\|\s*$/.test(l);
-
+// A separator row parses as null (its number cell is dashes), so only the header
+// test is needed here; tracker-rows.isSeparatorRow says why `includes('---')` was wrong.
 for (const line of appLines) {
-  if (line.startsWith('|') && !isSeparatorRow(line)) {
+  if (line.startsWith('|')) {
     const app = parseAppLine(line);
     if (app) {
       existingApps.push(app);
@@ -666,8 +647,8 @@ for (const file of tsvFiles) {
     }
   } else {
     // New entry — use the number from the TSV
-    const entryNum = addition.num > maxNum ? addition.num : ++maxNum;
-    if (addition.num > maxNum) maxNum = addition.num;
+    const entryNum = addition.num > maxNum ? addition.num : maxNum + 1;
+    maxNum = entryNum;
 
     const newLine = buildRow({
       num: entryNum, date: addition.date, company: addition.company, role: addition.role,

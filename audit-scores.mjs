@@ -30,6 +30,7 @@ import { fileURLToPath } from 'url';
 
 import { isMain } from './cli-guard.mjs';
 import { applyModel, loadPrefs, persistedArrangement } from './score-model.mjs';
+import { reportFileOf } from './tracker-rows.mjs';
 
 const args = process.argv.slice(2);
 const has = (f) => args.includes(f);
@@ -140,11 +141,11 @@ function actionableReports() {
     if (!sm) continue;
     const score = parseFloat(sm[1]);
     const status = c[6];
-    const rm = line.match(/\((?:\.\.\/)?reports\/([^)]+)\)/);
-    if (score >= 4.0 && !['Rejected', 'Discarded', 'SKIP'].includes(status) && rm) {
+    const reportFile = reportFileOf(line);
+    if (score >= 4.0 && !['Rejected', 'Discarded', 'SKIP'].includes(status) && reportFile) {
       // `role` is needed by prefFactor: a de-prioritised title keeps only a
       // fraction of its company preference, so omitting it overstates the score.
-      out.set(rm[1].split('/').pop(), { company: c[3], role: c[4], score, status });
+      out.set(reportFile, { company: c[3], role: c[4], score, status });
     }
   }
   return out;

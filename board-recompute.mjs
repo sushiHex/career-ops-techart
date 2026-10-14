@@ -31,6 +31,7 @@
 import { readFileSync, existsSync, mkdirSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { applyModel, loadPrefs, persistedArrangement } from './score-model.mjs';
+import { reportFileOf } from './tracker-rows.mjs';
 
 const { parseScores, computeGlobal } = await import(
   new URL('./audit-scores.mjs', import.meta.url).href
@@ -62,7 +63,7 @@ for (const line of readFileSync(TRACKER, 'utf-8').split('\n')) {
   if (!/^\d+$/.test(c[1] || '')) continue;
   const sm = (c[5] || '').match(/([\d.]+)\/5/);
   if (!sm) continue;
-  const rm = line.match(/\((?:\.\.\/)?reports\/([^)]+)\)/);
+  const reportFile = reportFileOf(line);
   rows.push({
     num: parseInt(c[1], 10),
     date: c[2],
@@ -70,7 +71,7 @@ for (const line of readFileSync(TRACKER, 'utf-8').split('\n')) {
     role: c[4],
     stated: parseFloat(sm[1]),
     status: c[6],
-    report: rm ? rm[1].split('/').pop() : null,
+    report: reportFile || null,
   });
 }
 

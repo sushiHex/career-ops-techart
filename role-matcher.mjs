@@ -1,10 +1,10 @@
 /**
- * role-matcher.mjs - Shared fuzzy role-title matching for tracker scripts.
+ * role-matcher.mjs - Posting identity for tracker scripts: requisition ids read
+ * from URLs and role cells (`extractJobId`, `rowIdReader`), the company key, and
+ * the fuzzy role-title match that decides only when neither row has an id.
  *
- * Both `merge-tracker.mjs` and `dedup-tracker.mjs` decide whether two
- * same-company tracker rows describe the same opening. Keeping this logic in
- * one module prevents the merge path from preserving rows that the later dedup
- * path would silently delete with weaker matching rules.
+ * merge-tracker, dedup-tracker, eval-write and verify-pipeline share it, so the
+ * merge path cannot keep rows that a later dedup would delete with weaker rules.
  */
 
 import { readFileSync } from 'fs';

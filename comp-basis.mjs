@@ -19,6 +19,7 @@
  */
 import { readFileSync, writeFileSync, existsSync } from 'fs';
 import { join } from 'path';
+import { reportFileOf } from './tracker-rows.mjs';
 
 const QUIET = process.argv.includes('--quiet');
 // Sibling modules resolve beside this file, so it runs from any directory; the
@@ -37,9 +38,9 @@ for (const line of readFileSync(TRACKER, 'utf-8').split('\n')) {
   const c = line.split('|').map((x) => x.trim());
   if (c.length < 8 || !/^\d+$/.test(c[1] || '')) continue;
 
-  const rm = line.match(/\((?:\.\.\/)?reports\/([^)]+)\)/);
-  if (!rm) continue;
-  const p = join('reports', rm[1].split('/').pop());
+  const reportFile = reportFileOf(line);
+  if (!reportFile) continue;
+  const p = join('reports', reportFile);
   if (!existsSync(p)) continue;
 
   let text;

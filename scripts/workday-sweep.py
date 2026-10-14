@@ -80,7 +80,7 @@ def tenants():
         if not m:
             continue
         tenant, wd, site = m.group(1), m.group(2), m.group(3)
-        base = f"https://{tenant}.{wd}.myworkdayjobs.com/wday/cxs/{tenant}/{site}"
+        base = _prep.rr.cxs_base(tenant, wd, site)
         if base in seen:
             continue
         seen.add(base)

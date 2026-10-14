@@ -2,10 +2,12 @@
 /**
  * dedup-tracker.mjs — Remove duplicate entries from applications.md
  *
- * Groups by normalized company. Within a company, rows are one posting when
- * they share a report or a requisition id, never when their id sets conflict,
- * and otherwise by fuzzy role match. Keeps entry with highest score. If discarded entry had more advanced status,
- * preserves that status. Merges notes.
+ * Groups by normalized company. Within a company two rows are one posting when
+ * they share a report or row number, or when their roles fuzzy-match, their
+ * requisition-id sets do not conflict and neither has reached Applied. A shared id
+ * alone never merges here, unlike in merge-tracker: this script deletes rows, so it
+ * asks for more. Keeps the row with the highest score and promotes the most
+ * advanced status onto it.
  *
  * Run: node career-ops/dedup-tracker.mjs [--dry-run]
  */
@@ -14,18 +16,12 @@ import { readFileSync, writeFileSync, copyFileSync, existsSync, mkdirSync } from
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { roleFuzzyMatch, rowIdReader, idSetsConflict } from './role-matcher.mjs';
-import { parseScore, rebuildRow, reportNumOf } from './tracker-rows.mjs';
+import { parseScore, rebuildRow, reportNumOf, trackerPath } from './tracker-rows.mjs';
 import { guardArgs } from './cli-guard.mjs';
 
 const CAREER_OPS = dirname(fileURLToPath(import.meta.url));
-// Support both layouts: data/applications.md (boilerplate) and applications.md
-// (original). CAREER_OPS_TRACKER lets tests point the script at an isolated
-// fixture so the real user tracker is never touched.
-const APPS_FILE = process.env.CAREER_OPS_TRACKER
-  ? process.env.CAREER_OPS_TRACKER
-  : existsSync(join(CAREER_OPS, 'data/applications.md'))
-    ? join(CAREER_OPS, 'data/applications.md')
-    : join(CAREER_OPS, 'applications.md');
+// CAREER_OPS_TRACKER lets tests point the script at an isolated fixture.
+const APPS_FILE = trackerPath(CAREER_OPS);
 // Argument handling comes FIRST and is strict, because the default action of
 // this script is a destructive rewrite of the tracker. `node dedup-tracker.mjs
 // --help` previously fell through to the real run and deleted rows (2026-08-12);
@@ -268,7 +264,7 @@ for (let i = 0; i < lines.length; i++) {
 
 console.log(`📊 ${entries.length} entries loaded`);
 
-// Group by company+role
+// Group by company
 const groups = new Map();
 for (const entry of entries) {
   const key = normalizeCompany(entry.company);
@@ -304,23 +300,13 @@ for (const companyEntries of groups.values()) {
     cluster.sort((a, b) => parseScore(b.score) - parseScore(a.score));
     const keeper = cluster[0];
 
-    // Check if any removed entry has more advanced status
-    let bestStatusRank = statusRank(keeper.status);
-    let bestStatus = keeper.status;
-    for (let k = 1; k < cluster.length; k++) {
-      const rank = statusRank(cluster[k].status);
-      if (rank > bestStatusRank) {
-        bestStatusRank = rank;
-        bestStatus = cluster[k].status;
-      }
-    }
-
-    // Update keeper's status if a removed entry had a more advanced one
-    if (bestStatus !== keeper.status) {
+    // The first row with the most advanced status; promote it onto the keeper.
+    const best = cluster.reduce((b, e) => (statusRank(e.status) > statusRank(b.status) ? e : b));
+    if (best !== keeper) {
       const parts = lines[keeper.lineIdx].split('|').map(s => s.trim());
-      parts[6] = bestStatus;
+      parts[6] = best.status;
       lines[keeper.lineIdx] = rebuildRow(parts);
-      console.log(`  📝 #${keeper.num}: status promoted to "${bestStatus}" (from #${cluster.find(e => e.status === bestStatus)?.num})`);
+      console.log(`  📝 #${keeper.num}: status promoted to "${best.status}" (from #${best.num})`);
     }
 
     // Remove duplicates

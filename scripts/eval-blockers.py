@@ -322,7 +322,7 @@ PRUNE_STATES = ("reported", "closed")
 
 
 def load_rows(queue=QUEUE, ix=None):
-    """Every packet in the queue with its blocker. The report index is read only if there is one."""
+    """Every packet in the queue with its blocker; reports are indexed only when there is a packet."""
     packets = list(queue_packets(queue))
     if packets and ix is None:
         ix = report_index()

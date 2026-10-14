@@ -22,6 +22,7 @@ import { readFileSync, writeFileSync, mkdtempSync, mkdirSync, rmSync } from 'fs'
 import { join, dirname } from 'path';
 import { tmpdir } from 'os';
 import { fileURLToPath } from 'url';
+import { isSeparatorRow } from './tracker-rows.mjs';
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
 const NODE = process.execPath;
@@ -68,9 +69,7 @@ function makeSandbox(trackerContent, additions = {}) {
 function dataRows(trackerPath) {
   return readFileSync(trackerPath, 'utf-8')
     .split('\n')
-    // Separator rows only. A bare includes('---') also dropped data rows whose
-    // report link contains "---" from a slugified role — see merge-tracker.mjs.
-    .filter(l => l.startsWith('|') && !/^\s*\|[\s:|-]*\|\s*$/.test(l) && !/\bScore\b/.test(l));
+    .filter(l => l.startsWith('|') && !isSeparatorRow(l) && !/\bScore\b/.test(l));
 }
 
 const HEADER_10 = `# Applications Tracker

@@ -305,8 +305,8 @@ def classify(url):
 def fetch_workday(slug):
     """(set_of_req_ids, ok) for one Workday tenant, via workday-sweep's own walker."""
     tenant, wd, site = slug.split("/")
-    base = f"https://{tenant}.{wd}.myworkdayjobs.com/wday/cxs/{tenant}/{site}"
     w = workday()
+    base = w._prep.rr.cxs_base(tenant, wd, site)
     try:
         posts, st, truncated = w.enumerate_board(base, pages=WORKDAY_PAGES, limit=20,
                                                  quiet=True)

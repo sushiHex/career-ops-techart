@@ -150,7 +150,7 @@ if __name__ == "__main__":
     for f, p in _prep.queue_packets(QUEUE):
         p = annotate(p)
         if not args.report:
-            json.dump(p, open(f, "w", encoding="utf-8"), indent=1, ensure_ascii=False)
+            _prep.write_packet(f, p)
         rows.append((p, f))
 
     auto = [r for r in rows if r[0].get("suggested_disposition")]

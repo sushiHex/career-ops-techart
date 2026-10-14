@@ -11,9 +11,9 @@
  * computed one way everywhere.
  *
  * Run:
- *   node eval-write.mjs batch/eval-queue/<packet>.json [--date=YYYY-MM-DD]
- *   node eval-write.mjs batch/eval-queue/*.json
- *   node eval-write.mjs <packet> --dry-run
+ *   node eval-write.mjs batch/eval-queue/<packet>.json --date=YYYY-MM-DD
+ *   node eval-write.mjs batch/eval-queue/*.json --date=YYYY-MM-DD
+ *   node eval-write.mjs <packet> --date=YYYY-MM-DD --dry-run
  */
 import { readFileSync, writeFileSync, readdirSync, mkdirSync, unlinkSync } from 'fs';
 import { basename, join } from 'path';
@@ -25,8 +25,16 @@ const args = process.argv.slice(2);
 const DRY = args.includes('--dry-run');
 const dateArg = args.find(a => a.startsWith('--date='));
 const files = args.filter(a => !a.startsWith('--'));
-if (!files.length) {
-  console.log('usage: node eval-write.mjs <packet.json> [...] [--date=YYYY-MM-DD] [--dry-run]');
+// This script writes by default, so a mistyped flag ("--dryrun") must stop it rather
+// than be dropped from the file list and ignored.
+const unknownFlags = args.filter(a => a.startsWith('-')
+  && !['--dry-run', '--help', '-h'].includes(a) && !a.startsWith('--date='));
+if (unknownFlags.length) {
+  console.error(`eval-write.mjs: unrecognised argument(s): ${unknownFlags.join(', ')}`);
+  process.exit(2);
+}
+if (!files.length || args.includes('--help') || args.includes('-h')) {
+  console.log('usage: node eval-write.mjs <packet.json> [...] --date=YYYY-MM-DD [--dry-run]');
   process.exit(1);
 }
 if (!dateArg) {

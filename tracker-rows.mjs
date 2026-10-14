@@ -6,6 +6,23 @@
  * differently from its neighbours. One module, so they cannot.
  */
 
+import { existsSync } from 'fs';
+import { join } from 'path';
+
+/**
+ * The tracker file under `root`: CAREER_OPS_TRACKER when set (tests and
+ * non-standard layouts), else data/applications.md, else the original
+ * root-level applications.md.
+ *
+ * @param {string} root - The career-ops directory.
+ * @returns {string}
+ */
+export function trackerPath(root) {
+  if (process.env.CAREER_OPS_TRACKER) return process.env.CAREER_OPS_TRACKER;
+  const data = join(root, 'data', 'applications.md');
+  return existsSync(data) ? data : join(root, 'applications.md');
+}
+
 // The original 9-column layout, indexed as `line.split('|')` indexes it (the
 // leading empty cell before the first pipe is index 0).
 export const LEGACY_COLMAP = { num: 1, date: 2, company: 3, role: 4, score: 5, status: 6, pdf: 7, report: 8, notes: 9 };
@@ -37,6 +54,21 @@ export function detectColumns(lines) {
   }
   return null;
 }
+
+/** The tracker's column layout: by header name when it has one, else the legacy layout. */
+export function columnsOf(lines) {
+  return detectColumns(lines) || LEGACY_COLMAP;
+}
+
+/**
+ * True for a markdown separator row, which is pipes, dashes, colons and spaces
+ * ONLY. Testing `includes('---')` instead skipped any DATA row with three dashes
+ * anywhere, which report links have whenever a role like "Engineer 5 - Model
+ * Runtime" slugifies to "engineer-5---model-runtime": two live rows were invisible
+ * to merge-tracker that way, so a re-evaluation would have been appended as a
+ * duplicate.
+ */
+export const isSeparatorRow = (line) => /^\s*\|[\s:|-]*\|\s*$/.test(line);
 
 /**
  * One table row as a tracker object, or null for a header, separator or short
@@ -77,6 +109,22 @@ export function parseScore(s) {
   return m ? parseFloat(m[1]) : 0;
 }
 
+/** A valid score cell: `4.2/5`, `N/A` or `DUP`. */
+export const SCORE_CELL = /^(?:\d+\.?\d*\/5|N\/A|DUP)$/;
+
+/**
+ * The report FILE a tracker line links to, `[n](../reports/<file>)`, or null.
+ * This is the join every score gate makes between a row and its report; it keys
+ * on the link and never on the row number, which is a separate sequence.
+ *
+ * @param {string} line
+ * @returns {string|null}
+ */
+export function reportFileOf(line) {
+  const m = String(line ?? '').match(/\((?:\.\.\/)?reports\/([^)]+)\)/);
+  return m ? m[1].split('/').pop() : null;
+}
+
 /**
  * The bracketed number of a report link, `[123](../reports/123-...md)`, or null.
  *
@@ -103,4 +151,38 @@ export function rebuildRow(parts) {
   const cells = parts.slice(1);
   if (cells.length > 0 && cells[cells.length - 1] === '') cells.pop();
   return '| ' + cells.join(' | ') + ' |';
+}
+
+export const CANONICAL_STATUSES = [
+  'evaluated', 'applied', 'responded', 'interview',
+  'offer', 'rejected', 'discarded', 'skip',
+];
+
+// Legacy and Spanish spellings, each mapped onto a canonical status.
+const STATUS_ALIASES = {
+  'evaluada': 'evaluated', 'condicional': 'evaluated', 'hold': 'evaluated',
+  'evaluar': 'evaluated', 'verificar': 'evaluated',
+  'aplicado': 'applied', 'enviada': 'applied', 'aplicada': 'applied',
+  'applied': 'applied', 'sent': 'applied',
+  'respondido': 'responded',
+  'entrevista': 'interview',
+  'oferta': 'offer',
+  'rechazado': 'rejected', 'rechazada': 'rejected',
+  'descartado': 'discarded', 'descartada': 'discarded',
+  'cerrada': 'discarded', 'cancelada': 'discarded',
+  'no aplicar': 'skip', 'no_aplicar': 'skip', 'monitor': 'skip', 'geo blocker': 'skip',
+};
+
+/**
+ * A status cell as a lowercase status: bold and a trailing date stripped, an
+ * alias mapped. Anything unrecognised comes back cleaned but unmapped, so
+ * `CANONICAL_STATUSES.includes(normalizeStatus(x))` is the canonical test.
+ *
+ * @param {string} raw
+ * @returns {string}
+ */
+export function normalizeStatus(raw) {
+  const clean = raw.replace(/\*\*/g, '').trim().toLowerCase()
+    .replace(/\s+\d{4}-\d{2}-\d{2}.*$/, '').trim();
+  return Object.hasOwn(STATUS_ALIASES, clean) ? STATUS_ALIASES[clean] : clean;
 }

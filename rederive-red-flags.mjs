@@ -36,6 +36,7 @@ import { fileURLToPath } from 'url';
 const { parseScores } = await import(new URL('./audit-scores.mjs', import.meta.url).href);
 
 import { guardArgs } from './cli-guard.mjs';
+import { reportFileOf } from './tracker-rows.mjs';
 
 const { argv: args } = guardArgs({
   name: 'rederive-red-flags.mjs',
@@ -175,9 +176,9 @@ for (const line of readFileSync(TRACKER, 'utf-8').split('\n')) {
   if (!line.startsWith('|')) continue;
   const c = line.split('|').map((x) => x.trim());
   if (c.length < 8 || !/^\d+$/.test(c[1] || '')) continue;
-  const rm = line.match(/\((?:\.\.\/)?reports\/([^)]+)\)/);
-  if (!rm) continue;
-  const p = join(REPORTS, rm[1].split('/').pop());
+  const reportFile = reportFileOf(line);
+  if (!reportFile) continue;
+  const p = join(REPORTS, reportFile);
   if (!existsSync(p)) continue;
   const text = readFileSync(p, 'utf-8');
   const s = parseScores(text);

@@ -3,13 +3,14 @@
  * verify-pipeline.mjs — Health check for career-ops pipeline integrity
  *
  * Checks:
- * 1. All statuses are canonical (per states.yml)
+ * 1. All statuses are canonical, with no bold and no dates
  * 2. No duplicate company+role entries
- * 3. All report links point to existing files
- * 4. Scores match format X.XX/5 or N/A or DUP
+ * 3. All report links point to existing files; 3b. live rows carry an apply link
+ * 4. Scores read N.N/5, N/A or DUP
  * 5. All rows have proper pipe-delimited format
  * 6. No pending TSVs in tracker-additions/ (only in merged/ or archived/)
- * 7. states.yml canonical IDs for cross-system consistency
+ * 7. No bold in scores
+ * 8. Stale report-number sentinels are collected
  *
  * Run: node career-ops/verify-pipeline.mjs
  */
@@ -17,42 +18,19 @@
 import { readFileSync, readdirSync, existsSync, mkdirSync, unlinkSync, statSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
-import { LEGACY_COLMAP, detectColumns, parseRow } from './tracker-rows.mjs';
+import { CANONICAL_STATUSES, columnsOf, isSeparatorRow, normalizeStatus, parseRow, SCORE_CELL, trackerPath } from './tracker-rows.mjs';
 import { companyKey } from './role-matcher.mjs';
 
 const CAREER_OPS = dirname(fileURLToPath(import.meta.url));
 // Support both layouts: data/applications.md (boilerplate) and applications.md (original).
 // CAREER_OPS_TRACKER overrides the path (used by tests and non-standard layouts).
-const APPS_FILE = process.env.CAREER_OPS_TRACKER
-  ? process.env.CAREER_OPS_TRACKER
-  : existsSync(join(CAREER_OPS, 'data/applications.md'))
-    ? join(CAREER_OPS, 'data/applications.md')
-    : join(CAREER_OPS, 'applications.md');
+const APPS_FILE = trackerPath(CAREER_OPS);
 const ADDITIONS_DIR = join(CAREER_OPS, 'batch/tracker-additions');
 const REPORTS_DIR = join(CAREER_OPS, 'reports');
-const STATES_FILE = existsSync(join(CAREER_OPS, 'templates/states.yml'))
-  ? join(CAREER_OPS, 'templates/states.yml')
-  : join(CAREER_OPS, 'states.yml');
 
 // Ensure required directories exist (fresh setup)
 mkdirSync(join(CAREER_OPS, 'data'), { recursive: true });
 mkdirSync(REPORTS_DIR, { recursive: true });
-
-const CANONICAL_STATUSES = [
-  'evaluated', 'applied', 'responded', 'interview',
-  'offer', 'rejected', 'discarded', 'skip',
-];
-
-const ALIASES = {
-  'evaluada': 'evaluated', 'condicional': 'evaluated', 'hold': 'evaluated', 'evaluar': 'evaluated', 'verificar': 'evaluated',
-  'aplicado': 'applied', 'enviada': 'applied', 'aplicada': 'applied', 'applied': 'applied', 'sent': 'applied',
-  'respondido': 'responded',
-  'entrevista': 'interview',
-  'oferta': 'offer',
-  'rechazado': 'rejected', 'rechazada': 'rejected',
-  'descartado': 'discarded', 'descartada': 'discarded', 'cerrada': 'discarded', 'cancelada': 'discarded',
-  'no aplicar': 'skip', 'no_aplicar': 'skip', 'monitor': 'skip', 'geo blocker': 'skip',
-};
 
 let errors = 0;
 let warnings = 0;
@@ -72,7 +50,7 @@ const lines = content.split('\n');
 
 // Columns are mapped by header name (tracker-rows.mjs), so a tracker with an
 // extra Location column is checked as correctly as the original 9-column one.
-const COLMAP = detectColumns(lines) || LEGACY_COLMAP;
+const COLMAP = columnsOf(lines);
 const MAX_IDX = Math.max(...Object.values(COLMAP));
 const entries = lines.filter(l => l.startsWith('|')).map(l => parseRow(l, COLMAP)).filter(Boolean);
 
@@ -81,11 +59,7 @@ console.log(`\n📊 Checking ${entries.length} entries in applications.md\n`);
 // --- Check 1: Canonical statuses ---
 let badStatuses = 0;
 for (const e of entries) {
-  const clean = e.status.replace(/\*\*/g, '').trim().toLowerCase();
-  // Strip trailing dates
-  const statusOnly = clean.replace(/\s+\d{4}-\d{2}-\d{2}.*$/, '').trim();
-
-  if (!CANONICAL_STATUSES.includes(statusOnly) && !ALIASES[statusOnly]) {
+  if (!CANONICAL_STATUSES.includes(normalizeStatus(e.status))) {
     error(`#${e.num}: Non-canonical status "${e.status}"`);
     badStatuses++;
   }
@@ -113,7 +87,7 @@ for (const e of entries) {
   if (!companyRoleMap.has(key)) companyRoleMap.set(key, []);
   companyRoleMap.get(key).push(e);
 }
-for (const [key, group] of companyRoleMap) {
+for (const group of companyRoleMap.values()) {
   if (group.length > 1) {
     warn(`Possible duplicates: ${group.map(e => `#${e.num}`).join(', ')} (${group[0].company} — ${group[0].role})`);
     dupes++;
@@ -176,7 +150,7 @@ if (badUrls === 0) ok('All live rows have an apply link');
 let badScores = 0;
 for (const e of entries) {
   const s = e.score.replace(/\*\*/g, '').trim();
-  if (!/^\d+\.?\d*\/5$/.test(s) && s !== 'N/A' && s !== 'DUP') {
+  if (!SCORE_CELL.test(s)) {
     error(`#${e.num}: Invalid score format: "${e.score}"`);
     badScores++;
   }
@@ -187,9 +161,7 @@ if (badScores === 0) ok('All scores valid');
 let badRows = 0;
 for (const line of lines) {
   if (!line.startsWith('|')) continue;
-  // Separator rows only — see merge-tracker.mjs. A bare includes('---') also
-  // skipped data rows whose report link contains "---" from a slugified role.
-  if (/^\s*\|[\s:|-]*\|\s*$/.test(line)) continue;
+  if (isSeparatorRow(line)) continue;
   const parts = line.split('|');
   if (parts.length <= MAX_IDX) {
     error(`Row with too few columns (need ${MAX_IDX} data cols): ${line.substring(0, 80)}...`);

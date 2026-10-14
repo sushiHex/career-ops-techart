@@ -22,6 +22,7 @@
  */
 import { readFileSync, writeFileSync, existsSync, copyFileSync } from 'fs';
 import { join } from 'path';
+import { reportFileOf } from './tracker-rows.mjs';
 
 // Sibling modules resolve beside this file, so it runs from any directory; the
 // data it reads (data/, reports/) stays relative to where it is run.
@@ -62,8 +63,8 @@ for (const line of lines) {
   const cells = c.map((x) => x.trim());
   if (cells.length < 8 || !/^\d+$/.test(cells[1] || '')) { out.push(line); continue; }
 
-  const rm = line.match(/\((?:\.\.\/)?reports\/([^)]+)\)/);
-  const p = rm ? join('reports', rm[1].split('/').pop()) : null;
+  const reportFile = reportFileOf(line);
+  const p = reportFile ? join('reports', reportFile) : null;
   if (!p || !existsSync(p)) { out.push(line); continue; }
 
   const text = readFileSync(p, 'utf-8');

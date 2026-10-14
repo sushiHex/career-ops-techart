@@ -216,6 +216,7 @@ def says_remote(*texts):
     """True when any of `texts` names remote work."""
     return any(REMOTE.search(t or "") for t in texts)
 
+
 # Both public SmartRecruiters URL shapes. The `/postings/` segment is not exotic: this
 # pipeline MINTS it, because providers/smartrecruiters.mjs rewrites the API's own `ref`
 # into jobs.smartrecruiters.com/{company}/postings/{id}. The pattern used to read
@@ -287,12 +288,15 @@ def portals_index():
     global _PORTALS
     if _PORTALS is not None:
         return _PORTALS
-    _PORTALS = []
     try:
         text = open(portals_path(), encoding="utf-8",
                     errors="replace").read()
     except OSError:
+        _PORTALS = []
         return _PORTALS
+    # Built in full before it is published, so no caller (a second thread, or a later
+    # call after a parse error) ever reads a partial list as the whole file.
+    entries = []
     for block in re.split(r"\n  - name:", text)[1:]:
         label = block.split("\n")[0].strip()
         # Labels carry descriptive suffixes: "SentinelOne (AI Developer Experience /
@@ -314,13 +318,14 @@ def portals_index():
             loose.add(first)
         slugs = list(dict.fromkeys(a or b for a, b in GH_SLUG.findall(block) if a or b))
         wd = WD_TENANT_URL.search(block)
-        _PORTALS.append(dict(
+        entries.append(dict(
             label=label, base=base.strip(), keys=keys, loose=loose, slugs=slugs,
             # Every ATS board slug the entry declares, lowercased, so a caller holding a
             # slug (eval-prep naming a packet's employer) can find the entry's label.
             boards={m.lower() for m in slugs + BOARD_SLUG.findall(block)},
             workday=(wd.group(1), wd.group(2), wd.group(3)) if wd else None))
-    return _PORTALS
+    _PORTALS = entries
+    return entries
 
 
 def portal_boards(url):
@@ -527,21 +532,27 @@ ATLASSIAN_MIN_BOARD = 50
 _BOARDS = {}
 
 
-def board_fetch(url):
-    """fetch() for a whole-board endpoint, kept for the life of the process.
+def board_fetch(url, parse=lambda body: body):
+    """(status, parse(body)) for a whole-board endpoint, kept for the life of the process.
 
-    The GitHub and Atlassian adapters read a 1.5 to 2.4 MB board to answer about ONE
-    posting, and verify-report-urls resolves reports one at a time, so a run re-downloaded
-    the same board once per report (13 GitHub reports cost about 39 MB). Only a 200 with
-    a body is kept, so a failed read is retried. Keyed on the fetch function too, so a
-    selftest's patched fetch never reads a board an earlier fetch filled.
+    The adapters that read a whole board (Greenhouse listing, Ashby API and board page,
+    Breezy, GitHub, Atlassian) answer about ONE posting from a board of up to 2.4 MB, and
+    verify-report-urls resolves reports one at a time, so a run re-downloaded the same
+    board once per report (13 GitHub reports cost about 39 MB). The second value is None
+    unless the status is 200 with a body. What is kept is the PARSED board, and only one
+    the caller's own `parse` accepted, so a WAF page, a truncated body or a transient
+    error is retried by the next row rather than reused by every row. Keyed on the fetch
+    function as well, so a selftest's patched fetch never reads a board an earlier fetch
+    filled. One URL has one parser, and callers treat the parsed board as read-only: it
+    is shared.
     """
     key = (fetch, url)
     if key not in _BOARDS:
         st, body = fetch(url)
-        if st != 200 or not body:
-            return st, body
-        _BOARDS[key] = (st, body)
+        got = parse(body) if st == 200 and body else None
+        if not got or got is UNREADABLE:
+            return st, got
+        _BOARDS[key] = (st, got)
     return _BOARDS[key]
 
 
@@ -1419,7 +1430,7 @@ def greenhouse_claim(u, allow_inference):
                 for b in boards:
                     bst, blist = board_fetch(f"https://boards-api.greenhouse.io/v1/boards/{b}/jobs")
                     if bst == 200:
-                        good, listing = b, blist
+                        good, listing = b, blist or ""
                         break
                 if not good:
                     # Last resort: ask the posting page which board it embeds.
@@ -1630,9 +1641,9 @@ def resolve(url):
     m = re.search(OUTER_HOST + r"jobs\.ashbyhq\.com/([\w-]+)/([0-9a-f-]{16,})", ou)
     if m:
         org, jid = m.group(1), m.group(2)
-        st, body = board_fetch(f"https://api.ashbyhq.com/posting-api/job-board/{org}?includeCompensation=true")
-        if st == 200 and body:
-            d = jload(body, need=("jobs",))
+        st, d = board_fetch(f"https://api.ashbyhq.com/posting-api/job-board/{org}?includeCompensation=true",
+                            lambda body: jload(body, need=("jobs",)))
+        if d is not None:
             if d is UNREADABLE:
                 return unreadable("ashby", st, "the posting API response")
             for j in d.get("jobs", []):
@@ -1673,8 +1684,9 @@ def resolve(url):
         if got:
             got["status"] = st
             return got
-        bst, bpage = board_fetch(f"https://jobs.ashbyhq.com/{org}")
-        rows = _ashby_embed.postings(bpage, org) if bst == 200 else []
+        _, rows = board_fetch(f"https://jobs.ashbyhq.com/{org}",
+                              lambda page: _ashby_embed.postings(page, org))
+        rows = rows or []
         for r in rows:
             if str(r.get("id", "")).lower() == jid.lower():
                 # On the board but not readable on its own page. Live, with the listing's
@@ -1749,9 +1761,10 @@ def resolve(url):
             # Stale slug, not a closure. Ask the tenant for the current path.
             ep, searched = workday_reslug(tenant, wd, site, path)
             if ep:
-                st2, body2 = fetch(f"{base}/{ep}")
-                if st2 == 200 and body2:
-                    return cxs_record(st2, body2, "the re-slugged CXS detail response",
+                # The search FOUND the current path, so whatever its detail read says is
+                # the answer; a failed read falling through to "absent = closed" below
+                # used to retire a req the search had just located.
+                return workday_detail(base, ep, "the re-slugged CXS detail response",
                                       reslugged=True)
             # Search saw nothing carrying this req id, which for Workday means the
             # posting is no longer in the active index. That verdict rests entirely on
@@ -1956,9 +1969,8 @@ def resolve(url):
     m = re.search(OUTER_HOST + r"([\w-]+)\.breezy\.hr/p/([0-9a-f]+)", ou)
     if m:
         org, pid = m.group(1), m.group(2)
-        st, body = board_fetch(f"https://{org}.breezy.hr/json")
-        if st == 200 and body:
-            board = jload(body, want=list)
+        st, board = board_fetch(f"https://{org}.breezy.hr/json", lambda body: jload(body, want=list))
+        if board is not None:
             if board is UNREADABLE:
                 return unreadable("breezy", st, "the board JSON")
             # A list that holds no posting RECORD is the same unreadable answer as a
@@ -1988,7 +2000,7 @@ def resolve(url):
                 return dict(ats="breezy", live=True, title=j.get("name"), org=org,
                             location=" | ".join(dict.fromkeys(locs)) or None,
                             jd=jd, pay=pays(paytxt) or pays(jd),
-                            remote_txt=any((L or {}).get("is_remote") for L in places))
+                            remote_txt=any(L.get("is_remote") for L in places))
             return dict(ats="breezy", live=False, note="absent from board = closed")
         return dict(ats="breezy", live=None, status=st, note="board not retrievable")
 
@@ -2004,10 +2016,10 @@ def resolve(url):
         # FEWER than its own count is a response disagreeing with itself, not a closure.
         total, seen = None, 0
         for page in range(1, 8):
-            st, body = board_fetch(f"https://www.github.careers/api/jobs?page={page}&limit=100")
-            if st != 200 or not body:
+            st, env = board_fetch(f"https://www.github.careers/api/jobs?page={page}&limit=100",
+                                  lambda body: jload(body, need=("jobs",)))
+            if env is None:
                 break
-            env = jload(body, need=("jobs",))
             if env is UNREADABLE:
                 return unreadable("github", st, f"page {page} of the jobs API")
             if page == 1 and isinstance(env.get("totalCount"), int):
@@ -2044,10 +2056,10 @@ def resolve(url):
     m = re.search(OUTER_HOST + r"atlassian\.com/company/careers/details/(\d+)", ou)
     if m:
         jid = m.group(1)
-        st, body = board_fetch("https://www.atlassian.com/endpoint/careers/listings")
-        if not (st == 200 and body):
+        st, board = board_fetch("https://www.atlassian.com/endpoint/careers/listings",
+                                lambda body: jload(body, want=list))
+        if board is None:
             return dict(ats="atlassian", live=None, status=st, note="board not retrievable")
-        board = jload(body, want=list)
         if board is UNREADABLE:
             return unreadable("atlassian", st, "the listings JSON")
         # Same rule as Breezy: an absence is evidence only on a board that was read
@@ -3121,6 +3133,17 @@ def behaviour_cases():
     # bare `patronus` Ashby board is recorded in CLAUDE.md as a decoy serving an empty
     # array while the real board is `patronusaiinc`.
     ASHBY_URL = "https://jobs.ashbyhq.com/acme/0f1db59b-b272-644c-af35-f84c91963e3b"
+    # A WAF page at HTTP 200 is not cached: the next row re-reads the board and gets the
+    # real answer, instead of every row on that org inheriting "unreadable".
+    _answers = iter([(200, "<html>challenge</html>"),
+                     (200, json.dumps({"jobs": [{"id": "0f1db59b-b272-644c-af35-f84c91963e3b",
+                                                 "title": "Engineer", "location": "Remote"}]}))])
+    _flaky = lambda *a, **k: next(_answers)
+    first = with_fetch(_flaky, ASHBY_URL)
+    second = with_fetch(_flaky, ASHBY_URL)
+    check(first.get("live") is None and second.get("live") is True,
+          f"a bad board read must be retried, not cached: {first.get('live')} then "
+          f"{second.get('live')} ({second.get('note')})")
     r = with_fetch(lambda *a, **k: (200, json.dumps({"jobs": []})), ASHBY_URL)
     check(r.get("live") is None,
           f"an EMPTY Ashby board must not close a row: {r.get('live')} {r.get('note')}")
@@ -3753,6 +3776,12 @@ def behaviour_cases():
     check(r.get("live") is None,
           f"a re-slugged empty nested record must be unknown, got live={r.get('live')} "
           f"({r.get('note')})")
+    # The search found the current path and its detail read came back empty: nothing was
+    # read, so that is unknown. It used to fall through to "absent from search = closed".
+    r = with_wd((200, HIT), live_body="")
+    check(r.get("live") is None,
+          f"a failed read of a FOUND re-slugged path must be unknown, got "
+          f"live={r.get('live')} ({r.get('note')})")
     # The flag itself, not only what the caller does with it.
     with mock.patch.object(sys.modules[__name__], "post", lambda *a, **k: (0, "")):
         check(workday_reslug("nvidia", "wd5", "S", "job/x/y_JR2391853") == (None, False),

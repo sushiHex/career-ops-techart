@@ -22,13 +22,26 @@ const ROOT = __dirname;
 const QUICK = process.argv.includes('--quick');
 const NODE = process.execPath;
 
+// Every temporary directory this run creates lives under one root that is removed when
+// the run ends, so no case can leak one. tmpdir() reads TEMP/TMP/TMPDIR on every call,
+// and the Node and Python children the suite spawns inherit them.
+const RUN_TMP = mkdtempSync(join(tmpdir(), 'career-ops-test-'));
+for (const k of ['TEMP', 'TMP', 'TMPDIR']) process.env[k] = RUN_TMP;
+process.on('exit', () => {
+  // Best effort: a file still held open (antivirus, a killed child) must not turn a
+  // finished run into a stack trace. The run's own exit code already stands.
+  try { rmSync(RUN_TMP, { recursive: true, force: true, maxRetries: 3 }); } catch { /* left for the OS */ }
+});
+
+const TRACKER_HEAD = '# Applications Tracker\n\n' +
+  '| # | Date | Company | Role | Score | Status | PDF | Report | Notes |\n' +
+  '|---|------|---------|------|-------|--------|-----|--------|-------|\n';
+
 // Every tool reads its configuration from CAREER_OPS_CONFIG_DIR when it is set. Point it
 // at an empty directory for this whole run, children included, so the suite sees no
 // configuration at all: a result must not depend on whose profile, location policy or
 // lane vocabulary happens to be installed. Tests that need a config build their own.
-const NO_CONFIG = mkdtempSync(join(tmpdir(), 'career-ops-noconfig-'));
-process.env.CAREER_OPS_CONFIG_DIR = NO_CONFIG;
-process.on('exit', () => rmSync(NO_CONFIG, { recursive: true, force: true }));
+process.env.CAREER_OPS_CONFIG_DIR = mkdtempSync(join(RUN_TMP, 'noconfig-'));
 
 let passed = 0;
 let failed = 0;
@@ -234,21 +247,20 @@ const scripts = [
   { name: 'score-model-tests.mjs', expectExit: 0 },
   { name: 'tracker-columns-tests.mjs', expectExit: 0 },
   { name: 'validate-portals.mjs --file templates/portals.example.yml', expectExit: 0 },
-  // Bare run: no portals.yml in the repo, so it must exit 0 gracefully (and hit
-  // no network). The probe logic itself is unit-tested below with a mock.
-  //
-  // Needs a longer timeout than the shared default. With a real user portals.yml this
-  // probes every ATS board in the file, so its runtime scales with that file rather
-  // than with anything in the repo. It sat around 8s at 80 boards; adding the
-  // coverage-gap employers on 2026-08-24 took it past 100, and it began intermittently
-  // tripping the 30s default and reporting as a crash. The work is network-bound, not
-  // slow code, so the timeout is what should move.
-  { name: 'verify-portals.mjs', expectExit: 0, timeoutMs: 120000 },
+  // Bare run with no portals file: it must exit 0 gracefully and hit no network. It is
+  // pointed at a missing file on purpose, because against an installed portals.yml it
+  // probes every board in it (15s and growing); the probe logic is unit-tested below
+  // with a mock.
+  { name: 'verify-portals.mjs', expectExit: 0,
+    env: { CAREER_OPS_PORTALS: join(RUN_TMP, 'no-portals.yml') } },
 ];
 
-for (const { name, allowFail, timeoutMs } of scripts) {
-  const result = run(NODE, name.split(' '),
-    { stdio: ['pipe', 'pipe', 'pipe'], ...(timeoutMs ? { timeout: timeoutMs } : {}) });
+for (const { name, allowFail, timeoutMs, env } of scripts) {
+  const result = run(NODE, name.split(' '), {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    ...(timeoutMs ? { timeout: timeoutMs } : {}),
+    ...(env ? { env: { ...process.env, ...env } } : {}),
+  });
   if (result !== null) {
     pass(`${name} runs OK`);
   } else if (allowFail) {
@@ -1393,22 +1405,33 @@ try {
   // flags, no factors, no min) via audit-scores.mjs and wrote that into the tracker's FINAL
   // column, which would have moved 234 rows while apply-model and score-audit both called
   // the same tracker clean.
+  // The three tracker writers read CAREER_OPS_TRACKER, so for them a broken guard here
+  // would rewrite a scratch tracker, not the real one; the other two preview by default.
+  // Those three take nothing but their flags, so a bare word or a "-1" (which the generic
+  // guard lets through as a flag value) must be refused as well.
+  const guardDir = join(RUN_TMP, 'guard');
+  const guardEnv = { ...process.env, CAREER_OPS_TRACKER: join(guardDir, 'applications.md'),
+    CAREER_OPS_ADDITIONS: join(guardDir, 'additions') };
+  const FLAGS_ONLY = new Set(['dedup-tracker.mjs', 'normalize-statuses.mjs', 'merge-tracker.mjs']);
   for (const script of ['dedup-tracker.mjs', 'normalize-statuses.mjs',
     'merge-tracker.mjs', 'refresh-job-links.mjs',
     'rederive-red-flags.mjs']) {
-    const helpOut = run('node', [join(ROOT, script), '--help'], { cwd: ROOT });
+    const helpOut = run('node', [join(ROOT, script), '--help'], { cwd: ROOT, env: guardEnv });
     const helped = typeof helpOut === 'string' && /--help/.test(helpOut);
 
-    let refusedCode = null;
-    try {
-      execFileSync('node', [join(ROOT, script), '--definitely-not-a-flag'],
-        { cwd: ROOT, stdio: ['pipe', 'pipe', 'pipe'] });
-    } catch (e) { refusedCode = e.status; }
+    const bad = ['--definitely-not-a-flag', ...(FLAGS_ONLY.has(script) ? ['-1', 'dry-run'] : [])];
+    const codes = bad.map((arg) => {
+      try {
+        execFileSync('node', [join(ROOT, script), arg],
+          { cwd: ROOT, env: guardEnv, stdio: ['pipe', 'pipe', 'pipe'] });
+        return 0;
+      } catch (e) { return e.status; }
+    });
 
-    if (helped && refusedCode === 2) {
-      pass(`${script}: --help prints usage, unknown flag exits 2`);
+    if (helped && codes.every((c) => c === 2)) {
+      pass(`${script}: --help prints usage, ${bad.join(' / ')} exit 2`);
     } else {
-      fail(`${script}: help=${helped}, unknown-flag exit=${refusedCode} (want usage + exit 2)`);
+      fail(`${script}: help=${helped}, exits ${codes.join('/')} for ${bad.join(' / ')} (want usage + exit 2)`);
     }
   }
 
@@ -2890,9 +2913,7 @@ try {
     writeFileSync(join(tmpDir, 'reports', '012-acme-2026-01-04.md'), '# fixture\n');
     const tracker = join(tmpDir, 'data', 'applications.md');
     writeFileSync(tracker,
-      '# Applications Tracker\n\n' +
-      '| # | Date | Company | Role | Score | Status | PDF | Report | Notes |\n' +
-      '|---|------|---------|------|-------|--------|-----|--------|-------|\n' +
+      TRACKER_HEAD +
       '| 12 | 2026-01-04 | Acme | Engineer | 4.2/5 | Evaluated | ✅ | [12](reports/012-acme-2026-01-04.md) | ok |\n');
 
     // Migrate by pointing the script at the fixture tracker via env override.
@@ -2944,9 +2965,7 @@ try {
     mkdirSync(join(dedupTmp, 'data'));
     const tracker = join(dedupTmp, 'data', 'applications.md');
     writeFileSync(tracker,
-      '# Applications Tracker\n\n' +
-      '| # | Date | Company | Role | Score | Status | PDF | Report | Notes |\n' +
-      '|---|------|---------|------|-------|--------|-----|--------|-------|\n' +
+      TRACKER_HEAD +
       '| 21 | 2026-01-08 | Acme | Full Stack Engineer, Foundation | 3.9/5 | Applied | ❌ | [21](../reports/021-foundation.md) | applied sibling |\n' +
       '| 22 | 2026-01-08 | Acme | Full Stack Engineer, Guarded Releases | 4.3/5 | Evaluated | ❌ | [22](../reports/022-guarded.md) | evaluated sibling |\n' +
       '| 23 | 2026-01-08 | Acme | Staff Software Engineer, API | 4.0/5 | Evaluated | ❌ | [23](../reports/023-api.md) | acronym sibling |\n' +
@@ -3020,9 +3039,7 @@ try {
     // guard doesn't block the collapse), so dedup promotes #50's status and
     // rewrites the row — exercising rebuildRow() on a no-trailing-pipe row.
     writeFileSync(tracker,
-      '# Applications Tracker\n\n' +
-      '| # | Date | Company | Role | Score | Status | PDF | Report | Notes |\n' +
-      '|---|------|---------|------|-------|--------|-----|--------|-------|\n' +
+      TRACKER_HEAD +
       '| 50 | 2026-02-01 | Globex | Widget Engineer | 4.5/5 | Rejected | ❌ | [50](../reports/050-widget.md) | KEEPER_NOTE_SENTINEL\n' +
       '| 51 | 2026-02-02 | Globex | Widget Engineer | 3.0/5 | Evaluated | ❌ | [51](../reports/051-widget.md) | dup row |\n');
 
@@ -3071,9 +3088,7 @@ try {
     // report 592 instead of report 591, sees a real disagreement while a
     // link-keyed lookup sees none.
     writeFileSync(tracker,
-      '# Applications Tracker\n\n' +
-      '| # | Date | Company | Role | Score | Status | PDF | Report | Notes |\n' +
-      '|---|------|---------|------|-------|--------|-----|--------|-------|\n' +
+      TRACKER_HEAD +
       '| 592 | 2026-09-19 | Fixtureco | Report Link Fixture One | 4.05/5 | Evaluated | ❌ | [592](../reports/591-fixture-link-one-2026-09-19.md) | row number is one more than its linked report |\n' +
       '| 593 | 2026-09-19 | Fixtureco | Report Link Fixture Two | 3.64/5 | Evaluated | ❌ | [593](../reports/592-fixture-link-two-2026-09-19.md) | row number is one more than its linked report |\n' +
       '| 594 | 2026-09-19 | Fixtureco | Report Link Fixture Unlinked | 4.0/5 | Evaluated | ❌ | not yet linked | no parseable report link at all, must read NOT CHECKED |\n');
@@ -3161,9 +3176,6 @@ console.log('\n🧪 Testing verify-board reports NOT CHECKED, not a silent pass,
 // One merge-tracker fixture: a tracker holding `rows`, report files and TSV additions,
 // merged in a temp dir. Returns the merged tracker text, or null if merge-tracker crashed;
 // `inspect(trackerPath)`, when given, runs after the merge and before the dir is removed.
-const TRACKER_HEAD = '# Applications Tracker\n\n' +
-  '| # | Date | Company | Role | Score | Status | PDF | Report | Notes |\n' +
-  '|---|------|---------|------|-------|--------|-----|--------|-------|\n';
 const mergeFixture = (prefix, { rows, reports = {}, tsvs = {}, inspect }) => {
   const dir = mkdtempSync(join(tmpdir(), prefix));
   try {
@@ -3194,45 +3206,43 @@ const mergeFixture = (prefix, { rows, reports = {}, tsvs = {}, inspect }) => {
 // distinct specialties fall below the 0.6 threshold.
 console.log('\n🧪 Testing merge-tracker fuzzy dedup (distinct roles vs reposts)...');
 try {
-  {
-    const merged = mergeFixture('career-ops-merge-', {
-      rows: [
-        '| 1 | 2026-01-04 | StreamCo | Full Stack Engineer 5, Ads Reporting | 4.4/5 | Evaluated | ❌ | [1](../reports/001-streamco-2026-01-04.md) | existing |',
-        '| 2 | 2026-01-04 | Uber | Senior Software Engineer, Consumer Fulfillment (UberEats) | 4.2/5 | Evaluated | ❌ | [2](../reports/002-uber-2026-01-04.md) | existing |',
-      ],
-      reports: Object.fromEntries(['001-streamco-2026-01-04', '002-uber-2026-01-04', '003-streamco-2026-01-05',
-        '004-uber-2026-01-05', '005-streamco-2026-01-06'].map(n => [`${n}.md`, '# fixture'])),
-      // Two DISTINCT roles (long shared prefix / shared brand token) + one true repost (score bump).
-      tsvs: {
-        '003-streamco.tsv': '3\t2026-01-05\tStreamCo\tFull-Stack Engineer 5, AI Insights & Visualizations\tEvaluated\t4.6/5\t❌\t[3](reports/003-streamco-2026-01-05.md)\tdistinct role',
-        '004-uber.tsv': '4\t2026-01-05\tUber\tSenior Software Engineer, UberEats Feed\tEvaluated\t4.1/5\t❌\t[4](reports/004-uber-2026-01-05.md)\tdistinct team (#751)',
-        '005-streamco.tsv': '5\t2026-01-06\tStreamCo\tFull Stack Engineer 5, Ads Reporting\tEvaluated\t4.5/5\t❌\t[5](reports/005-streamco-2026-01-06.md)\trepost',
-      },
-    });
-    if (merged === null) {
-      fail('merge-tracker.mjs crashed during fuzzy dedup regression test');
+  const merged = mergeFixture('career-ops-merge-', {
+    rows: [
+      '| 1 | 2026-01-04 | StreamCo | Full Stack Engineer 5, Ads Reporting | 4.4/5 | Evaluated | ❌ | [1](../reports/001-streamco-2026-01-04.md) | existing |',
+      '| 2 | 2026-01-04 | Uber | Senior Software Engineer, Consumer Fulfillment (UberEats) | 4.2/5 | Evaluated | ❌ | [2](../reports/002-uber-2026-01-04.md) | existing |',
+    ],
+    reports: Object.fromEntries(['001-streamco-2026-01-04', '002-uber-2026-01-04', '003-streamco-2026-01-05',
+      '004-uber-2026-01-05', '005-streamco-2026-01-06'].map(n => [`${n}.md`, '# fixture'])),
+    // Two DISTINCT roles (long shared prefix / shared brand token) + one true repost (score bump).
+    tsvs: {
+      '003-streamco.tsv': '3\t2026-01-05\tStreamCo\tFull-Stack Engineer 5, AI Insights & Visualizations\tEvaluated\t4.6/5\t❌\t[3](reports/003-streamco-2026-01-05.md)\tdistinct role',
+      '004-uber.tsv': '4\t2026-01-05\tUber\tSenior Software Engineer, UberEats Feed\tEvaluated\t4.1/5\t❌\t[4](reports/004-uber-2026-01-05.md)\tdistinct team (#751)',
+      '005-streamco.tsv': '5\t2026-01-06\tStreamCo\tFull Stack Engineer 5, Ads Reporting\tEvaluated\t4.5/5\t❌\t[5](reports/005-streamco-2026-01-06.md)\trepost',
+    },
+  });
+  if (merged === null) {
+    fail('merge-tracker.mjs crashed during fuzzy dedup regression test');
+  } else {
+    // Distinct role sharing a long prefix must be ADDED, not folded into the existing row.
+    if (merged.includes('AI Insights & Visualizations') && merged.includes('Ads Reporting')) {
+      pass('distinct roles with shared prefix kept as separate rows');
     } else {
-      // Distinct role sharing a long prefix must be ADDED, not folded into the existing row.
-      if (merged.includes('AI Insights & Visualizations') && merged.includes('Ads Reporting')) {
-        pass('distinct roles with shared prefix kept as separate rows');
-      } else {
-        fail('distinct role with shared prefix was merged away (silent data loss)');
-      }
+      fail('distinct role with shared prefix was merged away (silent data loss)');
+    }
 
-      // #751 repro: different teams under one brand token must both survive.
-      if (merged.includes('UberEats Feed') && merged.includes('Consumer Fulfillment')) {
-        pass('brand-token roles (#751: UberEats Feed vs Consumer Fulfillment) kept separate');
-      } else {
-        fail('brand-token roles were deduped (#751 regression)');
-      }
+    // #751 repro: different teams under one brand token must both survive.
+    if (merged.includes('UberEats Feed') && merged.includes('Consumer Fulfillment')) {
+      pass('brand-token roles (#751: UberEats Feed vs Consumer Fulfillment) kept separate');
+    } else {
+      fail('brand-token roles were deduped (#751 regression)');
+    }
 
-      // True repost (identical role tokens) must still UPDATE in place — exactly one row, score bumped.
-      const adsRows = merged.split('\n').filter(l => l.includes('Ads Reporting'));
-      if (adsRows.length === 1 && adsRows[0].includes('4.5/5')) {
-        pass('true repost still updates the existing row in place (4.4 → 4.5, no duplicate)');
-      } else {
-        fail(`repost handling broken: ${adsRows.length} 'Ads Reporting' rows, expected 1 updated to 4.5/5`);
-      }
+    // True repost (identical role tokens) must still UPDATE in place — exactly one row, score bumped.
+    const adsRows = merged.split('\n').filter(l => l.includes('Ads Reporting'));
+    if (adsRows.length === 1 && adsRows[0].includes('4.5/5')) {
+      pass('true repost still updates the existing row in place (4.4 → 4.5, no duplicate)');
+    } else {
+      fail(`repost handling broken: ${adsRows.length} 'Ads Reporting' rows, expected 1 updated to 4.5/5`);
     }
   }
 } catch (e) {
@@ -3457,37 +3467,35 @@ try {
 // update it in-place instead of appending NewCo as a new row.
 console.log('\n🧪 Testing merge-tracker report-number cross-company collision (#912)...');
 try {
-  {
-    const col912Merged = mergeFixture('career-ops-merge-912-', {
-      rows: ['| 1 | 2026-01-01 | OtherCo | Staff Engineer | 4.0/5 | Evaluated | ❌ | [1](../reports/001-otherco-2026-01-01.md) | original |'],
-      reports: { '001-otherco-2026-01-01.md': '# fixture', '001-newco-2026-01-05.md': '# fixture' },
-      // NewCo TSV also carries report number [1] — cross-company collision
-      tsvs: { '001-newco.tsv': '1\t2026-01-05\tNewCo\tNew Role\tEvaluated\t2.7/5\t❌\t[1](reports/001-newco-2026-01-05.md)\tcollision' },
-    });
-    if (col912Merged === null) {
-      fail('merge-tracker crashed during report-number collision test (#912)');
+  const col912Merged = mergeFixture('career-ops-merge-912-', {
+    rows: ['| 1 | 2026-01-01 | OtherCo | Staff Engineer | 4.0/5 | Evaluated | ❌ | [1](../reports/001-otherco-2026-01-01.md) | original |'],
+    reports: { '001-otherco-2026-01-01.md': '# fixture', '001-newco-2026-01-05.md': '# fixture' },
+    // NewCo TSV also carries report number [1] — cross-company collision
+    tsvs: { '001-newco.tsv': '1\t2026-01-05\tNewCo\tNew Role\tEvaluated\t2.7/5\t❌\t[1](reports/001-newco-2026-01-05.md)\tcollision' },
+  });
+  if (col912Merged === null) {
+    fail('merge-tracker crashed during report-number collision test (#912)');
+  } else {
+    const col912Rows = col912Merged.split('\n').filter(l => l.startsWith('| ') && !l.startsWith('| #') && !l.startsWith('|---'));
+    const expectedOtherCoRow = '| 1 | 2026-01-01 | OtherCo | Staff Engineer | 4.0/5 | Evaluated | ❌ | [1](../reports/001-otherco-2026-01-01.md) | original |';
+
+    if (col912Rows.length === 2) {
+      pass('report-number collision (#912): merged tracker has exactly 2 rows');
     } else {
-      const col912Rows = col912Merged.split('\n').filter(l => l.startsWith('| ') && !l.startsWith('| #') && !l.startsWith('|---'));
-      const expectedOtherCoRow = '| 1 | 2026-01-01 | OtherCo | Staff Engineer | 4.0/5 | Evaluated | ❌ | [1](../reports/001-otherco-2026-01-01.md) | original |';
+      fail(`report-number collision (#912): expected 2 rows, got ${col912Rows.length}`);
+    }
 
-      if (col912Rows.length === 2) {
-        pass('report-number collision (#912): merged tracker has exactly 2 rows');
-      } else {
-        fail(`report-number collision (#912): expected 2 rows, got ${col912Rows.length}`);
-      }
+    if (col912Rows.some(r => r.trim() === expectedOtherCoRow.trim())) {
+      pass('report-number collision (#912): existing OtherCo row left untouched (exact match)');
+    } else {
+      fail('report-number collision (#912): OtherCo row was overwritten by NewCo addition');
+    }
 
-      if (col912Rows.some(r => r.trim() === expectedOtherCoRow.trim())) {
-        pass('report-number collision (#912): existing OtherCo row left untouched (exact match)');
-      } else {
-        fail('report-number collision (#912): OtherCo row was overwritten by NewCo addition');
-      }
-
-      const expectedNewCoRow = '| 2 | 2026-01-05 | NewCo | New Role | 2.7/5 | Evaluated | ❌ | [1](../reports/001-newco-2026-01-05.md) | collision |';
-      if (col912Rows.some(r => r.trim() === expectedNewCoRow.trim())) {
-        pass('report-number collision (#912): NewCo appended as a new entry with correct data');
-      } else {
-        fail('report-number collision (#912): NewCo entry was swallowed or has incorrect data');
-      }
+    const expectedNewCoRow = '| 2 | 2026-01-05 | NewCo | New Role | 2.7/5 | Evaluated | ❌ | [1](../reports/001-newco-2026-01-05.md) | collision |';
+    if (col912Rows.some(r => r.trim() === expectedNewCoRow.trim())) {
+      pass('report-number collision (#912): NewCo appended as a new entry with correct data');
+    } else {
+      fail('report-number collision (#912): NewCo entry was swallowed or has incorrect data');
     }
   }
 } catch (e) {
@@ -3587,9 +3595,7 @@ try {
     mkdirSync(additionsB);
 
     writeFileSync(join(mergeTmp, 'data', 'applications.md'),
-      '# Applications Tracker\n\n' +
-      '| # | Date | Company | Role | Score | Status | PDF | Report | Notes |\n' +
-      '|---|------|---------|------|-------|--------|-----|--------|-------|\n');
+      TRACKER_HEAD);
     writeFileSync(join(mergeTmp, 'reports', '010-alpha-2026-01-07.md'), '# fixture\n');
     writeFileSync(join(mergeTmp, 'reports', '011-beta-2026-01-07.md'), '# fixture\n');
     writeFileSync(join(additionsA, '010-alpha.tsv'),
@@ -3692,9 +3698,7 @@ if (!sqliteAvailable) {
 
       // 1. Round trip: clean canonical input must export byte-identical.
       const clean =
-        '# Applications Tracker\n\n' +
-        '| # | Date | Company | Role | Score | Status | PDF | Report | Notes |\n' +
-        '|---|------|---------|------|-------|--------|-----|--------|-------|\n' +
+        TRACKER_HEAD +
         '| 2 | 2026-01-05 | Beta | Designer | 4.0/5 | Applied | ✅ | [2](../reports/002-beta-2026-01-05.md) | second |\n' +
         '| 1 | 2026-01-04 | Acme | Engineer | 4.2/5 | Evaluated | ❌ | [1](../reports/001-acme-2026-01-04.md) | first |\n';
       writeFileSync(md, clean);
@@ -5127,9 +5131,7 @@ try {
     const calix = 'https://calix.wd1.myworkdayjobs.com/Calix/job/Remote/Staff-Software-Engineer-AI-ML_R11095';
     // Only the Workiva req is tracked. The Calix one is real pending work.
     writeFileSync(join(paTmp, 'data', 'applications.md'),
-      '# Applications Tracker\n\n' +
-      '| # | Date | Company | Role | Score | Status | PDF | Report | Notes |\n' +
-      '|---|------|---------|------|-------|--------|-----|--------|-------|\n' +
+      TRACKER_HEAD +
       '| 700 | 2026-09-19 | Workiva | Senior Staff Machine Learning Engineer - US (R11095) | 4.0/5 | Evaluated | x | [700](../reports/700-workiva-2026-09-19.md) | tracked |\n');
     writeFileSync(join(paTmp, 'data', 'pipeline.md'),
       '# Inbox\n\n' +
@@ -5622,9 +5624,7 @@ try {
     // Header and row agree with the stated final, so the ONLY thing that can
     // disagree is the model replay.
     writeFileSync(join(sepTmp, 'data', 'applications.md'),
-      '# Applications Tracker\n\n' +
-      '| # | Date | Company | Role | Score | Status | PDF | Report | Notes |\n' +
-      '|---|------|---------|------|-------|--------|-----|--------|-------|\n' +
+      TRACKER_HEAD +
       '| 700 | 2026-09-19 | Fixtureco | Legacy Separator Fixture | 2.0/5 | Evaluated | x | [700](../reports/700-legacy-em-dash-2026-09-19.md) | legacy em dash separator |\n' +
       '| 701 | 2026-09-19 | Fixtureco | Plain Separator Fixture | 2.0/5 | Evaluated | x | [701](../reports/701-plain-separator-2026-09-19.md) | plain separator |\n');
 
@@ -5688,9 +5688,7 @@ try {
       '```\n';
     const fixtures = [[710, 'not published', 'none'], [711, SUB, 'base'],
                       [712, SUB, 'total'], [713, SUB, 'unknown']];
-    let table = '# Applications Tracker\n\n' +
-      '| # | Date | Company | Role | Score | Status | PDF | Report | Notes |\n' +
-      '|---|------|---------|------|-------|--------|-----|--------|-------|\n';
+    let table = TRACKER_HEAD;
     for (const [num, posted, basis] of fixtures) {
       writeFileSync(join(cbTmp, 'reports', `${num}-comp-basis-2026-09-19.md`),
         cbReport(num, posted, basis));
@@ -5952,15 +5950,10 @@ try {
     // Two packets for one req inside a SINGLE invocation. The index is built once,
     // before either report exists, so without feeding each write back into it both
     // packets see an empty index and both write.
-    const p1 = join(dupTmp, 'batch', 'eval-queue', 'batch1.json');
-    const p2 = join(dupTmp, 'batch', 'eval-queue', 'batch2.json');
-    writeFileSync(p1, evalPacket({ slug: 'theta-title', url: 'https://example.invalid/fixture/job/900003' }));
-    writeFileSync(p2, evalPacket({ slug: 'iota-title', url: 'https://example.invalid/fixture/job/900003' }));
-    let oneRun = '';
-    try {
-      oneRun = execFileSync(NODE, [join(ROOT, 'eval-write.mjs'), p1, p2, '--date=2026-09-19'],
-        { cwd: dupTmp, encoding: 'utf-8', timeout: 30000 });
-    } catch (e) { oneRun = `${e.stdout || ''}${e.stderr || ''}`; }
+    const oneRun = runWrite([
+      packet('batch1.json', { slug: 'theta-title', url: 'https://example.invalid/fixture/job/900003' }),
+      packet('batch2.json', { slug: 'iota-title', url: 'https://example.invalid/fixture/job/900003' }),
+      '--date=2026-09-19']).out;
     if ((oneRun.match(/^WROTE /gm) || []).length === 1 && /SKIP .*already written as/.test(oneRun)) {
       pass('eval-write: two packets for one req in one invocation write one report');
     } else {

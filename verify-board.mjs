@@ -22,6 +22,7 @@
  */
 import { readFileSync, existsSync } from 'fs';
 import { join } from 'path';
+import { reportFileOf } from './tracker-rows.mjs';
 
 // Sibling modules resolve beside this file, so it runs from any directory; the
 // data it reads (data/, reports/) stays relative to where it is run.
@@ -53,13 +54,13 @@ for (const line of readFileSync(TRACKER, 'utf-8').split('\n')) {
   live++;
 
   const shown = parseFloat(String(c[5]).replace('/5', ''));
-  const rm = line.match(/\((?:\.\.\/)?reports\/([^)]+)\)/);
-  const p = rm ? join('reports', rm[1].split('/').pop()) : null;
+  const reportFile = reportFileOf(line);
+  const p = reportFile ? join('reports', reportFile) : null;
 
   let why = null;
   if (!Number.isFinite(shown)) why = `score cell is not a number ("${c[5]}")`;
   else if (shown < 0 || shown > 5) why = `score ${shown} is outside 0-5`;
-  else if (!rm) why = 'no report link';
+  else if (!reportFile) why = 'no report link';
   else if (!existsSync(p)) why = `report file missing (${p})`;
   else {
     const s = parseScores(readFileSync(p, 'utf-8'));

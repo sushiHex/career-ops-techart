@@ -439,11 +439,9 @@ function daysBetweenIsoDates(start, end) {
 
 export function shouldDedupScanHistoryRow({ firstSeen, status = 'added' }, { recheckAfterDays = null, today = new Date().toISOString().slice(0, 10) } = {}) {
   // Only an `added` row expires; a skip (skipped_invalid_url, skipped_blocked_host) is permanent.
-  if (status !== 'added') return true;
-  if (recheckAfterDays == null) return true;
+  if (status !== 'added' || recheckAfterDays == null) return true;
   const ageDays = daysBetweenIsoDates(firstSeen, today);
-  if (ageDays == null) return true;
-  return ageDays < recheckAfterDays;
+  return ageDays == null || ageDays < recheckAfterDays;
 }
 
 function scanHistoryPolicy(config = {}) {

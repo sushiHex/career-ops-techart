@@ -56,12 +56,11 @@ export function guardArgs(spec) {
     process.exit(0);
   }
 
-  // Only flag-shaped tokens are validated; positional arguments are left to the
-  // caller, which knows whether it takes any, unless it said it takes none.
+  // Only flag-shaped tokens are validated, unless the script said it takes nothing but
+  // its flags. A flag's value ("--min-threshold 3", "-1") is not flag-shaped, so it is
+  // left to the caller too; under `positional: false` there are no values to leave.
   const unknown = argv.filter(a => !known.has(a)
-    && (spec.positional === false || (a.startsWith('-') && !/^-?\d/.test(a))));
-  // A flag that takes a value ("--min-threshold 3") must not have its value
-  // treated as an unknown flag; values are not flag-shaped, so they never are.
+    && (spec.positional === false || (a.startsWith('-') && !/^-\d/.test(a))));
   if (unknown.length > 0) {
     console.error(`${spec.name}: unrecognised argument(s): ${unknown.join(', ')}`);
     console.error(spec.writesByDefault === false

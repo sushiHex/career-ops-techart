@@ -16,17 +16,16 @@ import { readFileSync, writeFileSync, copyFileSync, existsSync, mkdirSync } from
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { guardArgs } from './cli-guard.mjs';
-import { rebuildRow } from './tracker-rows.mjs';
+import { rebuildRow, trackerPath } from './tracker-rows.mjs';
 
 const CAREER_OPS = dirname(fileURLToPath(import.meta.url));
-// Support both layouts: data/applications.md (boilerplate) and applications.md (original)
-const APPS_FILE = existsSync(join(CAREER_OPS, 'data/applications.md'))
-  ? join(CAREER_OPS, 'data/applications.md')
-  : join(CAREER_OPS, 'applications.md');
+// CAREER_OPS_TRACKER lets tests point the script at an isolated fixture.
+const APPS_FILE = trackerPath(CAREER_OPS);
 const args = guardArgs({
   name: 'normalize-statuses.mjs',
   summary: 'rewrite non-canonical status values in the applications tracker',
   flags: [['--dry-run', 'report what would change, write nothing']],
+  positional: false,
   notes: 'Without --dry-run this REWRITES data/applications.md. A backup is written to applications.md.bak.',
 });
 const DRY_RUN = args.has('--dry-run');
@@ -104,7 +103,7 @@ const content = readFileSync(APPS_FILE, 'utf-8');
 const lines = content.split('\n');
 
 let changes = 0;
-let unknowns = [];
+const unknowns = [];
 
 for (let i = 0; i < lines.length; i++) {
   const line = lines[i];
@@ -113,7 +112,6 @@ for (let i = 0; i < lines.length; i++) {
   const parts = line.split('|').map(s => s.trim());
   // Format: ['', '#', 'fecha', 'empresa', 'rol', 'score', 'STATUS', 'pdf', 'report', 'notas', '']
   if (parts.length < 9) continue;
-  if (parts[1] === '#' || parts[1] === '---' || parts[1] === '') continue;
 
   const num = parseInt(parts[1]);
   if (isNaN(num)) continue;
@@ -128,18 +126,12 @@ for (let i = 0; i < lines.length; i++) {
 
   if (result.status === rawStatus) continue; // Already canonical
 
-  // Apply change
-  const oldStatus = rawStatus;
   parts[6] = result.status;
 
   // Move DUPLICADO info to notes if needed
-  if (result.moveToNotes && parts[9]) {
-    const existing = parts[9] || '';
-    if (!existing.includes(result.moveToNotes)) {
-      parts[9] = result.moveToNotes + (existing ? '. ' + existing : '');
-    }
-  } else if (result.moveToNotes && !parts[9]) {
-    parts[9] = result.moveToNotes;
+  const moved = result.moveToNotes;
+  if (moved && !(parts[9] || '').includes(moved)) {
+    parts[9] = parts[9] ? `${moved}. ${parts[9]}` : moved;
   }
 
   // Also strip bold from score field
@@ -147,12 +139,10 @@ for (let i = 0; i < lines.length; i++) {
     parts[5] = parts[5].replace(/\*\*/g, '');
   }
 
-  // Reconstruct line
-  const newLine = rebuildRow(parts);
-  lines[i] = newLine;
+  lines[i] = rebuildRow(parts);
   changes++;
 
-  console.log(`#${num}: "${oldStatus}" → "${result.status}"`);
+  console.log(`#${num}: "${rawStatus}" → "${result.status}"`);
 }
 
 if (unknowns.length > 0) {
