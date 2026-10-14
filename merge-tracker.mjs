@@ -612,7 +612,9 @@ for (const file of tsvFiles) {
         report: addition.report,
         notes: `Re-eval ${addition.date} (${oldScore}→${newScore}). ${addition.notes}`,
       }, COLMAP);
-      appLines[duplicate.line] = updatedLine;
+      // A row added earlier in this run lives in newLines until the insert below.
+      if (duplicate.pending != null) newLines[duplicate.pending] = updatedLine;
+      else appLines[duplicate.line] = updatedLine;
       // Refresh the stored row, so a later addition in this run compares against
       // (and rewrites) what is now on that line rather than what was read at start.
       // Looking the line up by its old raw text found nothing after the first write,
@@ -634,6 +636,9 @@ for (const file of tsvFiles) {
       score: addition.score, status: addition.status, pdf: addition.pdf,
       report: addition.report, notes: addition.notes,
     }, COLMAP);
+    // Visible to the additions after it, so the same new posting sent twice in one run
+    // is one row: the second is an update or a skip, never a second add.
+    existingApps.push({ ...parseRow(newLine, COLMAP), pending: newLines.length });
     newLines.push(newLine);
     added++;
     console.log(`➕ Add #${entryNum}: ${addition.company} — ${addition.role} (${addition.score})`);

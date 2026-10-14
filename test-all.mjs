@@ -3577,6 +3577,26 @@ try {
       fail(`second update to one row in a run was dropped: ${rows.join(' / ') || 'merge crashed'}`);
     }
   }
+
+  // integration: a BRAND-NEW posting sent twice in one run is one row. The second
+  // addition was compared only against rows read at start, so it was added again.
+  {
+    const url = '**URL:** https://boards.greenhouse.io/acme/jobs/7654322';
+    const m = mergeFixture('career-ops-newtwice-', {
+      rows: [],
+      reports: { '060-acme.md': url, '061-acme.md': url },
+      tsvs: {
+        '060-acme.tsv': '60\t2026-07-16\tAcme\tPlatform Engineer\tEvaluated\t3.9/5\t❌\t[60](reports/060-acme.md)\tfirst',
+        '061-acme.tsv': '61\t2026-07-17\tAcme\tPlatform Engineer\tEvaluated\t4.2/5\t❌\t[61](reports/061-acme.md)\tsecond',
+      },
+    });
+    const rows = (m || '').split('\n').filter(l => /^\|\s*\d+\s*\|/.test(l) && l.includes('Acme'));
+    if (rows.length === 1 && rows[0].includes('4.2/5')) {
+      pass('merge-tracker folds a new posting sent twice in one run into one row');
+    } else {
+      fail(`a new posting sent twice in one run: ${rows.join(' / ') || 'merge crashed'}`);
+    }
+  }
 } catch (e) {
   fail(`job-id authoritative dedup tests crashed: ${e.message}`);
 }
