@@ -95,7 +95,7 @@ const SPELLED_STATES = Object.keys(STATE_ABBR).sort((a, b) => b.length - a.lengt
 const ST = '<[A-Z]{2}>';
 const LIST = `${ST}(?:${G.list_sep}${ST})*`;
 const expand = (p) => p.replaceAll('{LIST}', LIST).replaceAll('{ST}', ST)
-  .replaceAll('{US}', G.us).replaceAll('{R}', G.remote);
+  .replaceAll('{US}', G.us).replaceAll('{R}', G.remote).replaceAll('{AMER}', G.americas_region);
 const esc = (x) => x.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 /** A grammar key compiled the way _location.py compiles it; `g` for the global form. */
 function compile(key, g = '') {
@@ -107,11 +107,11 @@ const KEYS = ['remote', 'remote_friendly', 'remote_hybrid', 'us', 'city_suffix',
   'time_zone_us_paren', 'placeholder', 'nationwide', 'exclusion_lead', 'exclusion_trail', 'weak_context', 'scope_shapes',
   'metro_scope', 'chunk_split', 'sentence_break', 'place_split', 'place_donor',
   'undetermined', 'travel_phrase', 'preference_after', 'context_before', 'negation_before',
-  'street_before', 'place_list'];
+  'street_before', 'place_list', 'americas_region', 'hierarchy_gap'];
 const RX = Object.fromEntries(KEYS.map((k) => [k, compile(k)]));
 const RXG = Object.fromEntries(KEYS.map((k) => [k, compile(k, 'g')]));
 const CITY_SUFFIX = new RegExp(`^(?:${expand(G.city_suffix)})`, 'i');
-const FOLDS = G.folds.map(([p, r]) => [new RegExp(p, 'gi'), r]);
+const FOLDS = G.folds.map(([p, r]) => [new RegExp(expand(p), 'gi'), r]);
 const PLACE_BREAK = [new RegExp(G.place_break[0], 'gi'), G.place_break[1]];
 /** An unresolved "N Locations" style placeholder; providers/workday.mjs enriches these. */
 export const PLACEHOLDER_RE = RX.placeholder;
@@ -366,6 +366,14 @@ function commuteIn(n, s) {
       // A far metro over the match voids it ("Walnut" inside "Walnut Creek").
       const outs = s.far.spans(probe);
       if (hits.every((h) => overlaps(h, outs))) continue;
+      // So does a far place JOINED to it as a hierarchy: EA writes "Los Angeles -
+      // Chatsworth", a metro label over a city outside the ceiling, and the metro word used
+      // to pass it. Joined means nothing but a dash or colon between the two
+      // (hierarchy_gap). Anything wider is not a hierarchy: "Santa Monica, CA (reporting to
+      // San Francisco)" names a manager's city, and the first version of this rule failed
+      // it (Codex, 2026-10-15). _location.py Policy._commute_in is the same.
+      if (outs.some(([c, d]) => !overlaps([c, d], hits)
+        && hits.some(([a, b]) => RX.hierarchy_gap.test(probe.slice(Math.min(b, d), Math.max(a, c)))))) continue;
       // So does a foreign country or region BESIDE it when no US state is named: "Dublin,
       // Ireland" is not the Dublin in an Ohio commute list. The match itself may be a
       // foreign name too ("Dublin" alone), which settles nothing, and a foreign CITY in a
@@ -411,7 +419,11 @@ function classifyNormalised(n, s, excluded = new Set(), whole = true) {
   const stay = noTravel(n);
   const foreign = (s.blocked.test(stay) || BLOCKED_CODES.test(stay)) && !named.size && !us;
   if (remote && !homeOut && !foreign && RX.nationwide.test(n)) return { v: 'pass', why: 'remote, open nationwide', kind: 'remote' };
-  if (remote && whole) {
+  // An Americas label qualifies every remote alternative beside it: "AMER / Remote" split
+  // into a bare "Remote" that passed as remote-US (Codex, 2026-10-15). With no US marker or
+  // state named, the option is the region question below, not alternatives.
+  const regionOnly = RX.americas_region.test(n) && !us && !named.size;
+  if (remote && whole && !regionOnly) {
     const alts = n.split(ALT_SPLIT_RE);
     if (alts.length > 1) {
       for (const a of alts) {
@@ -460,6 +472,10 @@ function classifyNormalised(n, s, excluded = new Set(), whole = true) {
       return { v: 'pass', why: `remote, naming only ${mentioned.join(', ')}`, kind: 'remote' };
     }
     if (us || bareRemote(n)) return { v: 'pass', why: 'remote-US', kind: 'remote' };
+    // An Americas label with no US marker ("AMER - Remote") names a region wider than the
+    // US, so it is a question of its own kind: an ATS isRemote flag settles an
+    // UNRECOGNISED region and must not settle this one. _location.py is the same step.
+    if (RX.americas_region.test(n)) return { v: 'unknown', why: 'remote within the Americas, which is wider than the US; check which countries the offer covers', kind: 'region' };
     return { v: 'unknown', why: 'remote, but the region is not recognised', kind: 'unrecognised' };
   }
   if (homeOut) return { v: 'fail', why: `remote everywhere except ${s.homeName}`, kind: 'excluded' };
@@ -547,8 +563,12 @@ export function decideLocations(input, signals, meta = {}) {
   if (bare.length && others.length && others.every((r) => r.kind === 'foreign')) {
     bare.forEach((i) => { results[i] = { v: 'unknown', why: 'a bare remote entry next to a non-US place; confirm which country the remote option covers before judging', kind: 'ambiguous' }; });
   }
+  // Among unknowns a REGION question wins, or the answer depends on option order: with the
+  // ATS isRemote flag, "Remote, Flexible | AMER - Remote" passed and the reverse stayed
+  // unknown (Codex, 2026-10-15). A stable sort, as in _location.py Policy.decide().
+  const ordered = [...results].sort((x, y) => (x.kind !== 'region') - (y.kind !== 'region'));
   for (const want of ['pass', 'unknown', 'fail']) {
-    const r = results.find((x) => x.v === want);
+    const r = ordered.find((x) => x.v === want);
     if (r) return { verdict: TO_API[r.v], reason: r.why, kind: r.kind, options };
   }
   return { verdict: 'unknown', reason: 'no option could be read', options };
@@ -625,8 +645,11 @@ export function effectiveLocationFilter(portalsFilter = {}, policy = loadLocatio
     // and silently. A portals.yml hard_out_metro that omitted the policy's "Walnut Creek"
     // would let the commute signal "Walnut" pass a Bay Area role in the scanner while
     // eval-prep, which never reads portals.yml, failed it.
-    if (VETO_FILTER_KEYS.has(k) && Array.isArray(v)) {
-      merged[k] = [...new Set([...(merged[k] || []), ...v])];
+    if (VETO_FILTER_KEYS.has(k) && v != null) {
+      // A scalar is a one-entry list here too; letting it fall through to the generic
+      // assignment below would REPLACE the policy's list, the one thing this branch exists
+      // to prevent.
+      merged[k] = [...new Set([...(merged[k] || []), ...(Array.isArray(v) ? v : [v])])];
       continue;
     }
     if (Array.isArray(v) ? v.length : v != null) merged[k] = v;
@@ -724,6 +747,13 @@ const SELFTEST_OPTIONS = [
   ['Pennsylvania, USA - Remote', 'reject', 'Autodesk spells the state out'],
   ['Remote Massachusetts', 'reject', 'Adobe writes it with no punctuation'],
   ['Indiana - Remote', 'reject', 'Salesforce leads with the state'],
+  // Autodesk's Eightfold front end puts a sales region before the country. The scope shape
+  // is anchored at the start, so before the grammar folded the region away Texas read as a
+  // weak mention and this was a question (Autodesk 26WD134728).
+  ['AMER - United States - Texas - Remote', 'reject', 'region-prefixed Autodesk scope, not California'],
+  ['AMER - United States - California - Remote', 'accept', 'the same form scoped to California'],
+  ['AMER - Canada - Remote', 'reject', 'only a region before a US marker is folded'],
+  ['AMER - Remote', 'unknown', 'the Americas are wider than the US: a question'],
 
   // ── the contract: unambiguous rejects only ──
   // A scope named in words that no list here recognises stays a question. It
@@ -754,6 +784,9 @@ const SELFTEST_POSTINGS = [
     'accept', 'a CA-remote sibling makes the posting workable'],
   // Nationwide plus scoped: the nationwide option still carries it.
   [['US, DC, Remote', 'US, Remote'], 'accept', 'an unscoped option covers California'],
+  // Autodesk 26WD134728 exactly as the resolver returned it: both spellings name Texas.
+  [['AMER - United States - Texas - Remote | Texas, USA - Remote'], 'reject',
+    'both of Autodesk\'s spellings scope the offer to Texas'],
 
   // ── the review-metro override, which nearly swallowed the whole fix ──
   // At a review-metro employer that rule used to downgrade EVERY non-foreign
@@ -833,6 +866,15 @@ if (invokedDirectly) {
     [tx, 'Houston, TX', 'reject', 'TX: same-state metro outside the commute'],
     [tx, 'Irvine, California', 'reject', 'TX: onsite in another state'],
     [tx, 'Seattle', 'reject', 'TX: hard-out metro'],
+    // A California home accepts the California form from a weak mention too, so the case
+    // that proves the region fold is the one where California is NOT home.
+    [tx, 'AMER - United States - California - Remote', 'reject', 'TX: region-prefixed California scope'],
+    [tx, 'AMER - United States - Texas - Remote', 'accept', 'TX: region-prefixed home-state scope'],
+    [ca, 'AMER - United States - Texas - Remote', 'reject', 'CA preset: region-prefixed Texas scope'],
+    [ca, 'AMER - United States - California - Los Angeles', 'accept', 'CA preset: region-prefixed commute place'],
+    // The full blocked list lives in the preset's grammar, not in SELFTEST_FILTER.
+    [ca, 'EMEA - United Kingdom - London - Remote', 'reject', 'CA preset: EMEA is never folded and is foreign'],
+    [ca, 'APAC - Australia - Sydney - Remote', 'reject', 'CA preset: APAC is never folded and is foreign'],
     [none, 'US, GA, Remote', 'unknown', 'no home state: scoped remote is a question'],
     [none, 'US, Remote', 'accept', 'no home state: nationwide remote passes'],
     [unsure, 'Denver, CO', 'unknown', 'onsite_outside_commute: unknown asks instead'],
@@ -900,6 +942,20 @@ if (invokedDirectly) {
         + '\n      got ' + got + ', want ' + want + ' (' + why + ')');
     }
   }
+  // The KIND of an unknown is what eval-prep's ATS isRemote upgrade reads: it lifts
+  // 'unrecognised' and must never lift an Americas region label, which may mean Canada or
+  // Latin America. The scanner has no flag, so the kind is the whole contract here.
+  const KIND_CASES = [
+    ['AMER - Remote', 'region'], ['Americas - Remote', 'region'], ['NA - Remote', 'region'],
+    ['Remote (Americas)', 'region'], ['LATAM - Remote', 'foreign'], ['Remote, Flexible', 'unrecognised'],
+  ];
+  for (const [option, want] of KIND_CASES) {
+    const got = decideLocations(option, ca).kind;
+    if (got !== want) {
+      bad++;
+      console.log('FAIL  kind of ' + JSON.stringify(option) + '\n      got ' + got + ', want ' + want);
+    }
+  }
   // effectiveLocationFilter: a portals.yml override replaces one list and keeps the rest,
   // and legacy or generic keys are ignored out loud, never unioned or silently dropped.
   const warned = [];
@@ -926,11 +982,11 @@ if (invokedDirectly) {
   for (const [label, ok] of effChecks) {
     if (!ok) { bad++; console.log('FAIL  effectiveLocationFilter: ' + label); }
   }
-  const total = SELFTEST_OPTIONS.length + SELFTEST_POSTINGS.length + POLICY_CASES.length;
+  const total = SELFTEST_OPTIONS.length + SELFTEST_POSTINGS.length + POLICY_CASES.length + KIND_CASES.length;
   console.log(bad
     ? '\n' + bad + ' of ' + total + ' cases failed'
     : 'all ' + SELFTEST_OPTIONS.length + ' option cases, '
-      + SELFTEST_POSTINGS.length + ' posting cases and ' + POLICY_CASES.length
-      + ' policy cases pass');
+      + SELFTEST_POSTINGS.length + ' posting cases, ' + POLICY_CASES.length
+      + ' policy cases and ' + KIND_CASES.length + ' kind cases pass');
   process.exit(bad ? 1 : 0);
 }

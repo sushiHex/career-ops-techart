@@ -34,6 +34,7 @@ import { fileURLToPath } from 'url';
 import { execFileSync } from 'child_process';
 import { scrubCodenames } from './redactions-core.mjs';
 import { guardArgs } from './cli-guard.mjs';
+import { localDate } from './local-date.mjs';
 
 // ---------------------------------------------------------------------------
 // Bootstrap: load .env before anything else
@@ -132,9 +133,10 @@ function readFile(path, label) {
 function nextReportNumber() {
   if (!existsSync(PATHS.reports)) return '001';
   const files = readdirSync(PATHS.reports)
-    .filter(f => /^\d{3}-/.test(f))
-    .map(f => parseInt(f.slice(0, 3)))
-    .filter(n => !isNaN(n));
+    // Three digits is the floor, not the width (report 1000 exists since 2026-10-25).
+    .map(f => f.match(/^(\d{3,})-/))
+    .filter(Boolean)
+    .map(m => parseInt(m[1], 10));
   if (files.length === 0) return '001';
   return String(Math.max(...files) + 1).padStart(3, '0');
 }
@@ -364,7 +366,7 @@ if (saveReport) {
     }
 
     const num         = nextReportNumber();
-    const today       = new Date().toISOString().split('T')[0];
+    const today       = localDate();
     const companySlug = slugifyCompany(company);
     const filename    = `${num}-${companySlug}-${today}.md`;
     const reportPath  = join(PATHS.reports, filename);

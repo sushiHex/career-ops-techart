@@ -26,6 +26,8 @@ import { dirname, join } from 'path';
 import { REQ_ID_SRC, REQ_ID, canonId, reqIdGlobal } from './req-id-core.mjs';
 import { trackerRows } from './tracker-rows.mjs';
 import { guardArgs } from './cli-guard.mjs';
+import { extractJobId, rowIdReader, idSetsProvablyDistinct, globalNamespaces, isGlobalId } from './role-matcher.mjs';
+import { loadSeenReqIds, reqIdKey } from './scan.mjs';
 
 // WHAT this ranker rewards and penalises is DATA: config/lane-vocab.json, written by
 // `node setup.mjs` from a preset in presets/lanes/, and read by scripts/_lane.py too. With
@@ -293,6 +295,17 @@ const ORDER_CASES = [
   // table above builds itself from it, or it is read by NAME for some other treatment,
   // like early_career's outright disqualification. Anything else is a family that loaded
   // and did nothing, which is the silent half of drift.
+  // A per_employer id (iCIMS, Breezy) is unique only inside one employer, and gh/uuid can
+  // be read off a foreign host, so none of them may retire a row without the company join;
+  // an id anchored at one employer's own host may.
+  ['globalNamespaces: google and apple retire alone; icims, breezy, gh and uuid never do',
+    () => {
+      const g = globalNamespaces();
+      return ['google', 'apple'].every(n => g.has(n))
+        && !['icims', 'breezy', 'gh', 'uuid', 'id', 'wd'].some(n => g.has(n))
+        && extractJobId('https://www.google.com/about/careers/applications/jobs/results/114723757451217499-x')
+          === 'google:114723757451217499';
+    }],
   // The ranker's own lane terms are the preset's too, and a copy written back here
   // would be a second source that drifts.
   ['no ranker lane term is written out literally in this file',
@@ -796,7 +809,24 @@ for (const f of [PIPE, APPS]) {
 const evaluatedKeys = new Set();
 /** "<id>@<company>" for ids that need a company to mean anything. See AMBIGUOUS_ID. */
 const evaluatedAmbig = new Set();
-const evaluatedTitles = new Set();
+/**
+ * "<company>::<title>" -> the identity set of EVERY tracker row carrying that title.
+ *
+ * A title match retires an inbox row unless every such row's ids PROVE a different
+ * requisition (role-matcher idSetsProvablyDistinct: same numbering system, different
+ * value; ids from different systems prove nothing). It used to retire on the title alone,
+ * against this file's own rule that only a matching req id retires, so a live req was
+ * retired as tracked because a different req with the same title had a row. `norm` also
+ * drops level words, so a Staff req could be retired as a tracked Senior one. The
+ * identity is role-matcher's (rowIdReader / extractJobId), the one merge-tracker and
+ * dedup-tracker use, so the three cannot disagree about what one posting is.
+ */
+const evaluatedTitles = new Map();
+const idsOfRow = rowIdReader(dirname(APPS));
+// Tracker ids that name one posting whatever the employer (role-matcher isGlobalId), so
+// they retire an inbox row with no company join, which a decorated portals.yml label
+// defeats ("Example Corp / Parent (Division, ...)" against the tracker's "Example Corp").
+const trackedGlobalIds = new Set();
 // Same req, different wording. The inbox can carry "Senior Technical Artist,
 // Pipeline / Unannounced Project / Anytown, ST" while the tracker carries
 // "Senior Technical Artist, Pipeline (Unannounced Project) (R000001)". Exact
@@ -828,7 +858,8 @@ function tokenMatch(co, role) {
   }
   return false;
 }
-for (const { company, role, raw } of trackerRows(readFileSync(APPS, 'utf8').split('\n'))) {
+for (const row of trackerRows(readFileSync(APPS, 'utf8').split('\n'))) {
+  const { company, role, raw } = row;
   if (!company) continue;
   // The whole line is scanned on purpose: the req id lives in the role cell for
   // some rows and in the report-link slug for others. A tracker row names no
@@ -839,7 +870,10 @@ for (const { company, role, raw } of trackerRows(readFileSync(APPS, 'utf8').spli
     if (AMBIGUOUS_ID.test(id)) evaluatedAmbig.add(`${id}@${normCo(company)}`);
     else evaluatedKeys.add(`wd:${id}`);
   }
-  evaluatedTitles.add(`${normCo(company)}::${norm(role)}`);
+  const rowIds = idsOfRow(row);
+  for (const id of rowIds) if (isGlobalId(id)) trackedGlobalIds.add(id);
+  const tkey = `${normCo(company)}::${norm(role)}`;
+  evaluatedTitles.set(tkey, [...(evaluatedTitles.get(tkey) || []), rowIds]);
   evaluatedByCo.set(normCo(company),
     [...(evaluatedByCo.get(normCo(company)) || []), tokens(role)]);
 }
@@ -875,11 +909,29 @@ if (VERBOSE) {
 
 // --- already evaluated ------------------------------------------------------
 const survivors = [...byKey.values()].map(g => g[0]);
+const seenReqIds = loadSeenReqIds(readFileSync(APPS, 'utf8'));
 const done = [];
 const similar = [];   // looks tracked, but not retired without a matching req id
 for (const r of survivors) {
   const src = srcCo(r.source);
   if (evaluatedKeys.has(r.key)) { done.push([r, 'req id already in tracker']); continue; }
+  const gid = extractJobId(r.url);
+  if (isGlobalId(gid) && trackedGlobalIds.has(gid)) {
+    done.push([r, 'req id already in tracker']); continue;
+  }
+  // evaluatedKeys holds Workday ids only, so a tracked Greenhouse, Ashby or Lever req
+  // fell through to the title join, which a decorated inbox company name defeats
+  // ("Example / example.co (...) [REMOTE-US]" against "Example"), and tracked rows sat in
+  // the inbox as pending work. scan.mjs already asks the right question, per-company
+  // requisition identity through role-matcher, so this asks it the same way.
+  // RETIRING is destructive, so only the two namespaces that name one posting outright
+  // count here: a Greenhouse job id and an Ashby/Lever uuid. A generic `id:` is a number
+  // read out of a path, and one can be a truncated prefix (`/j/1000001A8B/` reads
+  // id:1000001), so it may suggest but never retire. Workday ids are evaluatedKeys.
+  const idKey = reqIdKey(r.source, r.url);
+  if (idKey && /::(?:gh|uuid):/.test(idKey) && seenReqIds.has(idKey)) {
+    done.push([r, 'req id already in tracker']); continue;
+  }
   // The inbox key for an ambiguous id carries the Workday TENANT and the
   // tracker only knows the COMPANY, so the two sides join on the id plus the
   // company rather than on the key. Disagreeing company spellings only cost a
@@ -887,7 +939,13 @@ for (const r of survivors) {
   if (r.ambigId && evaluatedAmbig.has(`${r.ambigId}@${src}`)) {
     done.push([r, 'req id already in tracker']); continue;
   }
-  if (evaluatedTitles.has(`${src}::${norm(r.role)}`)) { done.push([r, 'company+role already in tracker']); continue; }
+  const postingIds = new Set([extractJobId(r.url)].filter(Boolean));
+  const sameTitle = evaluatedTitles.get(`${src}::${norm(r.role)}`) || [];
+  if (sameTitle.some(ids => !idSetsProvablyDistinct(ids, postingIds))) {
+    done.push([r, 'company+role already in tracker']); continue;
+  }
+  // Same title, different requisition: never retired, but worth a look.
+  if (sameTitle.length) { similar.push(r); continue; }
   if (tokenMatch(src, r.role)) similar.push(r);   // reported, never retired
 }
 say(`already evaluated: ${done.length} reqs are in applications.md already`);
@@ -955,7 +1013,8 @@ if (RANK) {
     console.log('\nnote: the lane vocabulary has no positive terms, so every title scores 0 and '
       + 'this list is unranked. Add title keywords with `node setup.mjs` or a lane preset.');
   }
-  console.log(`\ntriage: ${worth.length} of ${ranked.length} pending reqs score ${MIN}+ on title`);
+  const band = MAX === Infinity ? `${MIN}+` : `${MIN} to below ${MAX}`;
+  console.log(`\ntriage: ${worth.length} of ${ranked.length} pending reqs score ${band} on title`);
   console.log(`  ${ranked.filter(r => r.score <= -90).length} out-of-lane, ` +
     `${ranked.filter(r => DEPRI && r.tags.includes(DEPRI.tag)).length} de-prioritised titles` +
     `${folded ? `, ${folded} folded into ${collapsed} vertical-split group(s)` : ''}\n`);
@@ -967,6 +1026,8 @@ if (RANK) {
     const hist = p ? `  [${p.n} prior, best ${p.best.toFixed(1)}${p.skips ? `, ${p.skips} skipped` : ''}]` : '';
     console.log(`${String(r.score).padStart(3)}  [${r.tags.join(',')}]  ${src.slice(0, 30).padEnd(30)} ${r.role.slice(0, 52).padEnd(52)}${hist}`);
   }
+  // The display cap is counted, never silent: a list that stops at 45 reads as "nothing else".
+  if (shown.length > 45) console.log(`  ... ${shown.length - 45} more display rows not shown; narrow with --min/--max or use --json`);
   process.exit(0);
 }
 

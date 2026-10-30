@@ -19,7 +19,7 @@ import { readFileSync, readdirSync, existsSync, mkdirSync, unlinkSync, statSync 
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { CANONICAL_STATUSES, columnsOf, isSeparatorRow, normalizeStatus, SCORE_CELL, trackerPath, trackerRows } from './tracker-rows.mjs';
-import { companyKey } from './role-matcher.mjs';
+import { companyKey, idSetsProvablyDistinct, rowIdReader } from './role-matcher.mjs';
 
 const CAREER_OPS = dirname(fileURLToPath(import.meta.url));
 // Support both layouts: data/applications.md (boilerplate) and applications.md (original).
@@ -79,6 +79,9 @@ for (const e of entries) {
 if (badStatuses === 0) ok('All statuses are canonical');
 
 // --- Check 2: Duplicates ---
+// Markdown links resolve relative to the file that contains them, so report
+// links, and the row identities read through them, resolve against the tracker's directory.
+const TRACKER_DIR = dirname(APPS_FILE);
 const companyRoleMap = new Map();
 let dupes = 0;
 for (const e of entries) {
@@ -87,9 +90,18 @@ for (const e of entries) {
   if (!companyRoleMap.has(key)) companyRoleMap.set(key, []);
   companyRoleMap.get(key).push(e);
 }
+// Same company and title is not the same posting: employers reuse titles across reqs
+// (Zillow P732510 and P711740, 2026-10-20). Two rows are provably distinct only when their
+// ids are disjoint AND comparable: a Greenhouse `gh:1234567` and a company-hosted
+// `id:1234567` can name one posting, so disjoint ids from different namespaces still warn.
+const idsOf = rowIdReader(TRACKER_DIR);
+const provablyDistinct = idSetsProvablyDistinct;
 for (const group of companyRoleMap.values()) {
-  if (group.length > 1) {
-    warn(`Possible duplicates: ${group.map(e => `#${e.num}`).join(', ')} (${group[0].company} — ${group[0].role})`);
+  if (group.length < 2) continue;
+  const suspect = group.filter((e, i) =>
+    group.some((o, j) => j !== i && !provablyDistinct(idsOf(e), idsOf(o))));
+  if (suspect.length > 1) {
+    warn(`Possible duplicates: ${suspect.map(e => `#${e.num}`).join(', ')} (${group[0].company}, ${group[0].role})`);
     dupes++;
   }
 }
@@ -100,7 +112,6 @@ if (dupes === 0) ok('No exact duplicates found');
 // links must resolve against the tracker's own directory (see #760). For the
 // transition we also accept legacy root-relative links: try the tracker dir
 // first, then fall back to the repo root before flagging a link broken.
-const TRACKER_DIR = dirname(APPS_FILE);
 let brokenReports = 0;
 for (const e of entries) {
   const match = e.report.match(/\]\(([^)]+)\)/);

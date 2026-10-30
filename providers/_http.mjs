@@ -21,6 +21,9 @@ async function fetchWithTimeout(url, { timeoutMs = DEFAULT_TIMEOUT_MS, headers =
       const err = new Error(snippet ? `HTTP ${res.status}: ${snippet}` : `HTTP ${res.status}`);
       err.status = res.status;
       err.body = responseText;
+      // Seconds form only; a throttling provider's own wait beats any guess of ours.
+      const retryAfter = (res.headers.get('retry-after') || '').trim();
+      if (/^\d+$/.test(retryAfter)) err.retryAfterMs = Number(retryAfter) * 1000;
       throw err;
     }
     return res;

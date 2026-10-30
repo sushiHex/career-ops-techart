@@ -98,21 +98,45 @@ function toEpochMs(value) {
 // them, so an EU-eligible role whose PRIMARY label is e.g. "Canada" reads as
 // Canada-only and gets wrongly removed by scan.mjs's location_filter. We fold
 // in each secondary's region, locality, and country so the filter can match
-// (e.g. "Europe", "Berlin", "Germany"). Deduped, joined with " · ".
+// (e.g. "Europe, Berlin, Germany"). Deduped, joined with " · ".
+//
+// An address COUNTRY never stands alone as an option. It used to, so Perplexity's offices
+// read "San Francisco · Seattle · United States · New York City", and a bare country is
+// `unknown` to the gate where SF, Seattle and NYC are a clear reject. The label and the
+// locality stay separate options exactly as before. The country is dropped when a
+// locality already places the office, and otherwise qualifies the label it belongs to
+// (with the region, which carries a state restriction), so a bare "Remote" label over a
+// Canadian address reads "Remote, Canada" rather than unqualified remote.
+// Joining the locality onto the label as well was tried and rejected (Codex,
+// 2026-10-18): "Remote, United States" plus locality New York became a New York
+// restriction and flipped an accept to a reject.
 /** @param {any} j */
-function formatLocation(j) {
+export function formatLocation(j) {
+  const str = (v) => (typeof v === 'string' ? v.trim() : '');
   const parts = [];
-  if (typeof j.location === 'string' && j.location.trim()) parts.push(j.location.trim());
+  if (str(j.location)) parts.push(str(j.location));
   if (Array.isArray(j.secondaryLocations)) {
     for (const s of j.secondaryLocations) {
       if (!s || typeof s !== 'object') continue;
-      if (typeof s.location === 'string' && s.location.trim()) parts.push(s.location.trim());
-      const pa = s.address && s.address.postalAddress;
-      if (pa) {
-        for (const k of ['addressLocality', 'addressCountry']) {
-          if (typeof pa[k] === 'string' && pa[k].trim()) parts.push(pa[k].trim());
+      const pa = (s.address && s.address.postalAddress) || {};
+      const label = str(s.location), locality = str(pa.addressLocality);
+      if (locality) {
+        if (label) parts.push(label);
+        parts.push(locality);
+        continue;
+      }
+      // A label that already names its country is left alone: appending the region then
+      // turned "Remote, United States" over a New York office address into a New York
+      // restriction (Codex, 2026-10-18).
+      const country = str(pa.addressCountry);
+      const piece = [label];
+      if (!(country && label.toLowerCase().includes(country.toLowerCase()))) {
+        for (const v of [str(pa.addressRegion), country]) {
+          if (v && !piece.some((p) => p.toLowerCase().includes(v.toLowerCase()))) piece.push(v);
         }
       }
+      const joined = piece.filter(Boolean).join(', ');
+      if (joined) parts.push(joined);
     }
   }
   return [...new Set(parts)].join(' · ');

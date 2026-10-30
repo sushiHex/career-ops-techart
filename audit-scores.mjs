@@ -29,7 +29,7 @@ import { join } from 'path';
 import { fileURLToPath } from 'url';
 
 import { isMain } from './cli-guard.mjs';
-import { applyModel, loadPrefs, persistedArrangement } from './score-model.mjs';
+import { applyModel, loadPrefs, persistedArrangement, reportModelText } from './score-model.mjs';
 import { reportFileOf, trackerRows } from './tracker-rows.mjs';
 
 const args = process.argv.slice(2);
@@ -238,7 +238,9 @@ for (const [f, meta] of actionable) {
   const base = s ? computeGlobal(s) : null;
   if (base === null) continue;
   const modelled = applyModel(base, {
-    company: meta?.company || '', role: meta?.role || '', prefs, text,
+    company: meta?.company || '', role: meta?.role || '', prefs,
+    // Same comp evidence as apply-model and score-audit (reportModelText, 2026-10-29).
+    text: reportModelText(text) ?? text,
     arrangement: persistedArrangement(text),
   });
   const calc = modelled ? modelled.final : base;

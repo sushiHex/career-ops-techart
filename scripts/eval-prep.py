@@ -17,6 +17,7 @@ the tracker TSV.
 Run:
   python scripts/eval-prep.py <url> [<url> ...]
   python scripts/eval-prep.py --from-triage triage.json --min 6
+  python scripts/eval-prep.py --from-linkedin batch/linkedin-sweep/<date>-details.json
 """
 import atexit, contextlib, glob, hashlib, importlib.util, io, json, os, re, shutil, sys, tempfile
 
@@ -164,7 +165,15 @@ REQ_START = re.compile(r"(what we need to see|qualifications|requirements|what y
                        r"what you bring|skills (and|&) experience|you have)", re.I)
 # Matches "$184,000" and "184,000 USD" alike; NVIDIA uses the second form and its
 # bands were being dropped silently.
-MONEY = re.compile(r"\$\s?([\d,]{5,})(?:\.\d\d)?|([\d,]{6,})\s*USD")
+# Read through rr.mask_foreign(), so a C$ or CA$ figure is never taken as US dollars.
+# Amazon writes the currency once, after the range ("154,200.00 - 208,600.00 USD"): the
+# third form reads the low end by looking ahead to that USD, and cents are allowed before
+# USD, or the band req-resolve now extracts became no figures at all (Codex, 2026-10-29).
+MONEY = re.compile(r"\$\s?([\d,]{5,})(?:\.\d\d)?|([\d,]{6,})(?:\.\d\d)?\s*USD"
+                   r"|([\d,]{6,})(?:\.\d\d)?(?=\s*(?:-|to|–|\u2014)\s*[\d,]{6,}(?:\.\d\d)?\s*USD)")
+# Words that contradict reading a silent hourly rate as the whole package: a bonus, equity,
+# or the rate called BASE. Only consulted for an hourly figure; see comp_verdict().
+EXTRA_COMP = re.compile(r"\b(bonus(es)?|equity|stock|RSUs?|commission|base (pay|salary|rate|compensation))\b", re.I)
 REMOTE_WORD = _location.RX["remote"]
 
 
@@ -198,7 +207,7 @@ def location_verdict(loc, remote_flag, policy=None):
     return verdict, why
 
 
-HOURLY = re.compile(r"\$\s?(\d{1,3}(?:\.\d{2})?)\s*(?:-|to|–)?\s*\$?\s?(\d{1,3}(?:\.\d{2})?)?"
+HOURLY = re.compile(r"\$\s?(\d{1,3}(?:\.\d{1,2})?)\s*(?:-|to|–)?\s*\$?\s?(\d{1,3}(?:\.\d{1,2})?)?"
                     r"[^.]{0,40}?\b(per hour|an hour|hourly|/\s?hr|/\s?hour)\b", re.I)
 
 # What a posted figure MEASURES. score-model.mjs draws exactly this line in compBand(),
@@ -233,8 +242,16 @@ def comp_basis(pays, jd=""):
     body does not contain (an Ashby compensation summary, for instance) is `unknown`,
     which is the answer that costs a human read rather than a lost req.
     """
+    # Both sides are read with every dash written one way. A range is spelled with a
+    # hyphen, an en dash or an em dash, with or without spaces, and `pay` is not always
+    # spelled like the text beside it: an Ashby summary "$100K \u2013 $150K total
+    # compensation" reached `pay` as "$100,000 - $150,000", the verbatim find missed, and a
+    # sub-floor stated total escaped the gate (Codex, PR 14).
+    dash = lambda t: re.sub(r"\s*[-\u2010-\u2015\u2212]\s*", " - ", t or "")
+    jd = dash(jd)
     for p in pays or []:
-        i = (jd or "").find(p)
+        p = dash(p)
+        i = jd.find(p)
         if i < 0:
             continue
         near = jd[max(0, i - 120):i + len(p) + 120]
@@ -256,12 +273,15 @@ ORG_NAMES = {
     "ilm": "ILM", "dneg": "DNEG", "mpc": "MPC", "scanlinevfx": "Scanline VFX",
     "anthropic": "Anthropic", "xai": "xAI", "ssi": "SSI", "aws": "AWS",
     "eyelinestudios": "Eyeline Studios", "lumalabs-ai": "Luma AI",
+    # explore.jobs.netflix.net hints "netflix", and the tracker's own "Netflix" is read as a
+    # possible seed of the capitalised guess, so every Netflix packet came out unnamed.
+    "netflix": "Netflix",
 }
 
 
 def org_from_url(u):
     """The employer's board slug as it appears in an ATS URL."""
-    for pat in (r"jobs\.ashbyhq\.com/([\w-]+)/", r"jobs\.lever\.co/([\w-]+)/",
+    for pat in (r"jobs\.ashbyhq\.com/([\w.-]+)/", r"jobs\.lever\.co/([\w-]+)/",
                 r"(?:job-boards|boards)\.greenhouse\.io/([\w-]+)/",
                 r"greenhouse\.io/(?:embed/job_app\?for=)?([\w-]+)/jobs/",
                 r"//([\w-]+)\.wd\d+\.myworkdayjobs\.com/",
@@ -362,8 +382,36 @@ def portal_employer(slug=None, workday=None):
     return tracker_spelling(names.pop()) if len(names) == 1 else None
 
 
+def company_hint(r):
+    """The raw board slug, Workday tenant or host label an employer could be GUESSED from.
+
+    Kept beside `company` in the packet so that a null company does not lose the clue: it is
+    what a person filling the packet reads, and it is never itself a name.
+    """
+    m = _WD_URL.search(r.get("url") or "")
+    if m and not r.get("org"):
+        return m.group(1).lower()
+    org = (r.get("org") or r.get("discovered_board") or "").strip().lower()
+    return org or org_from_url(r.get("url") or "").lower() or None
+
+
 def company_from(r):
-    """The employer's name: portals.yml first, then the hand table, then the tracker."""
+    """The employer's name, or None when nothing but a slug or a hostname says it.
+
+    Sources, strongest first: portals.yml for the board, the hand table, the name the ATS
+    record states about itself (req-resolve's `company`), then the tracker's own spelling.
+
+    A title-cased slug is NOT a source. It used to be the last resort, and it is how
+    packets came out naming "Weedmaps77", "Sonypicturesjobs" and "Certumlegalsolutions"
+    (issue #12): eval-write's required-field check then saw a non-empty company and wrote
+    the slug into the report and the tracker as if someone had confirmed it. A null
+    company is the honest answer, because eval-write refuses a packet whose company is
+    unfilled and so forces the one human read that settles it; the slug survives in
+    `company_hint`. The tracker may still vouch for a slug, but only with a spelling that
+    is not the mechanical capitalisation itself: "Anduril Industries" for
+    `andurilindustries` is a person's spelling, while a tracker row reading "Heygen" is
+    most likely an earlier seed of this very guess and confirms nothing.
+    """
     m = _WD_URL.search(r.get("url") or "")
     if m and not r.get("org"):
         # An unrecorded Workday tenant gets NO name rather than a capitalised hostname:
@@ -371,16 +419,30 @@ def company_from(r):
         # wrong employer that merge-tracker would treat as a new company.
         tenant = m.group(1).lower()
         return portal_employer(workday=(tenant, m.group(2).lower())) or ORG_NAMES.get(tenant)
-    org = (r.get("org") or r.get("discovered_board") or "").strip().lower()
-    if not org:
-        org = org_from_url(r.get("url") or "").lower()
+    if r.get("front_end") and r.get("org"):
+        # A company-hosted Workday front end (careers.blizzard.com, careers.adobe.com):
+        # req-resolve set `org` to the portals.yml LABEL it matched the host on, which is
+        # not a board slug, so the slug lookup below cannot find it and the capitalised
+        # guess either came back null or named "Adobe (Firefly)" (Codex, PR 14). The
+        # entry's base is the employer.
+        names = {e["base"] for e in rr.portals_index() if e["label"] == r["org"]}
+        return tracker_spelling(names.pop()) if len(names) == 1 else None
+    org = company_hint(r) or ""
+    named = org and (portal_employer(slug=org) or ORG_NAMES.get(org))
+    if named:
+        return named
+    stated = r.get("company").strip() if isinstance(r.get("company"), str) else ""
+    if stated:
+        # The ATS's own name, in the tracker's spelling only when the tracker spells it as
+        # a different WORD form ("Disney Studios" is the tracker's "Disney"). A case-only
+        # difference keeps the ATS spelling, which is how "HeyGen" stops being "Heygen".
+        known = tracker_spelling(stated)
+        return stated if rr.name_key(known) == rr.name_key(stated) else known
     if not org:
         return None
-    # A capitalised slug ("Andurilindustries") is a new employer to every name-keyed
-    # lookup; the tracker usually already spells it, and its normalised key is the slug's.
-    return (portal_employer(slug=org) or ORG_NAMES.get(org)
-            or tracker_spelling(" ".join(w.capitalize() for w in re.split(r"[-_]+", org) if w))
-            or None)
+    guess = " ".join(w.capitalize() for w in re.split(r"[-_]+", org) if w)
+    known = tracker_spelling(guess)
+    return known if known != guess else None
 
 
 # Passed as `targets` to mean "no floor", which None cannot say: None means "read the
@@ -389,7 +451,7 @@ def company_from(r):
 NO_FLOOR = ()
 
 
-def comp_verdict(pays, jd="", targets=None):
+def comp_verdict(pays, jd="", summary="", targets=None):
     """Turn the posted figures into the numbers the comp dimension is judged on.
 
     Handles hourly as well as annual. The annual pattern requires five or more
@@ -421,16 +483,36 @@ def comp_verdict(pays, jd="", targets=None):
     if targets is None:
         targets = configured_comp_targets()
     floor, target = targets if targets else (None, None)
+    # The ATS's own pay summary (Ashby's "$60.58 - $108.17 per hour • Offers Equity",
+    # SmartRecruiters' compensation text) is read for the BASIS beside the body. It was
+    # returned by the resolver and dropped here, so an hourly band whose body never
+    # mentioned equity read as total and armed the floor gate while the ATS said
+    # otherwise. Basis only: `pays` already carries its figures.
+    # Rewritten the way ashby_summary_pay() rewrote it for `pay` ("US$" to "$", "$100K" to
+    # "$100,000"), because comp_basis() looks for the pay string verbatim before reading the
+    # words around it: left in K notation, "$100K - $150K total compensation" never matched
+    # its own band and a stated-total band under the floor escaped the gate.
+    # The BODY is K-expanded too: a stored "$100,000 - $150,000" had to find itself in a body
+    # reading "Total compensation: $100K - $150K" to see the word "total", and without the
+    # rewrite --recomp read the basis as unknown and lifted a correct floor gate.
+    ctx = ". ".join(t for t in (rr.k_band(jd), rr.k_band(rr.us_dollars(summary))) if t)
     vals, hourly = [], False
     for p in pays or []:
-        for a, b in MONEY.findall(p):
-            tok = a or b
+        for a, b, c in MONEY.findall(rr.mask_foreign(p)):
+            tok = a or b or c
             if tok:
                 vals.append(int(tok.replace(",", "")))
     vals = [v for v in vals if 30_000 <= v <= 3_000_000]
-    if not vals and jd:
+    # The posted figures are read for an hourly rate as well as the body: req-resolve
+    # writes a structured hourly band (Lever salaryRange, interval per-hour) as
+    # "$45.00 - $60.00 per hour", which the annual rule above cannot match. Joined on a
+    # full stop so HOURLY's no-full-stop window cannot pair a figure in one with a unit in
+    # the next.
+    hourly_src = rr.mask_foreign(
+        ". ".join([p for p in (pays or []) if isinstance(p, str)] + [jd or ""]))
+    if not vals and hourly_src.strip(". "):
         hrs = []
-        for m in HOURLY.finditer(jd):
+        for m in HOURLY.finditer(hourly_src):
             for g in (m.group(1), m.group(2)):
                 if g:
                     hrs.append(float(g))
@@ -444,13 +526,22 @@ def comp_verdict(pays, jd="", targets=None):
                     basis=None, basis_why=None, floor_gate=None,
                     note="no band posted; score comp on evidence, not on this")
     if hourly:
-        # An hourly rate is the whole of the cash offer. There is no bonus and no equity
-        # attached to an hourly contract, so unlike an annual salary line it IS the total
-        # and can settle the floor by itself. This is the one place a basis is inferred
-        # from the shape of the figure rather than from the words beside it.
-        basis, basis_why = "total", "an hourly rate carries no bonus or equity behind it"
+        # An hourly contract usually carries no bonus or equity, so a SILENT hourly rate
+        # is read as the total: the one place a basis is inferred from the shape of the
+        # figure rather than from the words beside it. Only silence licenses that. A
+        # posting that says "base", or names a bonus or equity, has contradicted the
+        # inference, and reading it as total arms the floor gate and disposes of the req
+        # (Codex, 2026-10-15: "$60 - $80 per hour ... Eligible for annual bonus and equity"
+        # read as a $156K total once structured hourly bands reached this branch).
+        stated, stated_why = comp_basis(pays, ctx)
+        if stated != "unknown":
+            basis, basis_why = stated, stated_why
+        elif EXTRA_COMP.search(ctx):
+            basis, basis_why = "unknown", "an hourly rate, but the posting names a bonus or equity beside it"
+        else:
+            basis, basis_why = "total", "an hourly rate with no bonus or equity named carries none behind it"
     else:
-        basis, basis_why = comp_basis(pays, jd)
+        basis, basis_why = comp_basis(pays, ctx)
     lo, hi = min(vals), max(vals)
     ach = lo + (hi - lo) * BAND_POINT
     if floor is None:
@@ -496,7 +587,13 @@ def tracker_hits(title, url=""):
     """
     if not title:
         return []
-    host = rr.name_key(re.sub(r"^https?://(www\.)?", "", url or "").split("/")[0])
+    # Host AND the first path segment. On a shared board (job-boards.greenhouse.io/reddit,
+    # jobs.ashbyhq.com/render, jobs.lever.co/x) the employer is the board SLUG, not the
+    # host, so a host-only gate never matched and every Greenhouse, Ashby and Lever packet
+    # reported zero duplicates: a tracked Greenhouse req was prepped and scored again
+    # with an empty warning.
+    parts = re.sub(r"^https?://(www\.)?", "", url or "").split("?")[0].split("/")
+    host = rr.name_key(parts[0]) + "/" + (rr.name_key(parts[1]) if len(parts) > 1 else "")
     STOP = ("senior", "staff", "principal", "lead", "engineer")
     words = [w for w in re.sub(r"[^a-z0-9 ]", " ", title.lower()).split() if len(w) > 3]
     key = [w for w in words if w not in STOP]
@@ -523,18 +620,183 @@ def tracker_hits(title, url=""):
     return hits[:4]
 
 
-def prep(url):
-    r = rr.resolve(url)
+# What eval-write refuses a packet without, in its own REQUIRED order; test-all asserts
+# the two lists are equal. The instruction used to read "Fill every null below", which
+# also ordered num, the resolver's own nulls and comp_total_est filled. comp_total_est is
+# the one field that arms the comp gate, so a figure guessed to obey that sentence would
+# have lowered the whole score on a total nobody reasoned to (Codex, PR 14).
+EVAL_WRITE_REQUIRED = ("company", "status", "match_w_cv", "north_star", "comp_score",
+                       "cultural_signals", "body", "gate", "recommendation", "arrangement")
+INSTRUCTIONS = (
+    "Fill " + ", ".join(EVAL_WRITE_REQUIRED) + "; arrangement is remote, hybrid, onsite "
+    "or unknown, and unknown is a verdict. "
+    "A gate-closed packet (location_verdict fail) needs only gate and status SKIP, with the "
+    "dimensions left null. Leave comp_total_est null unless you reasoned to a USD total: it "
+    "is the only field that arms the comp gate. Leave num and every resolver field as they "
+    "are. Then: node eval-write.mjs <this file> --date=YYYY-MM-DD"
+)
+
+
+def linkedin_record(e):
+    """A resolver-shaped record for a LinkedIn posting with no ATS behind it.
+
+    `e` is one row of the details file `LIS.exportDetails()` writes (see
+    scripts/linkedin-sweep-extract.js): the posting as LinkedIn rendered it in the user's own
+    browser. An Easy Apply posting has no company board, so the resolver can read nothing
+    and eval-prep on its URL wrote an empty packet that a person then filled by retyping the
+    body (2026-10-28, twice). This carries the captured page instead.
+
+    Provenance is stated, not upgraded (Codex review, 2026-10-28):
+      * `live` is true only when the capture says the page was READ as a posting
+        (`read_ok`: a title, a company, a body and an apply control were all found), the
+        listing was open, and the capture is from TODAY. An unread page (a sign-in wall
+        parses as company "Sign in") or a stale capture is unknown, never live, and a
+        closed listing is unknown too: LinkedIn alone never closes a row.
+      * `captured_on` travels into the packet and eval-write's provenance line, so the
+        report says "LinkedIn page capture on <date>", not "resolver API on report date".
+      * The location gate reads LinkedIn's place string with the workplace badge as the
+        remote flag, exactly as an ATS isRemote flag is read (it settles an unknown, never
+        overturns a fail). The body is not consulted there, as on the ATS path; a badge the
+        body contradicts is check-remote.py's question.
+      * The card's band is normalised into `pay` ("$200K/yr - $260K/yr" is not a form
+        pays() reads as written, so it was silently dropped) and also kept in the body.
+    """
+    import datetime
+    jd = (e.get("jd") or "").strip()
+    pay = []
+    if e.get("comp"):
+        jd = f"{jd}\n\nPay shown on the LinkedIn listing: {e['comp']}".strip()
+        if "/hr" not in e["comp"]:
+            pay = rr.pays(rr.k_band(e["comp"].replace("/yr", "")))
+    today = datetime.date.today().isoformat()
+    fresh = e.get("read_on") == today
+    live = True if (e.get("read_ok") and e.get("open") is True and fresh) else None
+    why = ("" if live else
+           " NOT live: " + ("the page was not read as a posting" if not e.get("read_ok") else
+                            "the listing was closed" if e.get("open") is not True else
+                            f"captured {e.get('read_on')}, not today"))
+    return {
+        "ats": "linkedin",
+        "live": live,
+        "captured_on": e.get("read_on"),
+        "note": (f"read on LinkedIn in the user's browser {e.get('read_on') or '(date not recorded)'}; "
+                 f"{'Easy Apply' if e.get('apply_url') == 'EASY_APPLY' else 'no company apply link'}, "
+                 f"so LinkedIn is the only source for this posting.{why}"),
+        "title": (e.get("title") or "").strip(),
+        "location": (e.get("location") or "").strip() or None,
+        "remote_txt": (e.get("workplace") or "").strip().lower() == "remote",
+        "jd": jd, "pay": pay,
+        "company": (e.get("company") or "").strip() or None,
+    }
+
+
+# Short-link hosts an employer's LinkedIn apply button can point at. The resolver has no
+# adapter for a redirect, so a grnh.se link (Podium, 2026-10-29) reached it unread.
+SHORTLINK_HOSTS = ("grnh.se", "lnkd.in")
+_TRACKING_KEY = re.compile(r"^(utm_|trk|ref$|source$|src$|gh_src$|lever-|iis$|iisn$|codes$|mode$|"
+                           r"rb$|cmpid$|ss$|feedId$)", re.I)
+
+
+# A nested query is cut only where a TRACKING key follows it; a value that is itself a
+# URL ("redirect=https://x/job?jobId=123") keeps its own query (Codex, 2026-10-29).
+_NESTED_TRACKING = re.compile(r"\?(?:utm_\w+|gh_src|src|source|ref|trk\w*)=", re.I)
+# Only these ATSs serve an application FORM at the posting path plus a suffix; on any
+# other host the segment may be part of the posting's own slug.
+_APPLY_SUFFIX_HOSTS = re.compile(r"(^|\.)(myworkdayjobs\.com|lever\.co|ashbyhq\.com)$", re.I)
+
+
+def _expand(url):
+    """Where a short link lands. HEAD first; a host that refuses HEAD (405) gets one GET."""
+    import urllib.request, urllib.error
+    for method in ("HEAD", "GET"):
+        req = urllib.request.Request(url, method=method, headers={"User-Agent": "Mozilla/5.0"})
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                return resp.geturl()
+        except urllib.error.HTTPError as ex:
+            if ex.code not in (405, 501) or method == "GET":
+                raise
+
+
+def clean_apply(url, expand=_expand):
+    """An apply link as the resolver should see it: short links expanded, tracking keys
+    dropped, and a value cut at a NESTED query. Riot's LinkedIn button carries
+    `?gh_jid=7037924%3Fgh_src%3Dnslt3m`, one parameter whose decoded value is
+    "7037924?gh_src=nslt3m", so the extractor's key filter never saw gh_src and the id
+    reached the resolver with the tail attached (2026-10-29). A failed expansion keeps the
+    short link, which the resolver then reports as unreadable rather than as anything."""
+    from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
+    if urlsplit(url).netloc.lower() in SHORTLINK_HOSTS:
+        try:
+            url = expand(url)
+        except Exception as ex:
+            print(f"NOTE could not expand {url}: {ex}")
+    s = urlsplit(url)
+    q = [(k, v[:m.start()] if (m := _NESTED_TRACKING.search(v)) else v)
+         for k, v in parse_qsl(s.query, keep_blank_values=True) if not _TRACKING_KEY.match(k)]
+    # The button can link the APPLICATION form rather than the posting: Palo Alto's Workday
+    # link ended `..._JR-015305-1/apply` and resolved "not retrievable" (2026-10-29).
+    path = s.path
+    if _APPLY_SUFFIX_HOSTS.search(s.netloc):
+        path = re.sub(r"/(apply|application)/?$", "", path)
+    return urlunsplit((s.scheme, s.netloc, path, urlencode(q), ""))
+
+
+def linkedin_employer(tab_title):
+    """The employer a LinkedIn posting names, from its tab title "<title> | <company> |
+    LinkedIn" (an optional "(3) " notification badge first), or None."""
+    parts = re.sub(r"^\(\d+\+?\)\s*", "", tab_title or "").split(" | ")
+    if len(parts) < 3 or parts[-1].strip() != "LinkedIn":
+        return None
+    # Page names carry decoration ("Orum 🥇"); letters in any script are kept.
+    return re.sub(r"[^\w\s&.,'()/+-]", "", parts[-2]).strip() or None
+
+
+def from_linkedin(path, expand=_expand):
+    """(url, record-or-None, employer) triples from a details file: an ATS apply link is
+    resolved as usual (record None), and a posting with none is built from the captured
+    page. A row the page could not be read for is refused here, by name, rather than
+    becoming a packet whose company is "Sign in".
+
+    `employer` is the company the LinkedIn listing names. An iCIMS, Workday, Dayforce or
+    company-hosted link carries only a host label ("careers-americas" for Atlassian), so 7
+    of 21 packets on 2026-10-29 came out company UNNAMED and needed a hand fill, while the
+    tab title that `detail()` stores for every row had the name all along."""
+    out = []
+    for e in json.load(open(path, encoding="utf-8")):
+        apply = (e.get("apply_url") or "").strip()
+        if apply.startswith("http") and "linkedin.com" not in apply:
+            out.append((clean_apply(apply, expand), None, linkedin_employer(e.get("title"))))
+        elif not (e.get("read_ok") and e.get("id")):
+            print(f"REFUSED linkedin {e.get('id')}: the page was not read as a posting "
+                  f"({e.get('company')!r} / {e.get('title')!r}); open it and run LIS.detail() again")
+        else:
+            out.append((e.get("url") or f"https://www.linkedin.com/jobs/view/{e['id']}/",
+                        linkedin_record(e), e.get("company")))
+    return out
+
+
+def prep(url, r=None):
+    r = rr.resolve(url) if r is None else r
     lv, lw = location_verdict(r.get("location"), r.get("remote_txt"))
     title = r.get("title") or ""
     slug = slug_of(title)
     return {
-        "_instructions": "Fill every null below, then: node eval-write.mjs <this file> --date=YYYY-MM-DD",
+        "_instructions": INSTRUCTIONS,
         "url": url, "ats": r.get("ats"), "live": r.get("live"),
         "resolver_note": r.get("note"),
+        **({"captured_on": r["captured_on"]} if r.get("captured_on") else {}),
         "title": title, "location": r.get("location"),
+        # The remote flag the verdict was read with. --relocate re-gates from the packet
+        # and reads p.get("remote_txt"), which no packet carried, so a bare "United States"
+        # that passed on an ATS isRemote flag fell back to unknown on every re-gate.
+        "remote_txt": r.get("remote_txt"),
         "location_verdict": lv, "location_why": lw,
-        "comp": comp_verdict(r.get("pay"), r.get("jd") or ""),
+        "comp": comp_verdict(r.get("pay"), r.get("jd") or "", r.get("comp_summary") or ""),
+        "comp_summary": r.get("comp_summary"),
+        # The figures comp was derived from, kept so a later refetch that brings only new
+        # basis evidence (a summary) can re-derive the same band; see reresolve().
+        "pay": r.get("pay") or [],
         "possible_tracker_duplicates": tracker_hits(title, url),
         "requirements_excerpt": requirements(r.get("jd")),
         # Keep the whole body, not just the excerpt. eval-assist scans for stated
@@ -554,18 +816,33 @@ def prep(url):
         # Workday employer exists ONLY in the tenant hostname: every NVIDIA, Salesforce
         # and Disney packet was prepped with company None until 2026-10-08, and
         # eval-write refuses an unnamed packet. reresolve() already passed it this way.
-        "company": company_from({**r, "url": url}), "num": None, "slug": slug, "status": None,
+        # A null company means nothing but a slug or a host named the employer; the slug
+        # is kept in company_hint and eval-write refuses the packet until a person fills
+        # company (issue #12).
+        "company": company_from({**r, "url": url}),
+        "company_hint": company_hint({**r, "url": url}),
+        "num": None, "slug": slug, "status": None,
         "match_w_cv": None, "north_star": None, "comp_score": None,
         "cultural_signals": None, "red_flags_adj": 0,
         "verification_depth": "full-jd" if r.get("jd") else "listing",
         "body": None, "gate": None, "recommendation": None,
+        # Two more judgement fields eval-write reads. They were absent from the packet,
+        # so every evaluator had to know to add them; a key that is present and null
+        # is the contract. arrangement: remote | hybrid | onsite | unknown, where
+        # "unknown" is itself a verdict (the posting does not say). comp_total_est: a
+        # USD figure, the only field that can arm the comp gate; null when the
+        # evaluator did not reason to a total.
+        "arrangement": None, "comp_total_est": None,
     }
 
 
 # A requisition id as each ATS writes it into its own URL. Ordered, and tried before the
 # digest fallback, purely so the filename stays something a human can recognise.
 _URL_ID = [
-    re.compile(r"_((?:JR|R)-?\d{4,}|\d{2}WD\d{4,})(?:[/?]|$)", re.I),   # Workday
+    # Workday; the optional "-1" is the facet suffix Autodesk and NVIDIA append
+    # (JR2846252-1), which otherwise pushed the packet to a digest name.
+    re.compile(r"_((?:JR|R)-?\d{4,}|\d{2}WD\d{4,})(?:-\d+)?(?:[/?]|$)", re.I),
+    re.compile(r"linkedin\.com/jobs/view/(\d{6,})"),                    # LinkedIn Easy Apply
     re.compile(r"[?&]gh_jid=(\d+)"),                                    # hosted Greenhouse
     re.compile(r"/jobs?/(\d{5,})"),                                     # Greenhouse, Netflix
     re.compile(r"/postings/([\w-]{4,})"),                               # SmartRecruiters
@@ -633,6 +910,79 @@ def hard_gate(p):
     return None
 
 
+def settle_gate(p):
+    """Bring an unjudged packet's automatic closure in line with hard_gate(), in place.
+
+    Returns "closed", "reopened" or None. This is the ONE place a closure is written, for
+    prep, --relocate and --reresolve alike. It used to be written in two shapes by two
+    hands, and each drifted (Codex, PR 14): a packet that first failed during a relocate
+    got a disposition but no `auto_gate`, so a later correction could never lift it; and
+    one whose gate turned from location to comp kept the location shape, with no
+    `in_bounds: false`, so it read as open and could be scored.
+
+    The shape follows the CURRENT gate: SKIP, its reason in `gate`, `auto_gate` (this
+    function's, so it may lift it later), and `in_bounds: false` unless the location
+    gate is what closes it, since eval-write reads `location_verdict: fail` as closed on
+    its own. When nothing closes it any more, an automatic closure is lifted. A closed
+    posting is left alone (its disposition is about the posting, not a gate), and so is
+    a closure an evaluator wrote, which carries no `auto_gate`: that is a judgement.
+    """
+    if p.get("in_bounds") is False and not p.get("auto_gate"):
+        return None
+    g = hard_gate(p)
+    if g == "closed":
+        return None
+    if g is None:
+        if not p.get("auto_gate"):
+            return None
+        for k in ("status", "gate", "in_bounds", "auto_gate"):
+            p.pop(k, None)
+        return "reopened"
+    p.update(status="SKIP", gate=g, auto_gate=True)
+    if p.get("location_verdict") == "fail":
+        p.pop("in_bounds", None)
+    else:
+        p["in_bounds"] = False
+    return "closed"
+
+
+def gated_packet(p):
+    """The packet a hard-gated req is KEPT as at prep time, or None for a closed posting.
+
+    A gated req used to become a disposition and nothing else, so it never reached the
+    tracker: eval-write's gate-closed path needs a packet to write its unscored SKIP row
+    from, and the next sweep surfaced the req as new work (Antioch and 2K, 2026-10-15;
+    Codex, PR 14). A closed posting is not kept: it was never on offer, and there is no
+    decision about it for the tracker to record.
+    """
+    if p.get("live") is False:
+        return None
+    out = dict(p)
+    settle_gate(out)
+    return out
+
+
+def retract_dispositions(urls):
+    """Remove these urls from dispositions.json; return how many entries went."""
+    out = os.path.join(ROOT, "dispositions.json")
+    if not urls or not os.path.exists(out):
+        return 0
+    prev = json.load(open(out, encoding="utf-8"))
+    keep = [d for d in prev if d.get("url") not in set(urls)]
+    if len(keep) != len(prev):
+        json.dump(keep, open(out, "w", encoding="utf-8"), indent=1)
+    return len(prev) - len(keep)
+
+
+def report_reopened(reopened):
+    """Retract and say so. An inbox row a prune already retired is not restored here."""
+    if reopened:
+        n = retract_dispositions(reopened)
+        print(f"{len(reopened)} automatic closure(s) lifted and back in the queue; "
+              f"{n} disposition(s) retracted. Any inbox row already pruned for them stays "
+              "retired; re-add it by hand if it matters.")
+
+
 def write_packet(path, p):
     """Write one packet the way every reader expects it: UTF-8, one-space indent."""
     with open(path, "w", encoding="utf-8") as fh:
@@ -683,6 +1033,16 @@ def queue_packets(queue=None):
             yield f, p
 
 
+def is_settled(p):
+    """A packet a hard fact has already decided: closed, failed the location gate, or
+    closed by an evaluator's `in_bounds: false`. relocate and reresolve KEEP these now, so
+    every reader that offers judgement work must leave them out: a live=False packet with a
+    clearing band printed "TARGET pass" at the top of list_queue (Codex, 2026-10-15). Their
+    next steps are eval-write (an unscored SKIP row) and eval-blockers --prune."""
+    return (p.get("live") is False or p.get("location_verdict") == "fail"
+            or p.get("in_bounds") is False)
+
+
 def list_queue():
     """Show the packets waiting on judgement, best first.
 
@@ -693,9 +1053,12 @@ def list_queue():
     """
     if not os.path.isdir(OUT_DIR):
         print("no queue"); return
-    rows = []
+    rows, settled = [], 0
     for f, p in queue_packets():
         f = os.path.basename(f)
+        if is_settled(p):
+            settled += 1
+            continue
         c = p.get("comp", {})
         rank = (2 if c.get("clears_target") else 1 if c.get("clears_floor") else 0,
                 1 if p.get("location_verdict") == "pass" else 0,
@@ -703,7 +1066,9 @@ def list_queue():
         rows.append((rank, p, f))
     rows.sort(key=lambda r: r[0], reverse=True)
     filled = sum(1 for _, p, _ in rows if p.get("match_w_cv") is not None)
-    print(f"{len(rows)} packet(s) awaiting judgement, {filled} already filled\n")
+    print(f"{len(rows)} packet(s) awaiting judgement, {filled} already filled"
+          + (f"; {settled} settled (closed or gate-failed) left out, see eval-blockers" if settled else "")
+          + "\n")
     print(f"{'comp':14s} {'loc':8s} {'dup':4s} title")
     print("-" * 92)
     for rank, p, f in rows:
@@ -732,7 +1097,7 @@ def relocate():
     Recomputed from the stored location string, so it costs no network. Packets that
     already carry a judgement are left alone.
     """
-    changed, disp = 0, []
+    changed, disp, reopened = 0, [], []
     for f, p in queue_packets():
         if p.get("match_w_cv") is not None:
             continue
@@ -749,15 +1114,24 @@ def relocate():
         print(f"  {str(p.get('location'))[:30]:30s} {p.get('location_verdict')} -> {v}  "
               f"({(p.get('title') or '')[:40]})")
         p["location_verdict"], p["location_why"] = v, w
+        if settle_gate(p) == "reopened":
+            reopened.append(p["url"])
         write_packet(f, p)
         changed += 1
+        # A packet that now fails STAYS in the queue. This used to os.remove() it, which
+        # had two costs: a wrong gate could not be recovered by hand, and the req never
+        # got a tracker row, so the next LinkedIn or board sweep surfaced it as new work.
+        # eval-write records a gate-closed packet as an unscored SKIP row now, and
+        # eval-blockers --prune moves it once that report exists.
         if v == "fail":
             disp.append({"url": p["url"], "disposition": w})
-            os.remove(f)
     print(f"\n{changed} packet(s) re-gated, {len(disp)} now fail on location")
+    report_reopened(reopened)
     if disp:
-        print(f"dispositions.json now holds {record_dispositions(disp)}; retire with:")
+        print(f"dispositions.json now holds {record_dispositions(disp)}; retire the inbox rows with:")
         print("  node pipeline-audit.mjs --prune --dispositions=dispositions.json")
+        print("record each as an unscored SKIP row with:")
+        print("  node eval-write.mjs <packet> --date=YYYY-MM-DD")
 
 
 def reresolve():
@@ -776,17 +1150,27 @@ def reresolve():
     for f, p in queue_packets():
         if p.get("match_w_cv") is not None:
             continue
+        # A LinkedIn page capture has nothing for the resolver to refetch: it would answer
+        # unknown for linkedin.com and overwrite the capture's own liveness with that.
+        # Recapture it in the browser instead (LIS.detail()).
+        if p.get("ats") == "linkedin":
+            continue
         jd = p.get("jd_full") or ""
         # An unusable location is not the only reason to refetch. Two resolver
         # branches computed the description and then forgot to return it, so those
         # packets carry an EMPTY jd and score lane 0.0 on no evidence: that is how a
         # well-paid, in-lane remote req sorted to the bottom of the queue. And escaped markup used to survive clean(), so older packets hold
         # literal <p> and <li> in the text the lane scan reads.
-        if (p.get("location_verdict") == "unknown" or not jd
-                or re.search(r"<(p|li|div|br|ul|strong)\b", jd, re.I)):
+        # An automatic closure is refetched too: it rests on prep-day evidence, and only a
+        # fresh read can find the "Offers Equity" or the new location that lifts it. A
+        # gated packet with a good location and JD matched none of the tests above, so its
+        # closure and disposition were permanent in practice (Codex P1, PR 14).
+        # An untitled packet is stuck too: eval-write cannot name its report.
+        if (p.get("location_verdict") == "unknown" or not jd or p.get("auto_gate")
+                or not p.get("title") or re.search(r"<(p|li|div|br|ul|strong)\b", jd, re.I)):
             stuck.append((f, p))
     print(f"{len(stuck)} packet(s) need a fresh fetch\n")
-    changed, disp = 0, []
+    changed, disp, reopened = 0, [], []
     for f, p in stuck:
         r = rr.resolve(p["url"]) or {}
         # Rewrite the packet's OWN liveness on every refetch, whatever the answer comes
@@ -805,38 +1189,147 @@ def reresolve():
             changed += 1
             continue
         if r.get("live") is False:
+            # Kept, with live=False written above: eval-blockers reads that as `closed`
+            # and --prune MOVES it to done/. Deleting it here bypassed the one path that
+            # keeps a wrong closure recoverable by hand.
             print(f"  CLOSED  {(p.get('title') or '')[:52]}")
             disp.append({"url": p["url"], "disposition": "posting closed"})
-            os.remove(f)
+            write_packet(f, p)
             changed += 1
             continue
         if r.get("jd"):
             p["jd_full"], p["jd_chars"] = r["jd"], len(r["jd"])
             p["requirements_excerpt"] = requirements(r["jd"])
-            if not (p.get("comp") or {}).get("posted"):
-                p["comp"] = comp_verdict(r.get("pay"), r["jd"])
+        # Pay is refreshed whether or not a JD came back: Ashby's embedded-board fallback
+        # returns pay and the tier summary with jd "" on purpose, and nesting this under the
+        # JD left such a packet at no band and without its "Offers Equity" (Codex, PR 14).
+        # The stored body stands in as the basis context when the refetch carried none.
+        if r.get("comp_summary"):
+            p["comp_summary"] = r["comp_summary"]
+        # A stored figure that sits in the freshly read body and that today's reader rejects
+        # there (a stipend, a bonus, another place's band) is retracted: keeping it kept
+        # exactly what the resolver now refuses (Codex round 3). Silence is still not a
+        # retraction: a figure absent from the body came from a structured field the body
+        # cannot speak for, and with no body nothing is retracted at all.
+        retracted = False
+        if r.get("pay"):
+            p["pay"] = r["pay"]
+        elif r.get("jd") and (p.get("pay") or (p.get("comp") or {}).get("posted")):
+            stored = p.get("pay") or [(p.get("comp") or {}).get("posted")]
+            kept = surviving_figures(stored, r["jd"])
+            retracted = kept != stored
+            p["pay"] = kept
+        # A packet that already HAS a band is re-derived too: its basis and floor_gate were
+        # decided on the evidence of the day, and a summary that now says "Offers Equity"
+        # must be able to lift a gate an older inference set (Codex P1, PR 14). A refetch
+        # that finds no band leaves an existing one alone; silence is not a retraction.
+        # A refetch carrying ONLY a summary is new basis evidence too (Codex P1, PR 14), so
+        # it re-derives the stored figures: the packet's own `pay`, or for a packet older
+        # than that key, the band it recorded, which then reads as a yearly band of unknown
+        # basis and so cannot gate on its own.
+        if r.get("pay") or r.get("jd") or r.get("comp_summary"):
+            old = (p.get("comp") or {}).get("posted")
+            figures = p.get("pay") if retracted else (r.get("pay") or p.get("pay") or ([old] if old else []))
+            fresh = comp_verdict(figures, r.get("jd") or p.get("jd_full") or "",
+                                 p.get("comp_summary") or "")
+            if fresh.get("posted") or not old or retracted:
+                p["comp"] = fresh
         if not p.get("company"):
             p["company"] = company_from({**r, "url": p["url"]})
+            p["company_hint"] = p.get("company_hint") or company_hint({**r, "url": p["url"]})
+        # A packet first built from an unreadable host has no title and a resolver note
+        # saying so; a refetch that now reads the posting must replace both, or the packet
+        # stays "untitled" with a note contradicting its own body (Nominal and Cerby, after
+        # the Gem and Rippling adapters landed, 2026-10-29). A title the refetch lacks is
+        # kept; silence is not a retraction.
+        if r.get("title") and not p.get("title"):
+            p["title"] = r["title"]
+        if r.get("note") is not None or r.get("live") is not None:
+            p["resolver_note"] = r.get("note")
         loc = r.get("location")
+        if loc:
+            v, w = location_verdict(loc, r.get("remote_txt"))
+            p["location"], p["location_verdict"], p["location_why"] = loc, v, w
+        if settle_gate(p) == "reopened":
+            reopened.append(p["url"])
         if not loc:
             print(f"  jd {p.get('jd_chars', 0):5d}  (location unchanged)  "
                   f"{(p.get('title') or '')[:38]}")
             write_packet(f, p)
             changed += 1
             continue
-        v, w = location_verdict(loc, r.get("remote_txt"))
-        p["location"], p["location_verdict"], p["location_why"] = loc, v, w
         print(f"  {str(loc)[:34]:34s} -> {v:7s} jd {p.get('jd_chars', 0):5d}  "
               f"{(p.get('title') or '')[:34]}")
         write_packet(f, p)
         changed += 1
+        # A location failure stays in the queue too, for eval-write's SKIP row; see relocate().
         if v == "fail":
             disp.append({"url": p["url"], "disposition": w})
-            os.remove(f)
     print(f"\n{changed} packet(s) updated, {len(disp)} settled by a hard gate")
+    report_reopened(reopened)
     if disp:
-        print(f"dispositions.json now holds {record_dispositions(disp)}; retire with:")
+        print(f"dispositions.json now holds {record_dispositions(disp)}; retire the inbox rows with:")
         print("  node pipeline-audit.mjs --prune --dispositions=dispositions.json")
+        print("then: eval-write records each location failure as an unscored SKIP row, and")
+        print("  python scripts/eval-blockers.py --prune moves the closed and reported packets")
+
+
+def recomp_figures(p):
+    """The pay figures a packet should be judged on under the CURRENT body rules.
+
+    A stored figure that appears in the stored body and that today's reader rejects (a
+    stipend, a bonus, another place's band) is dropped; one that does not appear in the body
+    came from a structured field (an Ashby tier, a Greenhouse custom field) and is kept,
+    since the body cannot speak for it. With nothing kept, the body's current reading.
+    `recomp` used to skip any packet already holding a band and read no figures at all,
+    so it could neither repair nor even see a contaminated one (Codex round 3).
+    """
+    jd = p.get("jd_full") or ""
+    old = (p.get("comp") or {}).get("posted")
+    stored = p.get("pay") or ([old] if old else [])
+    kept = surviving_figures(stored, jd)
+    return kept or rr.pays(jd)
+
+
+def _nums(s):
+    """The amounts in one figure, as whole dollars: "$150K", "150,000.00 USD", "$150,000"
+    all give 150000. Figures are compared by AMOUNT, because the stored spelling and the
+    body's differ ("$150,000 - $200,000" stored, "$150,000.00 - $200,000.00" in the body)
+    and a literal test read that as "absent from the body, so structured" (round 4)."""
+    out = set()
+    for n, k in re.findall(r"(\d[\d,]*(?:\.\d+)?)\s*([kK])?\b", s or ""):
+        # The fraction counts: "$150.5K" is 150500, and dropping it made the stored
+        # "$150,500" read as absent from the body (round 5).
+        v = int(round(float(n.replace(",", "")) * (1000 if k else 1)))
+        if v >= 1000:
+            out.add(v)
+    return frozenset(out)
+
+
+def surviving_figures(stored, jd):
+    """The stored pay figures that today's reader would still accept from this body.
+
+    A figure whose amounts the body states, in any spelling, survives only if pays() still
+    accepts it there. A figure the body never states came from a structured field (an
+    Ashby tier, a Greenhouse custom field) and is kept, since the body cannot speak for it.
+    """
+    # Every amount the body states at all, read loosely on purpose: the stipend that started
+    # this is "$2,000", which PAY itself no longer matches.
+    said = _nums(rr.mask_foreign(jd or ""))
+    # Accepted figures are read with K notation expanded, since _nums() reads "$150K" as an
+    # amount and a body band in that spelling must be able to confirm a stored figure.
+    ok = [_nums(x) for x in rr.pays(rr.k_band(jd or ""))]
+    out = []
+    for f in stored or []:
+        n = _nums(f)
+        stated = bool(n) and n <= said
+        # Survives only if every amount it holds is inside one accepted figure. The reverse
+        # test let an accepted "$150,000" keep a rejected "$150,000 - $200,000" equity band
+        # (round 5); this direction still keeps the lone figures an older reader split a
+        # cents-written band into.
+        if not stated or any(a and n <= a for a in ok):
+            out.append(f)
+    return out
 
 
 def recomp():
@@ -849,18 +1342,27 @@ def recomp():
     of the day could not see. The full JD is stored in the packet, so this costs no
     network.
     """
-    changed = 0
+    changed, reopened = 0, []
     for f, p in queue_packets():
-        if p.get("match_w_cv") is not None or (p.get("comp") or {}).get("posted"):
+        if p.get("match_w_cv") is not None:
             continue
-        c = comp_verdict([], p.get("jd_full") or "")
-        if not c.get("posted"):
+        before = p.get("comp") or {}
+        c = comp_verdict(recomp_figures(p), p.get("jd_full") or "", p.get("comp_summary") or "")
+        # The WHOLE verdict, not just the band: a corrected basis on the same figures can
+        # lift a floor gate, and comparing `posted` alone threw that correction away; and a
+        # change has to reach settle_gate(), or a closure the old band armed stayed shut
+        # (Codex round 4).
+        if c == before:
             continue
-        print(f"  {c['posted']:24s} {(p.get('title') or '')[:52]}")
+        print(f"  {str(before.get('posted') or 'no band'):24s} -> "
+              f"{str(c.get('posted') or 'no band'):24s} {(p.get('title') or '')[:40]}")
         p["comp"] = c
+        if settle_gate(p) == "reopened":
+            reopened.append(p.get("url"))
         write_packet(f, p)
         changed += 1
-    print(f"\n{changed} packet(s) gained a band")
+    print(f"\n{changed} packet(s) changed comp")
+    report_reopened(reopened)
 
     named = 0
     for f, p in queue_packets():
@@ -868,6 +1370,10 @@ def recomp():
             continue
         co = company_from(p)
         if not co:
+            hint = company_hint(p)
+            if hint and not p.get("company_hint"):
+                p["company_hint"] = hint
+                write_packet(f, p)
             continue
         p["company"] = co
         write_packet(f, p)
@@ -966,6 +1472,61 @@ LOCATION_CASES = [
      "Autodesk writes its country as the ISO-3 code. The country list held 'canada' but "
      "not 'CAN', so the bare word 'Remote' carried this through as a PASS and a Canadian "
      "role was reported as actionable under a hard no-relocation constraint"),
+    ("AMER - United States - Texas - Remote | Texas, USA - Remote", True, "fail",
+     "Autodesk 26WD134728 as the resolver returned it. Autodesk's Eightfold front end puts "
+     "a sales region in front of the country, and the start-anchored scope shape could not "
+     "see past it, so Texas read as a weak mention and the packet came out 'unknown'. The "
+     "grammar now folds an Americas region label away before a US country marker",
+     "scoped to states"),
+    ("AMER - United States - Texas - Remote", True, "fail",
+     "the region-prefixed option on its own: a Texas scope, not a weak mention",
+     "scoped to states"),
+    ("AMER - United States - California - Remote", True, "pass",
+     "the same form scoped to California must pass, and through the SCOPE branch: it "
+     "already passed before the fold, on the weak 'naming only CA' path",
+     "scoped to CA"),
+    ("AMER - United States - California - Los Angeles", True, "pass",
+     "the onsite form of the same spelling reaches the commute list"),
+    ("AMER - United States - Texas", False, "fail",
+     "the onsite form with no Remote suffix is onsite in Texas"),
+    ("AMER - Canada - Remote", True, "fail",
+     "the fold only drops a region label in front of a US marker; the rest still fail as "
+     "foreign"),
+    ("EMEA - United Kingdom - London - Remote | APAC - Australia - Sydney - Remote", True, "fail",
+     "EMEA and APAC labels are never folded and are blocked regions in their own right"),
+    ("AMER - Remote", True, "unknown",
+     "the Americas include Canada and Latin America, so a bare AMER remote is a question, "
+     "not remote-US, even with the ATS isRemote flag set. The flag settles an UNRECOGNISED "
+     "remote region; this one is recognised as wider than the US, and lifting it was a "
+     "false pass in the direction that hides a hard no-relocation failure",
+     "wider than the US"),
+    ("Americas - Remote", True, "unknown", "the spelled-out label, same rule",
+     "wider than the US"),
+    ("NA - Remote", True, "unknown", "North America's sales label, same rule",
+     "wider than the US"),
+    ("Remote (Americas)", True, "unknown", "the label after the remote word, same rule",
+     "wider than the US"),
+    ("LATAM - Remote", True, "fail",
+     "LATAM is a blocked region, so it fails outright and the flag cannot touch it"),
+    ("Remote, Flexible", True, "pass",
+     "the upgrade the rule above must not take away: a remote string whose qualifier names "
+     "no region at all is still settled by the isRemote flag", "remote (unqualified)"),
+    ("Remote, Flexible", False, "unknown",
+     "and without the flag it stays a question, so the case above proves the flag did it",
+     "region is not recognised"),
+    ("Remote, Flexible | AMER - Remote", True, "unknown",
+     "the Americas question must survive aggregation: taking the first unknown let the flag "
+     "upgrade the 'unrecognised' option and pass the posting (Codex, 2026-10-15)"),
+    ("AMER - Remote | Remote, Flexible", True, "unknown",
+     "and the reverse order gives the same answer, which is the property being pinned"),
+    ("AMER / Remote", True, "unknown",
+     "a slash split the region off its remote word, and the bare half passed as remote-US"),
+    ("Los Angeles - San Diego, CA", False, "fail",
+     "EA writes a metro label over the city ('Los Angeles - Chatsworth'). One piece naming two "
+     "places is a hierarchy, so a far place beside the commute word voids it; the metro word "
+     "alone used to pass Respawn's Valley studio"),
+    ("Los Angeles, CA - HQ in San Francisco", False, "pass",
+     "an office named beside the place is not the place, so the rule above must not fire"),
     ("UK, Remote | Switzerland, Remote | Finland, Remote", True, "fail",
      "NVIDIA JR2548194, AI Developer Tools. NVIDIA writes the United Kingdom as 'UK', "
      "which is neither the spelled-out name nor the ISO-3 'GBR', so that one segment carried "
@@ -1240,6 +1801,18 @@ def selftest():
     the bug was live. Pin the reason wherever the branch is the point of the case.
     """
     bad = 0
+    # The duplicate warning must see an employer named only by a shared board's SLUG.
+    from unittest import mock as _m
+    _row = ("| 417 | 2026-08-03 | Reddit | Senior Staff Machine Learning Engineer, GenAI "
+            "Platform | 3.4/5 | SKIP |")
+    _cells = [c.strip() for c in _row.split("|")]
+    with _m.patch.object(sys.modules[__name__], "_tracker_rows", lambda: [(_row, _cells)]):
+        for _u, _want in (("https://job-boards.greenhouse.io/reddit/jobs/7033254", 1),
+                          ("https://job-boards.greenhouse.io/cresta/jobs/1", 0)):
+            _got = len(tracker_hits("Senior Staff Machine Learning Engineer, GenAI Platform", _u))
+            if _got != _want:
+                bad += 1
+                print(f"FAIL  tracker_hits on {_u}: {_got} hit(s), expected {_want}")
     for case in LOCATION_CASES:
         loc, flag, want, why = case[:4]
         want_note = case[4] if len(case) > 4 else None
@@ -1267,8 +1840,15 @@ def selftest():
     before = _real_queue()
     bad += other_state_cases()
     groups = (("comp", comp_cases), ("naming", naming_cases), ("reresolve", reresolve_cases),
-              ("queue", queue_cases))
-    bad += sum(fn() for _, fn in groups)
+              ("reopen", reopen_cases), ("queue", queue_cases), ("linkedin", linkedin_cases))
+    # No case may read the installed profile's floor: a case that needs one pins it (the
+    # explicit `targets`, or a mock of configured_comp_targets), and every other read is
+    # "no floor configured". A call naming its own profile path still reads that file.
+    from unittest import mock
+    _real_targets = configured_comp_targets
+    with mock.patch.object(sys.modules[__name__], "configured_comp_targets",
+                           lambda path=None: _real_targets(path) if path else None):
+        bad += sum(fn() for _, fn in groups)
     if _real_queue() != before:
         bad += 1
         print("FAIL  the selftest modified the REAL eval queue; a patch of OUT_DIR is not "
@@ -1279,6 +1859,97 @@ def selftest():
     # added later cannot go unnamed, as the queue group briefly did.
     print(f"eval-prep selftest: {bad} failure(s) across "
           + ", ".join(["location"] + [name for name, _ in groups]) + " cases")
+    return bad
+
+
+def linkedin_cases():
+    """--from-linkedin: a captured Easy Apply posting becomes a filled packet, an ATS apply
+    link still goes to the resolver, and a closed listing is never read as live."""
+    import datetime
+    bad = 0
+    today = datetime.date.today().isoformat()
+    good = {"id": "4620863806", "url": "https://www.linkedin.com/jobs/view/4620863806/",
+            "company": "Escape Velocity Entertainment", "title": "AI Director - Machine Learning",
+            "location": "United States", "workplace": "Remote", "comp": "$200K/yr - $260K/yr",
+            "open": True, "read_ok": True, "apply_url": "EASY_APPLY",
+            "jd": "Oversee ML bot research.", "read_on": today}
+    with tempfile.TemporaryDirectory() as d:
+        f = os.path.join(d, "details.json")
+        rows = [
+            good,
+            {"id": "4335539310", "url": "https://www.linkedin.com/jobs/view/4335539310/",
+             "apply_url": "https://careers.activision.com/job/ACPUUSR045261EXTERNAL/x", "open": True},
+            dict(good, id="4532225990", url="https://www.linkedin.com/jobs/view/4532225990/", open=False),
+            dict(good, id="4400000002", url="https://www.linkedin.com/jobs/view/4400000002/",
+                 read_on="2000-01-01"),
+            # A sign-in wall parsed as a posting (Codex, 2026-10-28): refused outright.
+            dict(good, id="4400000003", url="https://www.linkedin.com/jobs/view/4400000003/",
+                 company="Sign in", title="Join LinkedIn", jd="", read_ok=False),
+        ]
+        with open(f, "w", encoding="utf-8") as fh:
+            json.dump(rows, fh)
+        with contextlib.redirect_stdout(io.StringIO()):
+            got = from_linkedin(f)
+    by = {u: r for u, r, _ in got}
+    who = {u: w for u, _, w in got}
+    checks = [
+        (len(got) == 4, f"an unread page is refused, the other four rows are jobs ({len(got)})"),
+        (by.get("https://careers.activision.com/job/ACPUUSR045261EXTERNAL/x", 0) is None,
+         "an ATS apply link goes to the resolver, not the captured page"),
+        (by["https://www.linkedin.com/jobs/view/4532225990/"]["live"] is None,
+         "a closed listing is not live, and LinkedIn alone never closes a row"),
+        (by["https://www.linkedin.com/jobs/view/4400000002/"]["live"] is None,
+         "a capture from another day is not evidence the posting is live today"),
+    ]
+    checks += [
+        (linkedin_employer("(3) Staff AI Engineer | Cardinal Health | LinkedIn") == "Cardinal Health",
+         "the employer is read from the tab title, badge and all"),
+        (linkedin_employer("Sign in | LinkedIn") is None, "a two-part title names no employer"),
+        (linkedin_employer("Staff Applied AI Engineer | Orum \U0001f947 | LinkedIn") == "Orum"
+         and linkedin_employer("TD | Wētā FX | LinkedIn") == "Wētā FX",
+         "decoration is dropped, letters in any script are kept"),
+        (linkedin_employer("A | B | C | LinkedIn") == "C", "a title holding a pipe keeps the last company cell"),
+        (who[good["url"]] == "Escape Velocity Entertainment", "an Easy Apply row carries its company"),
+    ]
+    riot = "https://www.riotgames.com/en/work-with-us/job/7037924?gh_jid=7037924%3Fgh_src%3Dnslt3m"
+    nflx = "https://explore.jobs.netflix.net/careers/job/721941852582?microsite=netflix.com&domain=netflix.com"
+    fake = lambda u: "https://job-boards.greenhouse.io/podium81/jobs/123456?gh_src=abc"
+    def boom(u):
+        raise OSError("offline")
+    checks += [
+        (clean_apply(riot) == "https://www.riotgames.com/en/work-with-us/job/7037924?gh_jid=7037924",
+         f"a nested ?gh_src inside gh_jid is cut, got {clean_apply(riot)}"),
+        (clean_apply(nflx) == nflx, "an Eightfold domain parameter is not tracking and survives"),
+        ("jobId%3D123" in clean_apply("https://a.example/go?redirect=https%3A%2F%2Fx.example%2Fjob%3FjobId%3D123"),
+         "a value that is itself a URL keeps its own query"),
+        (clean_apply("https://careers.example.com/jobs/application") == "https://careers.example.com/jobs/application",
+         "an /application segment off the known ATS hosts is left alone"),
+        (clean_apply("https://x.wd5.myworkdayjobs.com/ext/job/NYC/Eng_JR-015305-1/apply")
+         == "https://x.wd5.myworkdayjobs.com/ext/job/NYC/Eng_JR-015305-1",
+         "an /apply form link becomes the posting link"),
+        (clean_apply("https://grnh.se/pfiou3ft1us", fake)
+         == "https://job-boards.greenhouse.io/podium81/jobs/123456",
+         "a grnh.se short link is expanded and its tracking dropped"),
+        (clean_apply("https://grnh.se/x", boom) == "https://grnh.se/x",
+         "a short link that cannot be expanded is kept, not lost"),
+    ]
+    p = prep(good["url"], by[good["url"]])
+    checks += [
+        (p["live"] is True and p["ats"] == "linkedin", "a fresh, read, open Easy Apply listing is live"),
+        (p.get("captured_on") == today, "the capture date travels into the packet"),
+        (p["company"] == "Escape Velocity Entertainment", "the page's company is the packet's"),
+        (p["location_verdict"] == "pass",
+         f"a bare United States with the Remote badge passes, got {p['location_verdict']}"),
+        (p.get("remote_txt") is True, "the remote flag is kept, so --relocate re-gates the same way"),
+        ((p["comp"].get("low"), p["comp"].get("high")) == (200000, 260000),
+         f"the card's K/yr band is read as pay, got {p['comp'].get('posted')!r}"),
+        (packet_name(p).endswith("4620863806.json"), f"packet named by its LinkedIn id: {packet_name(p)}"),
+    ]
+    for ok, msg in checks:
+        if not ok:
+            bad += 1
+            print("FAIL  linkedin:", msg)
+    print(f"{bad} linkedin case(s) failed" if bad else f"all {len(checks)} linkedin cases pass")
     return bad
 
 
@@ -1296,8 +1967,96 @@ def _patched(d, root=True):
         yield d
 
 
+def reopen_cases():
+    """An automatic closure is lifted when the evidence that closed it changes."""
+    from unittest import mock
+    bad = 0
+
+    def check(ok, msg):
+        nonlocal bad
+        if not ok:
+            bad += 1
+            print(f"FAIL  {msg}")
+
+    me = sys.modules[__name__]
+    URL, OTHER = "https://careers.example.com/job/2468013/x", "https://careers.example.com/job/1/y"
+    # An evaluator's closure is a judgement and is never reopened.
+    hand = {"url": URL, "live": True, "in_bounds": False, "gate": "relocation", "comp": {}}
+    check(settle_gate(dict(hand)) is None, "an evaluator's closure must never be reopened")
+    # The shape follows the CURRENT gate. A location closure whose location now passes
+    # while a stated-total band still fails becomes a comp closure, with in_bounds false.
+    sub_total = {"posted": "$93,600 - $124,800", "basis": "total", "floor_gate": True}
+    q = {"url": URL, "live": True, "location_verdict": "pass", "comp": sub_total,
+         "status": "SKIP", "gate": "Texas only", "auto_gate": True}
+    check(settle_gate(q) == "closed" and q.get("in_bounds") is False
+          and q.get("gate", "").startswith("below floor"),
+          f"a gate that turns from location to comp must take the comp shape: {q}")
+    # A packet that FIRST fails during a re-gate is marked automatic, so it can be lifted.
+    q = {"url": URL, "live": True, "location_verdict": "fail", "location_why": "Texas only", "comp": {}}
+    check(settle_gate(q) == "closed" and q.get("auto_gate") is True and "in_bounds" not in q,
+          f"a fresh location failure must be an automatic closure: {q}")
+    # A closed posting keeps what it has; its disposition is about the posting.
+    q = {"url": URL, "live": False, "status": "SKIP", "gate": "x", "auto_gate": True}
+    check(settle_gate(q) is None and q.get("auto_gate") is True,
+          f"a closed posting must not be reopened: {q}")
+    with tempfile.TemporaryDirectory(prefix="evalprep-reopen-") as d:
+        def seed(packet):
+            f = os.path.join(d, "x.json")
+            write_packet(f, packet)
+            json.dump([{"url": URL, "disposition": "gated"}, {"url": OTHER, "disposition": "x"}],
+                      open(os.path.join(d, "dispositions.json"), "w", encoding="utf-8"))
+            return f
+
+        def read(f):
+            return (json.load(open(f, encoding="utf-8")),
+                    [x["url"] for x in json.load(open(os.path.join(d, "dispositions.json")))])
+
+        # relocate: a stale location failure that now passes.
+        loc_gated = gated_packet({"url": URL, "title": "A Role", "company": "Example", "live": True,
+                                  "location": "United States - Remote", "location_verdict": "fail",
+                                  "location_why": "Texas only", "match_w_cv": None, "comp": {},
+                                  "jd_full": "plain"})
+        f = seed(loc_gated)
+        with _patched(d):
+            relocate()
+        p, urls = read(f)
+        check(p.get("location_verdict") == "pass" and "status" not in p and "gate" not in p
+              and "auto_gate" not in p and urls == [OTHER],
+              f"relocate must lift a closure the location no longer supports: "
+              f"{p.get('location_verdict')} {p.get('status')} {p.get('gate')} / {urls}")
+        # reresolve: a total-band gate that an equity summary lifts, on a no-JD refetch.
+        comp_gated = gated_packet({"url": URL, "title": "A Role", "company": "Example", "live": True,
+                                   "location": "United States - Remote", "location_verdict": "pass",
+                                   # A good JD and location: only auto_gate gets it refetched.
+                                   "match_w_cv": None, "jd_full": "Build agent tooling.",
+                                   "comp": {"posted": "$93,600 - $124,800", "basis": "total",
+                                            "floor_gate": True}})
+        f = seed(comp_gated)
+        refetch = {"live": True, "location": "United States - Remote", "jd": "",
+                   "pay": ["$45 - $60 per hour"],
+                   "comp_summary": "$45 \u2013 $60 per hour \u2022 Offers Equity"}
+        with _patched(d), mock.patch.object(rr, "resolve", lambda *a, **k: refetch), \
+                mock.patch.object(me, "configured_comp_targets", lambda *a, **k: (200_000, 250_000)):
+            reresolve()
+        p, urls = read(f)
+        check((p.get("comp") or {}).get("floor_gate") is False and "in_bounds" not in p
+              and "status" not in p and urls == [OTHER],
+              f"reresolve must lift a comp closure the refetch contradicts: "
+              f"{p.get('comp')} {p.get('in_bounds')} {p.get('status')} / {urls}")
+        # ...and one the evidence still supports stays closed, with its disposition.
+        f = seed(gated_packet({**comp_gated, "auto_gate": None}))
+        with _patched(d), mock.patch.object(rr, "resolve", lambda *a, **k: {**refetch, "comp_summary": ""}), \
+                mock.patch.object(me, "configured_comp_targets", lambda *a, **k: (200_000, 250_000)):
+            reresolve()
+        p, urls = read(f)
+        check(p.get("in_bounds") is False and p.get("status") == "SKIP" and URL in urls,
+              f"a closure the refetch still supports must stay: {p.get('in_bounds')} / {urls}")
+    print(f"{bad} reopen case(s) failed" if bad else "all reopen cases pass")
+    return bad
+
+
 def reresolve_cases():
-    """What --reresolve writes back, and what it is allowed to delete.
+    """What --reresolve writes back, and what it is allowed to settle. It deletes nothing.
 
     Two defects, both found by cross-review on 2026-09-20, both the same shape: a refetch
     that updated everything about a packet EXCEPT the field the rest of the toolchain
@@ -1308,21 +2067,33 @@ def reresolve_cases():
     result as readily as on a real closure.
     """
     from unittest import mock
-    bad = 0
+    bad = n = 0
 
     def check(ok, msg):
-        nonlocal bad
+        nonlocal bad, n
+        n += 1
         if not ok:
             bad += 1
             print(f"FAIL  {msg}")
 
-    def run(result, **over):
-        """One packet, one mocked resolver answer. Returns the packet, or None if deleted."""
+    me = sys.modules[__name__]
+    # A PINNED floor for the cases that need one, never the installed profile's: the suite
+    # must mean the same thing on every machine, configured or not.
+    FLOOR_FIX = (200_000, 250_000)
+
+    def pinned_floor():
+        return mock.patch.object(me, "configured_comp_targets", lambda *a, **k: FLOOR_FIX)
+
+    def run(result, root=True, **over):
+        """One packet, one mocked resolver answer. Returns the packet, or None if deleted.
+
+        root=False keeps the real ROOT and pins the fixture floor, for a case that needs one."""
         packet = {**dict(url="https://careers.example.com/job/1194374/x", title="A Role",
                          company="Example", live=True, location_verdict="unknown",
                          match_w_cv=None, jd_full="plain text, no markup"), **over}
-        with tempfile.TemporaryDirectory(prefix="evalprep-queue-") as d, _patched(d), \
-                mock.patch.object(rr, "resolve", lambda *a, **k: result):
+        with tempfile.TemporaryDirectory(prefix="evalprep-queue-") as d, _patched(d, root), \
+                mock.patch.object(rr, "resolve", lambda *a, **k: result), \
+                (contextlib.nullcontext() if root else pinned_floor()):
             f = os.path.join(d, "x.json")
             with open(f, "w", encoding="utf-8") as fh:
                 json.dump(packet, fh, indent=1)
@@ -1332,6 +2103,16 @@ def reresolve_cases():
             with open(f, encoding="utf-8") as fh:
                 return json.load(fh)
 
+    # A packet built untitled from an unreadable host gains the title and loses the stale
+    # note once the refetch reads it; an existing title is never overwritten.
+    got = run({"live": True, "title": "Staff AI Engineer", "note": "", "location": "Remote",
+               "jd": "We build agents. " * 20},
+              root=False, title="", resolver_note="no API for this host")
+    check(got and got.get("title") == "Staff AI Engineer" and got.get("resolver_note") == "",
+          f"an untitled packet takes the refetched title and note: {got and (got.get('title'), got.get('resolver_note'))}")
+    got = run({"live": True, "title": "Renamed", "note": "", "location": "Remote",
+               "jd": "We build agents. " * 20}, root=False)
+    check(got and got.get("title") == "A Role", "a stored title is not overwritten by a refetch")
     # A packet stamped live=True the day it was built kept saying so through every later
     # refetch, because this loop wrote jd, location, comp and company and never `live`.
     # eval-blockers reads that field to decide what is READY, so the staleness surfaced
@@ -1347,10 +2128,121 @@ def reresolve_cases():
     # undone from the disposition it leaves behind.
     check(run({}) is not None, "an empty resolver result must not delete the packet")
     check(run(None) is not None, "a null resolver result must not delete the packet")
-    # ...and a real closure must still remove it, or the fix would have bought safety by
-    # making --reresolve unable to settle anything.
-    check(run({"live": False}) is None, "a resolved closure must still remove the packet")
-    print(f"{bad} of 5 reresolve cases failed" if bad else "all 5 reresolve cases pass")
+    # ...and a real closure must still SETTLE it, or the fix would have bought safety by
+    # making --reresolve unable to settle anything. Settling used to mean a delete; since
+    # 2026-10-15 it writes live=False and keeps the file, which eval-blockers reads as
+    # `closed` and --prune moves to done/, so a wrong closure stays recoverable by hand.
+    p = run({"live": False})
+    check(p is not None and p.get("live") is False,
+          f"a resolved closure must be kept and marked live=False: {p and p.get('live')}")
+    # A location failure is kept too, rewritten to fail, so eval-write can record it as an
+    # unscored SKIP row instead of the req vanishing from the tracker.
+    p = run({"live": True, "location": "Austin, TX"})
+    check(p is not None and p.get("location_verdict") == "fail",
+          f"a refetch that fails the gate must keep the packet as fail: {p and p.get('location_verdict')}")
+    # The ATS pay summary has to reach comp_verdict from BOTH builders, prep() and this
+    # refetch: comp_verdict reading it is no use if a caller drops it on the way (Codex
+    # P1, PR 14). A sub-floor hourly band, a silent body, "Offers Equity" in the summary.
+    SUMMARY = {"live": True, "location": "United States - Remote", "jd": "Build agent tooling.",
+               "pay": ["$45.00 - $60.00 per hour"],
+               "comp_summary": "$45 \u2013 $60 per hour \u2022 Offers Equity"}
+    p = run(SUMMARY, root=False)
+    check(p is not None and (p.get("comp") or {}).get("floor_gate") is False
+          and "Offers Equity" in (p.get("comp_summary") or ""),
+          f"a refetch must read the ATS summary for the basis: {p and p.get('comp')}")
+    # A packet that already has a band, gated on an old total inference, is re-derived
+    # when the refetch brings the summary that contradicts it...
+    stale = {"posted": "$93,600 - $124,800", "basis": "total", "floor_gate": True}
+    p = run(SUMMARY, root=False, comp=stale)
+    check(p is not None and (p.get("comp") or {}).get("floor_gate") is False,
+          f"a refetch must re-derive an existing band's basis: {p and p.get('comp')}")
+    # ...and a refetch that finds no band leaves an existing one alone.
+    p = run({"live": True, "location": "United States - Remote", "jd": "No pay stated."},
+            root=False, comp=stale)
+    check(p is not None and (p.get("comp") or {}).get("posted") == stale["posted"],
+          f"a refetch with no band must not erase one: {p and p.get('comp')}")
+    # ...and a refetch carrying ONLY the summary re-derives the stored band, from the
+    # packet's own pay when it has it and from the recorded band when it does not.
+    only_summary = {"live": True, "location": "United States - Remote", "jd": "",
+                    "comp_summary": SUMMARY["comp_summary"]}
+    for kept, why in ((["$45.00 - $60.00 per hour"], "stored pay"), ([], "the recorded band")):
+        p = run(only_summary, root=False, comp=stale, pay=kept)
+        check(p is not None and (p.get("comp") or {}).get("floor_gate") is False
+              and (p.get("comp") or {}).get("posted"),
+              f"a summary-only refetch must re-derive from {why}: {p and p.get('comp')}")
+    # ...including when the refetch carries pay and no JD, as the embedded board does.
+    p = run({**SUMMARY, "jd": ""}, root=False)
+    check(p is not None and (p.get("comp") or {}).get("posted")
+          and (p.get("comp") or {}).get("floor_gate") is False
+          and "Offers Equity" in (p.get("comp_summary") or ""),
+          f"a no-JD refetch must still refresh pay and summary: {p and p.get('comp')}")
+    with mock.patch.object(rr, "resolve", lambda *a, **k: SUMMARY), pinned_floor():
+        p = prep("https://careers.example.com/job/7654321/x")
+    check(p["comp"].get("floor_gate") is False and "Offers Equity" in (p.get("comp_summary") or ""),
+          f"prep must read the ATS summary for the basis: {p['comp']}")
+    # A stored figure the body still states, and that the reader now rejects, is retracted
+    # on refetch; a structured figure absent from the body is not (Codex round 3).
+    stip = {"posted": "$2,000 - $2,000", "basis": "unknown", "floor_gate": False}
+    body = {"live": True, "location": "United States - Remote", "pay": [],
+            "jd": "Build agent evals. Perks: a $2,000 learning stipend."}
+    p = run(body, root=False, comp=stip, pay=["$2,000"])
+    check(p is not None and not p.get("pay") and not (p.get("comp") or {}).get("posted"),
+          f"a figure the body states and the reader rejects must be retracted: {p and (p.get('pay'), p.get('comp'))}")
+    p = run({**body, "jd": "Build agent evals."}, root=False,
+            comp={"posted": "$200,000 - $350,000", "basis": "unknown", "floor_gate": False},
+            pay=["$200,000 - $350,000"])
+    check(p is not None and p.get("pay") == ["$200,000 - $350,000"],
+          f"a structured figure absent from the body must survive a refetch: {p and p.get('pay')}")
+    # recomp_figures: the same rule offline.
+    check(recomp_figures({"jd_full": "Perks: a $2,000 learning stipend.", "pay": ["$2,000"]}) == []
+          and recomp_figures({"jd_full": "Build evals.", "pay": ["$200,000 - $350,000"]}) == ["$200,000 - $350,000"]
+          and recomp_figures({"jd_full": "Base salary $150,000 - $200,000.", "pay": []}) == ["$150,000 - $200,000"],
+          "recomp_figures must drop rejected body figures, keep structured ones, and read the body")
+    # Round 4: a figure is matched to the body by AMOUNT, whatever the spelling, and a
+    # legacy packet's recorded band is judged the same way.
+    check(recomp_figures({"jd_full": "Equity grant $150,000.00 - $200,000.00", "pay": ["$150,000 - $200,000"]}) == [],
+          "a rejected body band must be dropped even when the body spells it differently")
+    check(recomp_figures({"jd_full": "Base salary $150K - $200K",
+                          "comp": {"posted": "$150,000 - $200,000"}}) == ["$150,000 - $200,000"],
+          "a legacy packet's correct recorded band must survive a K-notation body")
+    # Round 4: --recomp must re-settle the gate. A budget figure once read as a sub-floor
+    # TOTAL band closed this packet automatically; once the reader rejects the figure, the
+    # closure has to lift rather than outlive its reason.
+    gated = dict(url="https://careers.example.com/job/2468101/x", title="A Role", company="Example",
+                 live=True, location="United States - Remote", location_verdict="pass", match_w_cv=None,
+                 jd_full="Our annual budget is $150,000 for tooling. Total compensation is discussed later.",
+                 pay=["$150,000"],
+                 comp={"posted": "$150,000 - $150,000", "low": 150000, "high": 150000, "achievable": 150000,
+                       "clears_floor": False, "clears_target": False, "basis": "total",
+                       "basis_why": "stated", "floor_gate": True, "note": ""})
+    with tempfile.TemporaryDirectory(prefix="evalprep-queue-") as d, _patched(d, False), pinned_floor():
+        settle_gate(gated)
+        closed_before = gated.get("auto_gate") and gated.get("status") == "SKIP"
+        f = os.path.join(d, "g.json")
+        with open(f, "w", encoding="utf-8") as fh:
+            json.dump(gated, fh, indent=1)
+        with contextlib.redirect_stdout(io.StringIO()):
+            recomp()
+        with open(f, encoding="utf-8") as fh:
+            after = json.load(fh)
+    check(closed_before and not after.get("auto_gate") and after.get("status") != "SKIP",
+          f"--recomp must lift a closure its corrected comp no longer supports: "
+          f"{closed_before} -> {after.get('status')} / {after.get('auto_gate')}")
+    # Round 5: one accepted endpoint keeps no rejected band; a K amount keeps its fraction;
+    # a K-written total band keeps its gate through --recomp.
+    check(recomp_figures({"jd_full": "Base salary $150,000. Equity grant $150,000 - $200,000.",
+                          "pay": ["$150,000 - $200,000"]}) == ["$150,000"],
+          "an accepted endpoint must not keep a rejected band alive")
+    check(recomp_figures({"jd_full": "Equity grant $150.5K - $200.5K", "pay": ["$150,500 - $200,500"]}) == [],
+          "a decimal-K body figure must be matched by its full amount")
+    check(recomp_figures({"jd_full": "Base salary $229,200.00 - $319,500.00",
+                          "pay": ["$229,200", "$319,500"]}) == ["$229,200", "$319,500"],
+          "lone figures an older reader split from one band must survive")
+    tot = comp_verdict(["$100,000 - $150,000"], "Total compensation: $100K - $150K", targets=FLOOR_FIX)
+    check(tot.get("basis") == "total" and tot.get("floor_gate") is True,
+          f"a K-written total band must read as total: {tot.get('basis')} / {tot.get('floor_gate')}")
+    # Counted, not written down: a literal "23" stayed 23 when cases were added (2026-10-29).
+    print(f"{bad} of {n} reresolve cases failed" if bad else f"all {n} reresolve cases pass")
     return bad
 
 
@@ -1388,12 +2280,28 @@ def _queue_cases_in(d):
         except Exception as e:  # noqa: BLE001, the crash IS the failure being tested
             bad += 1
             print(f"FAIL  {fn.__name__}() crashed on a queue holding non-packets: {e!r}")
-    # relocate() ran the fixed gate over the packet, and "UK, Remote" now fails, so the
-    # packet must be gone and its disposition written. This also proves relocate reached
-    # the packet rather than passing by skipping everything.
-    if os.path.exists(os.path.join(d, "a-packet.json")):
+    # relocate() ran the fixed gate over the packet, and "UK, Remote" now fails. The packet
+    # must STAY, rewritten to fail, so eval-write can record it as an unscored SKIP row; it
+    # used to be deleted, which lost the req from the tracker and from recovery by hand.
+    # Its disposition is still written. Reading the verdict back also proves relocate
+    # reached the packet rather than passing by skipping everything.
+    kept = os.path.join(d, "a-packet.json")
+    if not os.path.exists(kept):
+        bad += 1
+        print("FAIL  relocate() deleted a packet that failed the gate; it must keep it")
+    elif json.load(open(kept, encoding="utf-8")).get("location_verdict") != "fail":
         bad += 1
         print("FAIL  relocate() did not re-gate the one real packet in a queue of strays")
+    if not os.path.exists(os.path.join(d, "dispositions.json")):
+        bad += 1
+        print("FAIL  relocate() did not record the failed packet's disposition")
+    # ...and a kept packet is settled, never offered as judgement work.
+    buf = io.StringIO()
+    with _patched(d), contextlib.redirect_stdout(buf):
+        list_queue()
+    if not buf.getvalue().startswith("0 packet(s) awaiting judgement") or "1 settled" not in buf.getvalue():
+        bad += 1
+        print(f"FAIL  list_queue() offered a gate-failed packet as work: {buf.getvalue()[:120]!r}")
     print(f"{bad} queue case(s) failed" if bad else "all queue cases pass")
     return bad
 
@@ -1418,6 +2326,10 @@ def comp_cases():
             bad += 1
             print(f"FAIL  {msg}")
 
+    # Amazon's currency-after-the-range band becomes a band, not a point or nothing.
+    v = comp_verdict(["154,200.00 - 208,600.00 USD"], "", "", targets=NO_FLOOR)
+    check((v.get("low"), v.get("high")) == (154_200, 208_600),
+          f"a range with one trailing USD is a band: {v.get('low')}-{v.get('high')}")
     # ── The floor and target come from config/profile.yml, not from this file ──
     # They used to be literals in a System Layer script beside the
     # User Layer file that owns them. Asserting the REAL numbers alone would pass with a
@@ -1536,6 +2448,13 @@ def comp_cases():
     c = cv([SUB], f"The base salary range is {SUB}.")
     check(c["clears_floor"] is False and c["floor_gate"] is False,
           "a sub-floor BASE band must fail clears_floor and still not be a disposal")
+    # A foreign-currency band beside the US one is not US pay (AssemblyAI, 2026-10-18).
+    c = comp_verdict(["$160,000 - $210,000", "C$225,000 - C$285,000"], "Build agent tooling.",
+                      targets=FIX)
+    check(c["high"] == 210_000, f"a C$ band must not raise the US high, got {c['high']}")
+    # ...nor a C$ hourly rate read as a US annual figure that arms the floor gate (Codex).
+    c = comp_verdict([], "C$45 - C$60 per hour.", targets=FIX)
+    check(c["floor_gate"] is None and c["low"] is None, f"a C$ hourly rate is not US pay: {c['low']}")
     # No band at all settles nothing, and must not read as a gate.
     c = cv([], "No pay information anywhere in this posting.")
     check(c["floor_gate"] is None and c["clears_floor"] is None and c["basis"] is None,
@@ -1545,6 +2464,57 @@ def comp_cases():
     c = cv([], "Pay range for this role is $39.54 - $73.16 an hour.")
     check(c["basis"] == "total" and c["floor_gate"] is True,
           f"an hourly rate must still settle itself: {c['basis']} / {c['floor_gate']}")
+    # A STRUCTURED hourly band arrives in `pay`, not the body: req-resolve writes Lever's
+    # per-hour salaryRange as "$45.00 - $60.00 per hour". Annualised at 2080 hours, never
+    # read as a $45 yearly figure and never dropped as no band.
+    c = comp_verdict(["$45.00 - $60.00 per hour"], "The body states no pay at all.", targets=FIX)
+    check(c["low"] == 93_600 and c["high"] == 124_800 and c["basis"] == "total",
+          f"a structured hourly band must be annualised: {c['posted']} / {c['basis']}")
+    # One decimal is a rate too; the window cannot cross a full stop, so ".5" unread
+    # stranded the whole band (Codex, PR 14).
+    c = comp_verdict(["$60.5 - $70.5 per hour"], "The body states no pay at all.", targets=FIX)
+    check(c["low"] == 125_840 and c["high"] == 146_640,
+          f"a one-decimal hourly band must be annualised: {c['posted']}")
+    # The Ashby summary spelling has no cents ("$57 - $70 per hour"); same reading.
+    c = comp_verdict(["$57 - $70 per hour"], "The body states no pay at all.", targets=FIX)
+    check(c["low"] == 118_560 and c["high"] == 145_600,
+          f"a whole-dollar hourly band must be annualised too: {c['posted']}")
+    # Silence is what licenses reading an hourly rate as total. A posting that names a
+    # bonus or equity, or calls the rate base, has said otherwise, and reading it as total
+    # armed the floor gate and disposed of the req (Codex, 2026-10-15).
+    for jd in ("This is base pay. Eligible for annual bonus and equity.",
+               "Plus a quarterly bonus.", "This is the base rate for the role."):
+        c = comp_verdict(["$60.00 - $80.00 per hour"], jd, targets=FIX)
+        check(c["basis"] != "total" and c["floor_gate"] is False,
+              f"an hourly band beside {jd!r} must not settle as total: {c['basis']} / {c['floor_gate']}")
+    # The ATS summary is the posting's own words too. Ashby writes "Offers Equity" into
+    # the tier summary (OpenAI's hourly band carries it) while the body can be silent.
+    # The band here is under the floor so the gate CAN fire; pinned both ways, so the
+    # case can fail: without the summary the same band still settles as total.
+    # A K-notation summary that states TOTAL must gate its own band, which reached `pay`
+    # rewritten in full dollars.
+    for summ in ("$100K - $150K total compensation", "$100K \u2013 $150K total compensation",
+                 "$100K\u2014$150K total compensation"):
+        c = comp_verdict(["$100,000 - $150,000"], "Build agent tooling.", summ, targets=FIX)
+        check(c["basis"] == "total" and c["floor_gate"] is True,
+              f"a K-notation total summary must settle its band ({summ!r}): {c['basis']} / {c['floor_gate']}")
+    # ...and the other way round: a pay string spelt with an en dash, a body with a hyphen.
+    c = comp_verdict(["$100,000\u2013$150,000"], "Total compensation is $100,000 - $150,000.",
+                      targets=FIX)
+    check(c["basis"] == "total" and c["floor_gate"] is True,
+          f"an en-dash pay string must still find its band: {c['basis']} / {c['floor_gate']}")
+    OAI = ["$45.00 - $60.00 per hour"]
+    c = comp_verdict(OAI, "Build agent tooling.", "$45 \u2013 $60 per hour \u2022 Offers Equity",
+                      targets=FIX)
+    check(c["basis"] != "total" and c["floor_gate"] is False,
+          f"an ATS summary naming equity must stop the hourly total read: {c['basis']} / {c['floor_gate']}")
+    c = comp_verdict(OAI, "Build agent tooling.", targets=FIX)
+    check(c["basis"] == "total" and c["floor_gate"] is True,
+          f"the same silent hourly band must still settle as total: {c['basis']} / {c['floor_gate']}")
+    # ...and a structured yearly band is a band of unknown basis, never a gate on its own.
+    c = comp_verdict(["$250,000 - $350,000"], "The body states no pay at all.", targets=FIX)
+    check(c["low"] == 250_000 and c["basis"] == "unknown" and c["floor_gate"] is False,
+          f"a structured yearly band must read as posted, basis unknown: {c['posted']} / {c['basis']}")
 
     # ── hard_gate: only these three may throw a req away permanently ────────
     base_p = dict(live=True, location_verdict="pass", location_why="remote-US",
@@ -1595,6 +2565,16 @@ def comp_cases():
     check(nf["floor_gate"] is None and nf["clears_floor"] is None
           and hard_gate({**base_p, "comp": nf}) is None,
           f"with no floor a sub-anything TOTAL band must gate nothing: {nf}")
+    # A gated LIVE req is kept in the shape eval-write's gate-closed path writes; a closed
+    # posting is not kept at all.
+    g = gated_packet({**base_p, "location_verdict": "fail", "location_why": "Texas only"})
+    check(g and g.get("status") == "SKIP" and g.get("gate") == "Texas only" and "in_bounds" not in g,
+          f"a location-gated req must be kept as a SKIP packet: {g and {k: g.get(k) for k in ('status', 'gate')}}")
+    g = gated_packet({**base_p, "comp": sub_total})
+    check(g and g.get("in_bounds") is False and g.get("gate", "").startswith("below floor"),
+          f"a comp-gated req must be kept with in_bounds false: {g and g.get('in_bounds')}")
+    check(gated_packet({**base_p, "live": False}) is None,
+          "a closed posting must not be kept as a packet")
     print(f"{bad} comp case(s) failed" if bad else "all comp cases pass")
     return bad
 
@@ -1652,6 +2632,13 @@ def naming_cases():
                           ("https://unrecorded.wd5.myworkdayjobs.com/Ext/job/X/Y_R1000001", None)):
             got = company_from({"url": url})
             check(got == want, f"Workday employer for {url[8:60]}: {got!r}, want {want!r}")
+        # A company-hosted front end resolves with org = the matched portals.yml LABEL and
+        # front_end set; its employer is that entry's base, never the label or a guess.
+        for org, want in (("Blizzard Entertainment (notes)", "Blizzard Entertainment"),
+                          ("Unrecorded Studio (notes)", None)):
+            got = company_from({"url": "https://careers.example.com/global/en/job/R095439/x",
+                                "org": org, "front_end": True, "ats": "workday"})
+            check(got == want, f"front-end employer for {org!r}: {got!r}, want {want!r}")
     # The tracker's spelling wins only on a whole key or at a WORD boundary. Asserted
     # against a fake tracker so the cases cannot drift with the real one.
     with tempfile.TemporaryDirectory(prefix="evalprep-spell-") as _d:
@@ -1664,6 +2651,57 @@ def naming_cases():
                                 ("Andurilindustries", "Anduril Industries")):
                 got = tracker_spelling(spelt)
                 check(got == want, f"tracker spelling of {spelt!r}: {got!r}, want {want!r}")
+    # ── A slug is a HINT, never a name (issue #12) ───────────────────────────
+    # A title-cased board slug or host label used to be the last-resort company, and
+    # eval-write's required check took "Weedmaps77" as filled. Only portals.yml, the hand
+    # table, the ATS record's own name, or a tracker spelling that is not the mechanical
+    # capitalisation itself may name an employer. Fake portals and tracker, as above.
+    GH = "https://job-boards.greenhouse.io/"
+    fake_boards = [dict(label="Whatnot (LA)", base="Whatnot", boards={"whatnot"}, workday=None)]
+    with tempfile.TemporaryDirectory(prefix="evalprep-slug-") as _d:
+        os.makedirs(os.path.join(_d, "data"))
+        with open(os.path.join(_d, "data", "applications.md"), "w", encoding="utf-8") as fh:
+            for i, co in enumerate(("Heygen", "Anduril Industries", "Disney"), 1):
+                fh.write(f"| {i} | 2026-10-13 | {co} | Role | 3.0/5 | Evaluated | x | [r](r) | n |\n")
+        with mock.patch.object(rr, "portals_index", lambda: fake_boards), \
+                mock.patch.object(sys.modules[__name__], "ROOT", _d):
+            for r, want, why in (
+                    ({"url": GH + "weedmaps77/jobs/8623654667", "org": "weedmaps77"}, None,
+                     "a bare Greenhouse slug names no one"),
+                    ({"url": GH + "weedmaps77/jobs/8623654667", "org": "weedmaps77",
+                      "company": "Weedmaps"}, "Weedmaps",
+                     "the ATS record's own company_name is a name"),
+                    ({"url": "https://www.sonypicturesjobs.com/job/-/-/22978/105825311512"}, None,
+                     "a host label names no one"),
+                    ({"url": GH + "heygen/jobs/5893099557", "org": "heygen"}, None,
+                     "a tracker row that merely echoes the capitalised slug confirms nothing"),
+                    ({"url": GH + "heygen/jobs/5893099557", "org": "heygen", "company": "HeyGen"},
+                     "HeyGen", "a case-only tracker difference keeps the ATS spelling"),
+                    ({"url": GH + "andurilindustries/jobs/1", "org": "andurilindustries"},
+                     "Anduril Industries", "a tracker spelling a person wrote still vouches"),
+                    ({"url": GH + "disneystudios/jobs/1", "org": "disneystudios",
+                      "company": "Disney Studios"}, "Disney",
+                     "an ATS name takes the tracker's word form, as merge-tracker keys on it"),
+                    ({"url": "https://jobs.ashbyhq.com/whatnot/x", "org": "whatnot",
+                      "company": "Whatnot {HQ}"}, "Whatnot",
+                     "portals.yml still outranks the ATS name for a recorded board")):
+                got = company_from(r)
+                check(got == want, f"{why}: company_from gave {got!r}, want {want!r}")
+            check(company_hint({"url": GH + "weedmaps77/jobs/8623654667", "org": "weedmaps77"})
+                  == "weedmaps77", "the slug must survive as company_hint")
+            check(company_hint({"url": "https://www.sonypicturesjobs.com/job/-/-/22978/1"})
+                  == "sonypicturesjobs", "a host label must survive as company_hint")
+            # Through prep() with the resolver's real shape, both branches.
+            _gh = {"ats": "greenhouse", "live": True, "title": "Senior Software Engineer, AI",
+                   "location": "Remote", "pay": [], "jd": "x", "org": "weedmaps77"}
+            for extra, want in (({}, None), ({"company": "Weedmaps"}, "Weedmaps")):
+                with mock.patch.object(rr, "resolve", lambda *a, **k: {**_gh, **extra}), \
+                        mock.patch.object(sys.modules[__name__], "comp_verdict",
+                                          lambda *a, **k: {}):
+                    pk = prep(GH + "weedmaps77/jobs/8623654667")
+                check(pk.get("company") == want and pk.get("company_hint") == "weedmaps77",
+                      f"prep() company/hint with {extra or 'no ATS name'}: "
+                      f"{pk.get('company')!r} / {pk.get('company_hint')!r}")
     # Two EMPLOYERS posting the same title, which is the other half of the collision.
     x = name("https://job-boards.greenhouse.io/cresta/jobs/5055750430")
     y = name("https://job-boards.greenhouse.io/anthropic/jobs/4820222953")
@@ -1700,7 +2738,10 @@ def naming_cases():
                        "fe71c039c890"),
                       ("https://explore.jobs.netflix.net/careers/job/712200781859", "712200781859"),
                       ("https://crowdstrike.wd5.myworkdayjobs.com/x/job/USA/Lead_R26710",
-                       "r26710")):
+                       "r26710"),
+                      # the facet suffix some Workday tenants append is not part of the id
+                      ("https://nvidia.wd5.myworkdayjobs.com/en-US/X/job/US-CA-Santa-Clara/MLE_JR2846252-1",
+                       "jr2846252")):
         got = packet_id(url)
         check(got == want, f"packet id for {url[:56]}: got {got!r}, want {want!r}")
     print(f"{bad} naming case(s) failed" if bad else "all naming cases pass")
@@ -1728,22 +2769,43 @@ if __name__ == "__main__":
     # trailing \r on every argument, because shell word splitting does not treat \r as
     # whitespace. It then rode into the packet and the report's **URL:** line, where it
     # broke requisition-identity matching, more than once.
-    urls = [u.strip() for u in urls]
-    if not urls:
+    jobs = [(u.strip(), None, None) for u in urls]
+    if "--from-linkedin" in sys.argv:
+        jobs += from_linkedin(sys.argv[sys.argv.index("--from-linkedin") + 1])
+    if not jobs:
         print(__doc__); sys.exit(1)
     os.makedirs(OUT_DIR, exist_ok=True)
     disp = []
-    for u in urls:
-        p = prep(u)
-        # Hard gates decide on their own and need no judgement, so they are recorded
-        # as dispositions rather than turned into packets. Without this they come back
-        # in every future triage and get re-resolved and re-rejected forever.
+    for u, rec, employer in jobs:
+        p = prep(u, rec)
+        # The listing's own employer name fills a packet the ATS left unnamed; it never
+        # overrides a name the ATS stated. It goes through the tracker's spelling, so the
+        # company-scoped id guards see one employer, and it says where it came from: a
+        # recruiter's repost or a parent brand can name someone else (Codex, 2026-10-29),
+        # and eval-write's reviewer should be able to see that the name is LinkedIn's.
+        if employer:
+            p["linkedin_company"] = employer
+            if not p.get("company"):
+                p["company"] = tracker_spelling(employer)
+                p["company_source"] = "linkedin listing"
+        # Hard gates decide on their own and need no judgement, so they are recorded as
+        # dispositions, or they come back in every future triage and get re-resolved and
+        # re-rejected forever. A live one is ALSO kept as a gate-closed packet, so
+        # eval-write gives it an unscored SKIP row; see gated_packet().
         # Comp is a hard gate ONLY when a band is actually posted; an unposted band is
         # unknown, not low, and unknown still needs a human read.
         gated = hard_gate(p)
         if gated:
-            print(f"SKIP ({gated})  {(p['title'] or u)[:56]}")
-            disp.append({"url": u, "disposition": gated}); continue
+            disp.append({"url": u, "disposition": gated})
+            kept = gated_packet(p)
+            if kept is None:
+                print(f"SKIP ({gated})  {(p['title'] or u)[:56]}")
+                continue
+            name = packet_name(kept)
+            write_packet(os.path.join(OUT_DIR, name), kept)
+            print(f"GATED ({gated})  {(p['title'] or u)[:56]}\n"
+                  f"      -> batch/eval-queue/{name}  (eval-write records it as an unscored SKIP row)")
+            continue
         name = packet_name(p)
         write_packet(os.path.join(OUT_DIR, name), p)
         c = p["comp"]
@@ -1756,6 +2818,9 @@ if __name__ == "__main__":
                  if c["clears_floor"] is False else "unknown")
         dup = f"  [{len(p['possible_tracker_duplicates'])} possible dup]" if p["possible_tracker_duplicates"] else ""
         print(f"PREP  {p['title'][:50]:50s} {p['location_verdict']:7s} {money:24s} {gates}{dup}")
+        if not p.get("company"):
+            print(f"      company UNNAMED: nothing but a slug or host names the employer "
+                  f"(hint {p.get('company_hint')!r}); fill `company` or eval-write refuses it")
         print(f"      -> batch/eval-queue/{name}")
 
     if disp:

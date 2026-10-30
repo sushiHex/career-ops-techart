@@ -302,6 +302,38 @@ def strong_anti(anti, title):
     return False
 
 
+# The four judgement dimensions, as eval-write.mjs names them in DIMS.
+DIMS = ("match_w_cv", "north_star", "comp_score", "cultural_signals")
+
+
+def blank(v):
+    """eval-write.mjs's `blank`: null, absent or the empty string. One definition for both,
+    or a field the writer reads as cleared reads here as set (Codex, PR 14)."""
+    return v is None or v == ""
+
+
+def flags_set(v):
+    """eval-write's red-flag test: not blank and not numerically zero ("0" is zero)."""
+    if blank(v):
+        return False
+    try:
+        return float(v) != 0
+    except (TypeError, ValueError):
+        return True
+_REQUIRED = []
+
+
+def eval_write_required():
+    """eval-write's REQUIRED list, through eval-prep's copy, which test-all pins equal to it.
+
+    Loaded on first use, not at import: eval-prep pulls in the resolver, and most runs of
+    this file never reach a judged packet.
+    """
+    if not _REQUIRED:
+        _REQUIRED.extend(_load("eval_prep", "eval-prep.py").EVAL_WRITE_REQUIRED)
+    return _REQUIRED
+
+
 def blocker(p, ix):
     """Why this packet is not decided yet.
 
@@ -320,16 +352,32 @@ def blocker(p, ix):
     live = p.get("live")
     if live is False:
         return "closed"
+    lv = p.get("location_verdict")
+    if lv == "fail" or p.get("in_bounds") is False:
+        # Closure is read BEFORE `filled`: eval-write refuses a gate-closed packet whose
+        # dimensions are filled, so calling it `filled` sent it to a writer that will not
+        # take it (Codex, PR 14). Same test as eval-write's gateClosedProblem(): any
+        # dimension set, or a non-zero red-flag adjustment.
+        if any(not blank(p.get(k)) for k in DIMS) or flags_set(p.get("red_flags_adj")):
+            return "gate-conflict"
+        # An evaluator's explicit `in_bounds: false` closes the req on another hard
+        # constraint (mandatory relocation, a total under the floor), and eval-write
+        # records it unscored. It read as `ready` until Codex found it (2026-10-15).
+        return "location-fail" if lv == "fail" else "gate-closed"
     if p.get("match_w_cv") is not None:
         # ...but only when eval-write could actually act on it. eval-write.mjs gates on
         # `p.live !== true` and skips anything else, so a judged packet whose liveness was
         # never settled and which is told to "run eval-write" is being sent to a tool that
         # will refuse it. `live` is already known not to be False here, so the only other
         # case is null, and the actionable blocker there is the liveness, not the write.
-        return "filled" if live is True else "liveness-unknown"
-    lv = p.get("location_verdict")
-    if lv == "fail":
-        return "location-fail"
+        if live is not True:
+            return "liveness-unknown"
+        # ...and only when the judgement is COMPLETE. A scored packet missing a field
+        # eval-write requires, most often `arrangement` on a packet older than that rule,
+        # read as `filled` and was sent to a writer that refuses it (Codex, PR 14).
+        if any(blank(p.get(k)) for k in eval_write_required()):
+            return "judgement-incomplete"
+        return "filled"
     if lv == "unknown":
         return "resolve-location"
     lane = p.get("lane_balance", 0)
@@ -354,7 +402,9 @@ def blocker(p, ix):
 # (heading, states); the heading is what makes the finished/pending split
 # readable at a glance, which a flat count of ten states is not.
 GROUPS = [
-    ("needs judgement", ["ready"]),
+    # gate-conflict: closed by a gate AND scored. eval-write refuses it until someone
+    # either clears the dimensions or corrects the gate, which is a judgement.
+    ("needs judgement", ["ready", "gate-conflict", "judgement-incomplete"]),
     # `filled` is WORK, not a finished state, and it sat under "finished" until a review
     # caught it. Judgement fields being set with no report behind them means eval-write
     # still has to run, which is exactly why PRUNE_STATES below already excluded it. The
@@ -362,7 +412,7 @@ GROUPS = [
     # nothing was left to do while a judged packet waited to be written up.
     ("needs eval-write", ["filled"]),
     ("needs a lookup", ["liveness-unknown", "resolve-location", "no-band"]),
-    ("dispositionable", ["likely-tracked", "out-of-lane", "location-fail"]),
+    ("dispositionable", ["likely-tracked", "out-of-lane", "location-fail", "gate-closed"]),
     ("finished", ["reported", "closed"]),
 ]
 ORDER = [s for _, states in GROUPS for s in states]
@@ -559,7 +609,10 @@ def selftest():
           norm_url("https://x.com/j?id=AbC#Frag"), "https://x.com/j?id=AbC#Frag")
 
     check("judged + live true -> filled",
-          blocker({"match_w_cv": 3, "live": True}, ({}, {})), "filled")
+          blocker({"match_w_cv": 3, "north_star": 3, "comp_score": 3, "cultural_signals": 3,
+                   "company": "X", "status": "Evaluated", "body": "b", "gate": "none",
+                   "recommendation": "r", "arrangement": "remote", "live": True},
+                  ({}, {})), "filled")
     # A judged packet whose liveness was never settled is NOT ready for eval-write:
     # eval-write.mjs gates on `live !== true` and would refuse it, so telling the user to
     # run it points at the wrong remediation. The blocker is the liveness.
@@ -691,7 +744,7 @@ def selftest():
           req_key("https://www.github.careers/careers-home/jobs/1001/x_JR2000003", ""), None)
     # A host match is final: the generic rules never re-key a host-owned url.
     check("a host rule outranks the generic rules",
-          req_key("https://jobs.apple.com/en-us/details/200000002-0001/x_JR2000002", "Apple"),
+          req_key("https://jobs.apple.com/en-us/details/200000002-0001/x_JR2730341", "Apple"),
           "apple:200000002")
 
     # A written-up req is `reported` even when its judgement fields are filled.
@@ -737,6 +790,27 @@ def selftest():
     # The pre-existing states still answer, and they still outrank ready.
     check("location fail still reported as location-fail",
           blocker(_packet(url=PLAIN, location_verdict="fail"), ix), "location-fail")
+    check("an explicit in_bounds:false is gate-closed, never ready",
+          blocker(_packet(url=PLAIN, location_verdict="pass", in_bounds=False,
+                          gate="Mandatory relocation under employment contract"), ix), "gate-closed")
+    for over, want in ((dict(location_verdict="fail", match_w_cv="", north_star=""), "location-fail"),
+                       (dict(in_bounds=False, gate="relocation", comp_score="",
+                             red_flags_adj="0"), "gate-closed")):
+        check(f"a dimension cleared to an empty string is cleared, as eval-write reads it: {over}",
+              blocker(_packet(url=PLAIN, live=True, **over), ix), want)
+    for over in (dict(location_verdict="fail", match_w_cv=4.0),
+                 dict(in_bounds=False, gate="relocation", north_star=3.5),
+                 dict(in_bounds=False, gate="relocation", red_flags_adj=-0.3)):
+        check(f"a gate-closed packet with judgement set is a conflict, never filled: {over}",
+              blocker(_packet(url=PLAIN, live=True, **over), ix), "gate-conflict")
+    full = dict(company="Example", status="Evaluated", match_w_cv=4.0, north_star=4.0,
+                comp_score=4.0, cultural_signals=4.0, body="b", gate="none",
+                recommendation="r", arrangement="remote")
+    check("a complete live judgement is filled",
+          blocker(_packet(url=PLAIN, live=True, **full), ix), "filled")
+    check("a scored packet missing arrangement is incomplete, never filled",
+          blocker(_packet(url=PLAIN, live=True, **{**full, "arrangement": None}), ix),
+          "judgement-incomplete")
     check("no band still reported as no-band",
           blocker(_packet(url=PLAIN, comp={}), ix), "no-band")
 

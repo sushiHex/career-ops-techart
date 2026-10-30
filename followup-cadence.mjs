@@ -18,6 +18,7 @@ import yaml from 'js-yaml';
 
 import { isMain } from './cli-guard.mjs';
 import { normalizeStatus, trackerRows } from './tracker-rows.mjs';
+import { localDate } from './local-date.mjs';
 
 const CAREER_OPS = dirname(fileURLToPath(import.meta.url));
 const APPS_FILE = existsSync(join(CAREER_OPS, 'data/applications.md'))
@@ -90,8 +91,10 @@ const ACTIONABLE_STATUSES = ['applied', 'responded', 'interview'];
 export { normalizeStatus };
 
 // --- Date helpers ---
+// UTC midnight of the LOCAL date, the same representation parseDate() gives a
+// tracker date, so day counts roll over at local midnight rather than UTC midnight.
 function today() {
-  return new Date(new Date().toISOString().split('T')[0]);
+  return new Date(localDate());
 }
 
 export function parseDate(dateStr) {
@@ -298,7 +301,8 @@ function analyze() {
 
   return {
     metadata: {
-      analysisDate: now.toISOString().split('T')[0],
+      // `now` is today(): UTC midnight OF the local date, so read it back as UTC.
+      analysisDate: now.toISOString().slice(0, 10),
       totalTracked: apps.length,
       actionable: entries.length,
       overdue: entries.filter(e => e.urgency === 'overdue').length,

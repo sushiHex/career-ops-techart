@@ -104,6 +104,33 @@ def board_lane(role):
     return fb.get("name", "Other"), fb.get("cv", "")
 
 
+# USD the scene description, never USD the currency. A body carries its pay band, and
+# some employers write every one as "184,000 USD - 287,500 USD", so a bare `\bUSD\b` body
+# term handed its bonus to every such posting on its own salary line: package-layout and
+# EDA reqs ranked +5 to +8 in a full-board sweep once bodies were read whole. One
+# lookaround pattern could not cover the spellings ("Salary (USD): 150,000", "150,000
+# (USD)", "in USD" kept scoring, and "USD payloads" did not), so the currency uses are cut
+# out of the body first and the scene term stays a plain word match. The guard applies to
+# the body term spelled exactly BODY_USD, whichever vocabulary supplies it.
+BODY_USD = r"\bOpenUSD|\bUSD\b"
+# A money-sized figure: a thousands group or four-plus digits. "USD 24.05" is a release and
+# "3 USD layers" a count, and a bare digit test stripped both as currency.
+_MONEY = r"(?:(?:\d{1,3}(?:,\d{3})+|\d{4,})(?:\.\d+)?|\d{2,4}(?:\.\d+)?\s*[Kk]\b)"   # incl. 150K
+_PAY_WORD = r"(?:salary|pay\b|base\b|compensation|range\b|rate\b|per\s+(?:year|annum|hour|month))"
+_CURRENCY_USD = re.compile(
+    rf"{_MONEY}\s*\(?\s*USD\b\s*\)?"                       # 150,000 USD / 150,000 (USD)
+    rf"|\(?\bUSD\b\)?\s*[:$]?\s*\$?\s*{_MONEY}"             # USD 150,000 / USD: 150,000
+    r"|\b(?:salary|salaries|pay|paid|compensation|figures|amounts?|prices?|wages?|currency)\b"
+    r"[^.\n]{0,30}?\(?\bUSD\b\)?"                           # Salary (USD) / figures are in USD
+    rf"|\(?\bUSD\b\)?\s*:?\s*{_PAY_WORD}"                   # USD salary range / USD per year
+    r"|\bUSD[- ]denominated\b", re.I)                       # USD-denominated pay
+
+
+def money_free(body):
+    """`body` with every currency use of USD removed, so only USD the format can score."""
+    return _CURRENCY_USD.sub(" ", body or "")
+
+
 # A selftest never reads the user's vocabulary, not even at import: a malformed config
 # must not be able to break the suite that checks the rules.
 import sys as _sys  # noqa: E402
@@ -127,7 +154,8 @@ def lane_score(title, body=""):
          + sum(w for p, w in LANE_DOWN if re.search(p, t, re.I)))
     if body:
         b = str(body)
-        s += min(8, sum(w for p, w in BODY_UP if re.search(p, b, re.I)))
+        s += min(8, sum(w for p, w in BODY_UP
+                        if re.search(p, money_free(b) if p == BODY_USD else b, re.I)))
         s += sum(w for p, w in BODY_DOWN if re.search(p, b, re.I))
     return s
 
@@ -262,9 +290,11 @@ def _selftest():
         ("no shared pattern is also written out literally in this file",
          not [p for f in _FAMILIES for p in VOCAB[f]["patterns"] if p in _SRC]),
         # The same for this scorer's own lane terms: they are the preset's, and a copy
-        # written back here would be a second source that drifts.
+        # written back here would be a second source that drifts. BODY_USD is the one
+        # exception: it is the key the currency guard recognises, not a scoring copy.
         ("no lane term of the preset is written out literally in this file",
-         not [p for p, _ in LANE_UP + BODY_UP + BODY_DOWN if len(p) > 8 and p in _SRC]),
+         not [p for p, _ in LANE_UP + BODY_UP + BODY_DOWN
+              if len(p) > 8 and p != BODY_USD and p in _SRC]),
         ("every family in the preset is weighted here",
          set(SHARED_WEIGHTS) == set(_FAMILIES)),
         # And the weights are READ, never restated. A number written back into this file
@@ -280,6 +310,25 @@ def _selftest():
          lane_score("AI Tools Engineer") == lane_score("AI Tooling Engineer")),
         ("OpenUSD earns the USD bonus, as the bare spelling always did",
          lane_score("OpenUSD Pipeline Engineer") == lane_score("USD Pipeline Engineer")),
+        # A pay band in the body is money, not scene description; USD the format still counts.
+        ("the preset's body USD term is the one the currency guard covers",
+         any(p == BODY_USD for p, _ in BODY_UP)),
+        ("a body's USD pay band earns no OpenUSD bonus",
+         all(lane_score("Package Layout Engineer", b) == lane_score("Package Layout Engineer", "")
+             for b in ("The base salary range is 184,000 USD - 287,500 USD.",
+                       "USD Salary Range: $160,000 - $210,000", "Pay: USD $150,000 to $200,000",
+                       "paid in USD per year", "Salary (USD): 150,000 - 200,000",
+                       "150,000 (USD)", "All compensation is in USD.", "USD: 150,000",
+                       "150,000  USD", "USD 150,000", "USD-denominated pay",
+                       "Compensation: 150000 USD", "Salary: USD150,000",
+                       "All figures are in USD.", "USD 150K - 200K", "150K - 200K USD"))),
+        ("USD the scene format still earns it in the body",
+         all(lane_score("Pipeline Engineer", b) > lane_score("Pipeline Engineer", "")
+             for b in ("Build USD composition tools.", "Experience with OpenUSD and Hydra.",
+                       "You know USD, Maya and Houdini.", "Implement USD payloads.",
+                       "USD / Hydra integration.", "Convert assets to USD stages.",
+                       "Author base layers in USD and Hydra.", "USD per-prim attributes.",
+                       "Experience with USD 24.05.", "Build 3 USD layers."))),
     ]
     # A lane floor only means something when the vocabulary can score above zero. The
     # general preset cannot, and a floor of 2 there silently emptied every sweep.

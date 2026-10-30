@@ -362,11 +362,16 @@
       "case-insensitively. They run on NORMALISED text, where every state the text names has",
       "been replaced by a token like <TX>, so a code can never be confused with a word ('OR',",
       "'IN', 'LA') by the time a pattern reads it. Placeholders: {ST} a state token, {LIST} a",
-      "list of tokens, {US} a country marker, {R} a remote word. presets/README.md explains",
+      "list of tokens, {US} a country marker, {R} a remote word, {AMER} an Americas region",
+      "label (americas_region; folds expand placeholders too). presets/README.md explains",
       "the rules these patterns implement. The tokeniser's own mechanics (what a code token,",
       "a run of codes or a signal looks like) are code, written the same way in both engines."
     ],
     "folds": [
+      [
+        "(^|[|;\\u00b7\\u2022\\n]\\s*){AMER}\\s*[-\\u2013\\u2014,:]\\s*(?={US})",
+        "$1"
+      ],
       [
         "\\bwashington,?\\s*(?:d\\.?\\s*c\\.?|district of columbia)(?![a-z])",
         "District of Columbia"
@@ -395,6 +400,7 @@
       "NY": "New York City, NY"
     },
     "us": "\\b(?:u\\.s\\.a\\.?|u\\.s\\.|usa|us|united states(?: of america)?)(?![a-z0-9])",
+    "americas_region": "\\b(?:americas|amer|north america|noram|namer|na)(?![a-z0-9])",
     "list_sep": "\\s*(?:,\\s*(?:and|or)\\s+|,|\\s+and\\s+|\\s+or\\s+|&|/)\\s*",
     "city_suffix": "\\s+(?:city|beach|township|twp|springs|heights)\\b",
     "code_before": "(?:^|[,(:/|;&–—-]|\\b(?:or|and|excluding|except|excl\\.?|than|but|(?:reside|residing|live|living|located|based|remote|eligible|available|hiring|anywhere|work|working)\\s+(?:in|within)|residents?\\s+of|state\\s+of))\\s*$",
@@ -461,6 +467,7 @@
       "$1$2 / "
     ],
     "street_before": "\\b\\d{1,6}\\s+(?:[nsew]\\.?|north|south|east|west)\\s+$",
+    "hierarchy_gap": "^\\s*[-\\u2013\\u2014:]\\s*$",
     "place_list": "^\\s*[A-Z][A-Za-z.'-]*(?:\\s+[A-Z][A-Za-z.'-]*)*(?:\\s*,\\s*[A-Z][A-Za-z.'-]*(?:\\s+[A-Z][A-Za-z.'-]*)*)+\\s*$"
   },
   "blocked_codes": [

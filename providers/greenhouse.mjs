@@ -13,6 +13,8 @@ const ALLOWED_GREENHOUSE_HOSTS = new Set([
   'job-boards.eu.greenhouse.io',
 ]);
 
+const GREENHOUSE_TIMEOUT_MS = 30_000;
+
 /** @param {string} url */
 function assertGreenhouseUrl(url) {
   let parsed;
@@ -277,7 +279,9 @@ export default {
     assertGreenhouseUrl(apiUrl);
     // redirect:'error' prevents SSRF via server-side redirects; combined with
     // assertGreenhouseUrl above it guarantees the final hostname stays in the allowlist.
-    const json = /** @type {any} */ (await ctx.fetchJson(apiUrl, { redirect: 'error' }));
+    // The 10s default is too tight for the largest boards under scan concurrency: Anduril's
+    // 2000+ job list (2.6MB) aborted on 2026-10-20 and loaded in 0.2s alone a minute later.
+    const json = /** @type {any} */ (await ctx.fetchJson(apiUrl, { redirect: 'error', timeoutMs: GREENHOUSE_TIMEOUT_MS }));
     return parseGreenhouseJobs(json, entry.name);
   },
 };

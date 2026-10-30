@@ -48,7 +48,8 @@ _LIST = _ST + "(?:" + G["list_sep"] + _ST + ")*"
 
 def _expand(p):
     return (p.replace("{LIST}", _LIST).replace("{ST}", _ST)
-             .replace("{US}", G["us"]).replace("{R}", G["remote"]))
+             .replace("{US}", G["us"]).replace("{R}", G["remote"])
+             .replace("{AMER}", G["americas_region"]))
 
 
 # Python's \d, \w, \b and case folding are Unicode-wide where JavaScript's (no `u` flag)
@@ -69,7 +70,7 @@ RX = {k: _compile(k) for k in (
     "time_zone_us_paren", "placeholder", "nationwide", "exclusion_lead", "exclusion_trail", "weak_context",
     "scope_shapes", "metro_scope", "chunk_split", "sentence_break", "place_split", "place_donor",
     "undetermined", "travel_phrase", "preference_after", "context_before", "negation_before",
-    "street_before", "place_list")}
+    "street_before", "place_list", "americas_region", "hierarchy_gap")}
 
 
 def _repl(r):
@@ -77,7 +78,7 @@ def _repl(r):
     return re.sub(r"\$(\d)", r"\\\1", r)
 
 
-FOLDS = [(re.compile(p, re.I | _A), _repl(r)) for p, r in G["folds"]]
+FOLDS = [(re.compile(_expand(p), re.I | _A), _repl(r)) for p, r in G["folds"]]
 PLACE_BREAK = (re.compile(G["place_break"][0], re.I | _A), _repl(G["place_break"][1]))
 # Every whitespace character that is not an ASCII one, made a plain space before either
 # engine reads the text: the two disagree about which of these \s matches (JavaScript's
@@ -382,6 +383,16 @@ class Policy:
                 outs = [m.span() for m in self.far_re.finditer(probe)]
                 if all(any(a < d and c < b for c, d in outs) for a, b in hits):
                     continue
+                # So does a far place JOINED to it as a hierarchy: EA writes "Los Angeles -
+                # Chatsworth", a metro label over a city outside the ceiling, and the metro
+                # word used to pass it. Joined means nothing but a dash or colon between the
+                # two (hierarchy_gap). Anything wider is not a hierarchy: "Santa Monica, CA
+                # (reporting to San Francisco)" names a manager's city, and the first version
+                # of this rule failed it (Codex, 2026-10-15).
+                if any(not any(a < d and c < b for a, b in hits)
+                       and any(RX["hierarchy_gap"].match(probe[min(b, d):max(a, c)]) for a, b in hits)
+                       for c, d in outs):
+                    continue
                 # So does a foreign country or region BESIDE it when no US state is named:
                 # "Dublin, Ireland" is not the Dublin in an Ohio commute list. The match
                 # itself may be a foreign name too ("Dublin" alone), which settles nothing,
@@ -428,7 +439,11 @@ class Policy:
         foreign = abroad and not named and not us
         if remote and not home_out and not foreign and RX["nationwide"].search(n):
             return "pass", "remote, open nationwide", "remote"
-        if remote and whole:
+        # An Americas label qualifies every remote alternative beside it: "AMER / Remote"
+        # split into a bare "Remote" that passed as remote-US (Codex, 2026-10-15). With no US
+        # marker or state named, the option is the region question below, not alternatives.
+        region_only = bool(RX["americas_region"].search(n)) and not us and not named
+        if remote and whole and not region_only:
             alts = _ALT_SPLIT.split(n)
             if len(alts) > 1:
                 for a in alts:
@@ -484,6 +499,12 @@ class Policy:
                 return "pass", "remote, naming only " + ", ".join(sorted(mentioned)), "remote"
             if us or _bare_remote(n):
                 return "pass", "remote-US", "remote"
+            # An Americas label with no US marker ("AMER - Remote") names a region wider
+            # than the US, so it is a question of its own kind: an ATS isRemote flag
+            # settles an UNRECOGNISED region and must not settle this one.
+            if RX["americas_region"].search(n):
+                return "unknown", ("remote within the Americas, which is wider than the US; "
+                                   "check which countries the offer covers"), "region"
             return "unknown", "remote, but the region is not recognised", "unrecognised"
         if home_out:
             return "fail", f"remote everywhere except {self.home_display}", "excluded"
@@ -542,6 +563,11 @@ class Policy:
             for i in bare:
                 results[i] = ("unknown", "a bare remote entry next to a non-US place; confirm which "
                               "country the remote option covers before judging", "ambiguous")
+        # Among unknowns a REGION question wins. Taking the first unknown made the answer
+        # depend on option order: with the ATS isRemote flag set, "Remote, Flexible |
+        # AMER - Remote" passed (eval-prep upgrades an `unrecognised` kind) while the reverse
+        # order stayed unknown (Codex, 2026-10-15). The region evidence must survive.
+        results.sort(key=lambda r: r[2] != "region")
         for want in ("pass", "unknown", "fail"):
             for r in results:
                 if r[0] == want:

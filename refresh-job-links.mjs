@@ -30,6 +30,7 @@
 import { readFileSync, writeFileSync, existsSync, readdirSync, mkdirSync } from 'fs';
 import { join, dirname } from 'path';
 import { guardArgs } from './cli-guard.mjs';
+import { localDate } from './local-date.mjs';
 
 const args = guardArgs({
   name: 'refresh-job-links.mjs',
@@ -147,7 +148,7 @@ for (const t of due) {
   } else if (!t.alreadyClosed) {
     closed.push(t);
     if (!DRY && /^\*\*URL:\*\*.*$/m.test(text)) {
-      const stamp = new Date(now).toISOString().slice(0, 10);
+      const stamp = localDate(new Date(now));
       writeFileSync(t.file, text.replace(/^(\*\*URL:\*\*.*)$/m,
         `$1\n**Posting status:** CLOSED as of ${stamp} — JR${t.jr} is no longer in the NVIDIA search index, so the URL above does not resolve. Verified per-JR. NOTE: a closed posting does not mean a closed application; check Workday Candidate Home before discarding.`), 'utf-8');
     }

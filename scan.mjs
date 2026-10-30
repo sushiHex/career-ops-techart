@@ -40,6 +40,8 @@ import { guardArgs, isMain } from './cli-guard.mjs';
 import { makeHttpCtx } from './providers/_http.mjs';
 import { buildSignals, decideLocations, effectiveLocationFilter } from './location-core.mjs';
 import { ROLE_ID_TOKEN_SRC } from './req-id-core.mjs';
+import { extractJobId, rowIdReader, idSetsProvablyDistinct, isGlobalId } from './role-matcher.mjs';
+import { localDate } from './local-date.mjs';
 
 const parseYaml = yaml.load;
 
@@ -143,7 +145,9 @@ function compileTitleKeyword(keyword) {
   const isStem = keyword.endsWith('*');
   const body = (isStem ? keyword.slice(0, -1) : keyword).toLowerCase().trim();
   if (!body) return () => false;
-  const escaped = body.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/\s+/g, '\\s+');
+  // A space in a keyword also matches a hyphen: "Forward Deployed" must find
+  // "Forward-Deployed", and "Real Time" "Real-Time" (2026-10-29, Astra review).
+  const escaped = body.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/[\s-]+/g, '[\\s-]+');
   const tail = isStem ? '' : '(?=$|[^a-z0-9])';
   // Built once per keyword. Building it per call cost about 2s a scan: every one of
   // ~22,000 titles against ~130 keywords, and twice over for each rejected title.
@@ -169,10 +173,22 @@ export function buildTitleFilter(titleFilter) {
 export function buildTitleExplainer(titleFilter) {
   const positive = (titleFilter?.positive || []).map(k => [k, compileTitleKeyword(k)]);
   const negative = (titleFilter?.negative || []).map(k => [k, compileTitleKeyword(k)]);
+  // `override`: titles a negative must not veto. "Sales" is a sound negative and it
+  // also vetoed "Pre-Sales Solutions Architect", which a profile may want in scope. An override only lifts the veto; the title still needs a positive.
+  const override = (titleFilter?.override || []).map(k => [k, compileTitleKeyword(k)]);
+  // ...and only the negatives named in `override_lifts`. Lifting every negative let the
+  // "Applied AI" override pass "Applied AI Intern" and "Junior Solutions Engineer":
+  // early-career, recruiting and account executive vetoes are never lifted.
+  const liftable = new Set((titleFilter?.override_lifts || []).map(k => String(k).toLowerCase()));
   return (title) => {
     const text = String(title ?? '');
-    const neg = negative.find(([, match]) => match(text));
-    if (neg) return { pass: false, reason: `negative "${neg[0]}"` };
+    const negs = negative.filter(([, match]) => match(text));
+    const neg = negs.find(([k]) => !liftable.has(String(k).toLowerCase())) || negs[0];
+    const lifted = negs.length > 0 && negs.every(([k]) => liftable.has(String(k).toLowerCase()))
+      && override.some(([, match]) => match(text));
+    if (neg && !lifted) {
+      return { pass: false, reason: `negative "${neg[0]}"` };
+    }
     if (positive.length === 0) return { pass: true, reason: 'no positive list configured' };
     const pos = positive.find(([, match]) => match(text));
     if (pos) return { pass: true, reason: `positive "${pos[0]}"` };
@@ -438,7 +454,7 @@ function daysBetweenIsoDates(start, end) {
   return Math.floor((endDate - startDate) / (1000 * 60 * 60 * 24));
 }
 
-export function shouldDedupScanHistoryRow({ firstSeen, status = 'added' }, { recheckAfterDays = null, today = new Date().toISOString().slice(0, 10) } = {}) {
+export function shouldDedupScanHistoryRow({ firstSeen, status = 'added' }, { recheckAfterDays = null, today = localDate() } = {}) {
   // Only an `added` row expires; a skip (skipped_invalid_url, skipped_blocked_host) is permanent.
   if (status !== 'added' || recheckAfterDays == null) return true;
   const ageDays = daysBetweenIsoDates(firstSeen, today);
@@ -498,12 +514,16 @@ export function loadSeenUrls(policy = {}) {
  * 2026-08-11 scan.
  */
 export function canonicalCompany(value) {
+  // Brackets go BEFORE the dash split: a dash inside a parenthetical, "Zillow (Agentic AI
+  // org, Zillow AI Copilot)", used to cut the string mid-paren, and the descriptive words
+  // survived as part of the name (24 of 243 portals entries, 2026-10-23).
   return String(value ?? '')
     .toLowerCase()
-    .split(/\s+[—–]\s+/)[0]          // drop the descriptive tail
     .replace(/\([^)]*\)/g, ' ')       // drop parentheticals
     .replace(/\[[^\]]*\]/g, ' ')      // drop [REMOTE-US]-style tags
+    .split(/\s+[\u2014\u2013/]\s+/)[0]          // drop the descriptive tail, or a "Future / future.co" alias
     .replace(/[^a-z0-9]+/g, ' ')
+    .replace(/\s(?:inc|llc|ltd|corp|corporation)$/, '') // "ThirdLaw Inc", "Appian Corporation"
     .trim();
 }
 
@@ -547,18 +567,80 @@ export function canonicalRole(value) {
     .trim();
 }
 
-function loadSeenCompanyRoles() {
+/**
+ * Tracker rows keyed by company plus canonical title, each key holding EVERY row that
+ * shares it along with that row's requisition ids.
+ *
+ * The title key strips ids, so two distinct reqs with one title collapse onto it. That
+ * collapse used to be accepted on the grounds that each match is logged to
+ * data/already-evaluated.tsv, and the log is a file nobody reads: a live in-lane posting
+ * was dropped every scan as a tracked row carrying the same title and a DIFFERENT,
+ * already-closed requisition id. A title match now stands
+ * unless the ids PROVE a different requisition (role-matcher idSetsProvablyDistinct: same
+ * numbering system, different value). See titleDupOf().
+ */
+export function loadSeenCompanyRoles(text = existsSync(APPLICATIONS_PATH) ? readFileSync(APPLICATIONS_PATH, 'utf-8') : '') {
   const seen = new Map();
-  if (existsSync(APPLICATIONS_PATH)) {
-    const text = readFileSync(APPLICATIONS_PATH, 'utf-8');
-    for (const { num, company, role, score, status } of trackerRows(text.split('\n'))) {
-      if (!company || !role) continue;
-      const key = `${canonicalCompany(company)}::${canonicalRole(role)}`;
-      if (!seen.has(key)) seen.set(key, { num: String(num), company, role, score, status });
+  const idsOf = rowIdReader(path.dirname(APPLICATIONS_PATH));
+  for (const row of trackerRows(text.split('\n'))) {
+    const { num, company, role, score, status } = row;
+    if (!company || !role) continue;
+    const key = `${canonicalCompany(company)}::${canonicalRole(role)}`;
+    const entry = { num: String(num), company, role, score, status, ids: idsOf(row) };
+    if (seen.has(key)) seen.get(key).push(entry);
+    else seen.set(key, [entry]);
+  }
+  return seen;
+}
+
+/**
+ * The tracked row a posting duplicates by TITLE, or null.
+ *
+ * The title decides unless the ids prove the posting is a different requisition: both
+ * sides read the SAME numbering system and disagree (CrowdStrike wd:r21535 against a row
+ * holding wd:r37811). Ids from different systems prove nothing, since one Riot posting
+ * reads gh:N with its ?gh_jid= query and id:N without it; treating that as a conflict
+ * resurfaced tracked rows as new (Codex review, 2026-10-25).
+ */
+export function titleDupOf(seenRoles, key, jobId) {
+  const mine = new Set(jobId ? [jobId] : []);
+  for (const entry of seenRoles.get(key) || []) {
+    if (!idSetsProvablyDistinct(entry.ids || new Set(), mine)) return entry;
+  }
+  return null;
+}
+
+/**
+ * Tracker rows keyed by COMPANY plus requisition id (role-matcher's row identity set).
+ *
+ * The URL and title keys both miss a posting the employer re-titled on a URL spelled
+ * differently: a req tracked under ".../en-US/..." came back with no locale and
+ * "Senior" prepended to its title, and was listed as new. The id is the posting's identity
+ * wherever both sides have one. Scoped by company because Workday counters are tenant-local.
+ */
+export function loadSeenReqIds(text = existsSync(APPLICATIONS_PATH) ? readFileSync(APPLICATIONS_PATH, 'utf-8') : '') {
+  const seen = new Map();
+  const idsOf = rowIdReader(path.dirname(APPLICATIONS_PATH));
+  for (const row of trackerRows(text.split('\n'))) {
+    if (!row.company) continue;
+    for (const id of idsOf(row)) {
+      const key = idKeyOf(row.company, id);
+      if (!seen.has(key)) seen.set(key, { num: String(row.num), company: row.company, role: row.role, score: row.score, status: row.status });
     }
   }
   return seen;
 }
+
+/** The `loadSeenReqIds` key for a scanned posting, or null when its URL carries no id. */
+export function reqIdKey(company, url) {
+  const id = extractJobId(url);
+  return id ? idKeyOf(company, id) : null;
+}
+
+/** An id that names one posting whatever the employer (role-matcher isGlobalId) is keyed
+ *  without the company, which a decorated portals.yml label would otherwise defeat
+ *  ("Google / Alphabet (DeepMind, ...)" is not the tracker's "Google"). */
+const idKeyOf = (company, id) => isGlobalId(id) ? `*::${id}` : `${canonicalCompany(company)}::${id}`;
 
 // ── Pipeline writer ─────────────────────────────────────────────────
 
@@ -959,9 +1041,10 @@ async function main() {
   const seenUrlState = loadSeenUrls(historyPolicy);
   const seenUrls = seenUrlState.seen;
   const seenCompanyRoles = loadSeenCompanyRoles();
+  const seenReqIds = loadSeenReqIds();
 
   // 5. Fetch from each target
-  const date = new Date().toISOString().slice(0, 10);
+  const date = localDate();
   let totalFound = 0;
   let totalFilteredTitle = 0;
   let totalFilteredLocation = 0;
@@ -1006,6 +1089,11 @@ async function main() {
       }
       if (!Array.isArray(jobs)) {
         throw new Error(`${provider.id}: fetch() did not return an array`);
+      }
+      // A provider that read only part of a board says so on the array (`truncated`);
+      // its jobs are still used, and the board is listed under Errors as incomplete.
+      if (jobs.truncated) {
+        errors.push({ company: company.name, error: `incomplete board: ${jobs.truncated}` });
       }
       totalFound += jobs.length;
 
@@ -1060,7 +1148,9 @@ async function main() {
           continue;
         }
         const key = `${canonicalCompany(job.company)}::${canonicalRole(job.title)}`;
-        const prior = seenCompanyRoles.get(key);
+        const idKey = reqIdKey(job.company, job.url);
+        const prior = (idKey && seenReqIds.get(idKey))
+          || titleDupOf(seenCompanyRoles, key, extractJobId(job.url));
         if (prior) {
           totalDupes++;
           alreadyEvaluated.push({
@@ -1072,7 +1162,12 @@ async function main() {
         }
         // Mark as seen to avoid intra-scan dupes
         seenUrls.add(job.url);
-        seenCompanyRoles.set(key, { num: '(this scan)', company: job.company, role: job.title, score: '', status: '' });
+        const thisId = extractJobId(job.url);
+        const mine = { num: '(this scan)', company: job.company, role: job.title, score: '', status: '',
+          ids: new Set(thisId ? [thisId] : []) };
+        if (seenCompanyRoles.has(key)) seenCompanyRoles.get(key).push(mine);
+        else seenCompanyRoles.set(key, [mine]);
+        if (idKey) seenReqIds.set(idKey, { num: '(this scan)', company: job.company, role: job.title, score: '', status: '' });
         // Tag with the company's careers domain so verify can offer a 404/410
         // rediscovery fallback. A null domain (no careers_url) marks the offer
         // as broad-discovery — ineligible for the fallback, per the issue scope.
@@ -1164,7 +1259,10 @@ async function main() {
     console.log(`  ...of which vetoed:  ${titleVetoes.length} by a negative keyword (${top})`);
     if (!dryRun) {
       try {
-        writeFileSync('data/title-vetoes.tsv', [
+        // A --company scan writes its own file: it used to overwrite the full scan's
+        // ledger, and a 53-row Netflix run replaced 5,996 vetoes the same evening
+        // (2026-10-29) just as they were about to be audited.
+        writeFileSync(filterCompany ? 'data/title-vetoes.partial.tsv' : 'data/title-vetoes.tsv', [
           ['company', 'title', 'reason', 'url'].join('\t'),
           ...titleVetoes.map(v => [v.company, v.title, v.reason, v.url]
             .map(x => String(x ?? '').replace(/[\t\r\n]+/g, ' ').trim()).join('\t')),
@@ -1182,7 +1280,8 @@ async function main() {
   if (locationRejects.length > 0 && !dryRun) {
     // Persisted so the reject set can be replayed and audited. Overwritten each
     // run: it describes THIS scan's decisions, not an accumulating history.
-    const rejectPath = 'data/location-rejects.tsv';
+    // A --company scan writes its own file rather than replacing the full scan's ledger.
+    const rejectPath = filterCompany ? 'data/location-rejects.partial.tsv' : 'data/location-rejects.tsv';
     try {
       writeFileSync(rejectPath, [
         ['url', 'company', 'title', 'location', 'reason'].join('\t'),

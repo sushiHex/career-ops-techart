@@ -24,7 +24,7 @@ process.env.CAREER_OPS_CONFIG_DIR = join(TMP, 'noconfig');
 mkdirSync(process.env.CAREER_OPS_CONFIG_DIR);
 const M = await import(new URL('./score-model.mjs', import.meta.url).href);
 const { compBand, arrangement, locationText, MODEL,
-        normaliseArrangement, persistedArrangement } = M;
+        normaliseArrangement, persistedArrangement, reportModelText } = M;
 
 // Every floor-dependent call runs against FX, a PINNED fixture model. The real floor
 // comes from config/profile.yml, so a test reading it would pass or fail depending on
@@ -312,6 +312,46 @@ t('pref: damping an unlisted company is a no-op, never a penalty', () => {
   // never be LABELLED as damped — that would read as a penalty that never happened.
   if (r.damped) return 'an unlisted company was flagged as damped';
   return close(r.factor, 1);
+});
+
+// 2026-10-29: apply-model read the whole report and score-audit read the comp fields, so
+// a pay range in an evaluator's prose armed a gate in one pass and not the other.
+t('replay: an eval-write report is replayed on its comp fields, never its prose', () => {
+  const prose = 'Total comp most plausibly lands in the $120-180K range.\n';
+  const evalWrite = prose + 'location_final: "Los Angeles -- passes"\ncomp_posted: "not published"\ncomp_basis: "unknown"\n';
+  const legacy = prose + 'location_final: "Los Angeles, onsite"\n';
+  const txt = reportModelText(evalWrite);
+  if (txt === null) return 'an eval-write report (location -- why) must get a replay text';
+  if (/120/.test(txt)) return `prose leaked into the replay text: ${txt}`;
+  const gated = applyModel(3.2, { text: evalWrite, company: 'X', role: 'Y', prefs: PREFS }).final;
+  const replay = applyModel(3.2, { text: txt, company: 'X', role: 'Y', prefs: PREFS }).final;
+  if (!(replay > gated)) return `the prose range must not gate the replay (${replay} vs whole-text ${gated})`;
+  if (reportModelText(legacy) !== null) return 'a legacy report keeps its whole-text reading (null)';
+  const total = reportModelText('location_final: "LA -- ok"\ncomp_total_est: 150000\n');
+  return /comp_total_est: "150000"/.test(total) || `a stated comp_total_est must survive: ${total}`;
+});
+
+// The writer stamp decides; the separator guess is only for unmarked legacy reports.
+t('replay: a writer-stamped report gets a replay text whatever its location form', () => {
+  const prose = 'Total comp most plausibly lands in the $120-180K range.\n';
+  const stamped = prose + '## Machine Summary\nwriter: eval-write\nlocation_final: "Los Angeles, onsite"\n';
+  const txt = reportModelText(stamped);
+  if (txt === null) return 'a stamped report must get a replay text even with no "--" separator';
+  if (/120/.test(txt)) return `prose leaked into the replay text: ${txt}`;
+  if (!/location: "Los Angeles, onsite"/.test(txt)) return `the whole location must survive: ${txt}`;
+  const elsewhere = prose + 'writer: eval-write\n## Machine Summary\nlocation_final: "Los Angeles, onsite"\n';
+  return reportModelText(elsewhere) === null || 'a stamp outside the Machine Summary must not count';
+});
+
+// An example summary inside the analysis must not feed the replay (Codex, 2026-10-29).
+t('replay: only the LAST Machine Summary is read', () => {
+  const example = '## Machine Summary\n```yaml\ncomp_total_est: 100000\narrangement: onsite\n```\n';
+  const real = '## Machine Summary\n```yaml\nwriter: eval-write\nlocation_final: "Remote -- ok"\n' +
+    'arrangement: remote\n```\n';
+  const txt = reportModelText('## Analysis\n' + example + '## Verdict\n' + real);
+  if (/100000/.test(txt || '')) return `the example's comp leaked into the replay: ${txt}`;
+  return persistedArrangement('## Analysis\n' + example + real) === 'remote'
+    || 'the example summary supplied the arrangement';
 });
 
 t('pref: engineering titles are not damped', () =>
