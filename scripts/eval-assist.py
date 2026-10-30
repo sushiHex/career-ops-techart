@@ -153,12 +153,18 @@ if __name__ == "__main__":
             _prep.write_packet(f, p)
         rows.append((p, f))
 
+    # A settled packet (closed, gate-failed) is kept in the queue for eval-write now and is
+    # not judgement work; eval-prep.is_settled() is the one definition.
+    settled = [r for r in rows if _prep.is_settled(r[0])]
+    rows = [r for r in rows if not _prep.is_settled(r[0])]
     auto = [r for r in rows if r[0].get("suggested_disposition")]
     rest = [r for r in rows if not r[0].get("suggested_disposition")]
     rest.sort(key=lambda r: (r[0].get("lane_balance", 0),
                              r[0].get("suggested_comp_score") or 0), reverse=True)
 
-    print(f"annotated {len(rows)} packet(s)")
+    print(f"annotated {len(rows) + len(settled)} packet(s)")
+    if settled:
+        print(f"  {len(settled)} already settled (closed or gate-failed); record them with eval-write")
     print(f"  {len(auto)} have a stated gate that already decides them")
     print(f"  {len(rest)} need judgement, ranked by lane balance\n")
     print(f"{'comp':>5} {'lane':>5}  {'gates':<34} title")

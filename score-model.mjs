@@ -399,20 +399,75 @@ export function normaliseArrangement(v) {
  * a trailing `# comment` dropped, then one pair of quotes, then whitespace. A raw value
  * the regex used to reject (`" onsite "`, `onsite # note`) silently re-derived instead.
  */
-export function persistedArrangement(text) {
+/**
+ * The text a REPLAY of an eval-write report hands applyModel, or null for a report
+ * eval-write did not produce.
+ *
+ * eval-write hands the model `comp_total_est` and the bare location, nothing else,
+ * because compBand() must arm the comp gate from comp_total_est alone: prose total-comp
+ * extraction proved unreliable in both directions. apply-model used to hand it the WHOLE
+ * report, so a range an evaluator wrote in prose ("total comp most plausibly lands in the
+ * $120-180K range") armed a gate the report's own final never had, and alternating
+ * apply-model with score-audit --fix churned five rows on 2026-10-29 (measured with
+ * _compinput-audit.mjs: 25 of 674 rows differ, almost all legacy). This one function is
+ * now what both score-audit's replay and apply-model use for eval-write reports.
+ * Legacy hand-written reports (no "<location> -- <why>" location_final) return null and
+ * keep their whole-text reading, since prose is all they carry.
+ *
+ * Since 2026-10-29 eval-write stamps `writer: eval-write` in the summary, and the stamp
+ * decides. The location-separator test survives ONLY for unmarked reports: on the day
+ * the stamp landed it disagreed with eval-write's own summary signature on 105 of 1171
+ * reports (52 hand-written July reports in the separator form, 53 early eval-write ones
+ * without it), so stamping old reports from it would have written the guess down as
+ * fact. Every report written from now on is classified by what wrote it.
+ */
+export function reportModelText(text) {
+  // Read the Machine Summary only: the analysis body precedes it, and a standalone
+  // "comp_total_est: 100000" line in an example there must not win (Codex, 2026-10-29).
+  const t = summaryScope(text);
+  const field = (k) => {
+    const m = t.match(new RegExp('^\\s*' + k + ':\\s*"?([^"\\n]+)', 'm'));
+    return m ? m[1].trim().replace(/"$/, '') : null;
+  };
+  const sep = new RegExp('\\s+(?:' + String.fromCharCode(0x2014) + '|--)\\s+');
+  const locRaw = field('location_final');
+  const stamped = /^[ \t]*writer:[ \t]*eval-write[ \t]*$/m.test(t);
+  if (locRaw === null || (!stamped && !sep.test(locRaw))) return null;
+  const est = field('comp_total_est');
+  const basis = String(field('comp_basis') || '').trim().toLowerCase();
+  const posted = field('comp_posted');
+  // A posted band stands in for a total only when its basis IS total, exactly eval-write's
+  // rule (eval-write.mjs compText). Excluding only base/unknown let "posted" arm a gate on
+  // replay that the writer never armed (Codex, 2026-10-29).
+  const compLine = est !== null ? est
+    : (posted && posted !== 'not published' && basis === 'total') ? posted : '';
+  return `comp_total_est: "${compLine}"\nlocation: "${locRaw.split(sep)[0].trim()}"\n`;
+}
+
+/**
+ * The Machine Summary a replay may read, or the whole text when a report has none.
+ *
+ * The LAST "## Machine Summary" heading, bounded to its first fenced block, else to the
+ * next heading. Every writer puts the real summary last, and the analysis body ahead of it
+ * is free prose: reading from the FIRST such heading through end of file let an example
+ * summary in the body supply comp_total_est while the real one supplied the location
+ * (Codex, 2026-10-29, reproduced at 4.00 written against 1.53 replayed). Reading on past
+ * the summary let a later section's "arrangement:" line supply a verdict (review, round 3).
+ */
+export function summaryScope(text) {
   const t = text || '';
-  const at = t.search(/^##\s*Machine Summary/im);
-  // Bounded to the summary itself: its first fenced block, else up to the next heading.
-  // Reading on to the end of the file let a later example section's "arrangement:" line
-  // supply a verdict the summary never gave (review, round 3).
-  let scope = t;
-  if (at >= 0) {
-    const body = t.slice(at).replace(/^[^\n]*\n?/, '');      // past the heading line
-    const next = body.search(/^#{1,2}\s/m);
-    const section = next >= 0 ? body.slice(0, next) : body;
-    const fence = section.match(/^```[^\n]*\n([\s\S]*?)^```/m);
-    scope = fence ? fence[1] : section;
-  }
+  const heads = [...t.matchAll(/^##\s*Machine Summary[^\n]*\n?/gim)];
+  if (!heads.length) return t;
+  const last = heads[heads.length - 1];
+  const body = t.slice(last.index + last[0].length);
+  const next = body.search(/^#{1,2}\s/m);
+  const section = next >= 0 ? body.slice(0, next) : body;
+  const fence = section.match(/^```[^\n]*\n([\s\S]*?)^```/m);
+  return fence ? fence[1] : section;
+}
+
+export function persistedArrangement(text) {
+  const scope = summaryScope(text);
   const m = scope.match(/^[ \t]*arrangement:[ \t]*(.*)$/m);
   if (!m) return undefined;
   const v = m[1].replace(/\s+#.*$/, '').trim().replace(/^(["'])(.*)\1$/, '$2').trim();

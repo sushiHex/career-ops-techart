@@ -39,6 +39,7 @@ import lever from './providers/lever.mjs';
 import ashby from './providers/ashby.mjs';
 import workday from './providers/workday.mjs';
 import { buildTitleFilter, buildLocationFilter, loadSeenUrls, appendToPipeline, appendToScanHistory } from './scan.mjs';
+import { localDate } from './local-date.mjs';
 import { effectiveLocationFilter } from './location-core.mjs';
 
 // ── Config ──────────────────────────────────────────────────────────
@@ -243,7 +244,7 @@ async function main() {
 
   const { seen: seenUrls } = loadSeenUrls();
   const ctx = makeHttpCtx();
-  const date = new Date().toISOString().slice(0, 10);
+  const date = localDate();
 
   const newOffers = [];
   let totalCompanies = 0;
@@ -261,6 +262,9 @@ async function main() {
     await parallelEach(entries, CONCURRENCY, async (entry) => {
       try {
         const jobs = await source.provider.fetch(entry, ctx);
+        // Printed whatever --verbose says: an unreachable board is expected noise here,
+        // a partial one is a silent miss.
+        if (jobs.truncated) console.error(`  ! ${name}/${entry.name}: incomplete board: ${jobs.truncated}`);
         for (const job of jobs) {
           if (!job.url || !job.title) continue;
           if (!job.postedAt || job.postedAt < cutoff) continue;
@@ -306,7 +310,7 @@ async function main() {
   offers.sort((a, b) => (b.postedAt || 0) - (a.postedAt || 0));
   console.log('\nNew offers:');
   for (const o of offers) {
-    const posted = o.postedAt ? new Date(o.postedAt).toISOString().slice(0, 10) : 'n/a';
+    const posted = o.postedAt ? localDate(new Date(o.postedAt)) : 'n/a';
     console.log(`  + [${o.source}] ${posted} | ${o.company} | ${o.title} | ${o.location || 'N/A'}\n    ${o.url}`);
   }
 
@@ -332,7 +336,7 @@ async function main() {
         `> ${offers.length} jobs | since ${opts.sinceDays}d | ${opts.liveness ? 'liveness ✓' : 'no liveness check'}`,
         '',
         ...offers.map(o => {
-          const posted = o.postedAt ? new Date(o.postedAt).toISOString().slice(0, 10) : 'n/a';
+          const posted = o.postedAt ? localDate(new Date(o.postedAt)) : 'n/a';
           return `- [${o.title} @ ${o.company}](${o.url}) — ${o.location || 'N/A'} | ${o.source} | ${posted}`;
         }),
         '',

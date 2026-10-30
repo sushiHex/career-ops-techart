@@ -100,7 +100,33 @@ WD_POSTING_URL = re.compile(
 # number is ambiguous anywhere else, which is why WD_REQ_ID refuses it; it is unambiguous
 # HERE because its position is fixed by the Workday posting path and every comparison is
 # scoped to one tenant's own search. inbox-liveness reads Workday ids through this too.
-WD_BARE_ID = re.compile(r"_(\d{6,})(?:-\d+)?(?:[?/#]|$)")
+#
+# It reads ANY id in that position, not one tenant's spelling, because every tenant met so
+# far has its own: Cotality `_REQ19351` (the R of REQ is followed by letters, so the shared
+# pattern cannot read it), Snap's quarterly evergreen `_H226SWEGML5` and `_Q426SWEML5-1`.
+# Each one unreadable meant every row on that tenant resolved "unknown" for ever, reported as
+# an unreadable SEARCH that had never been sent (2026-10-27).
+#
+# A reader that loose is only safe at the one POSITION a requisition occupies, because the
+# id it reads is searched for and a clean absence CLOSES the row. Searched across the whole
+# string, `job/US_CA2026/Role_H226SWEGML5` read the LOCATION token `CA2026`, a fragment such
+# as `#panel_ABC123` read `ABC123`, and either one walked the tenant for the wrong id and
+# closed a live posting (Codex, 2026-10-27). So it reads only the posting SEGMENT (the one
+# after `job/<location>/`, else the last), only after its LAST underscore, query and
+# fragment cut first. The id must carry a digit and run six characters, so a title word is
+# never an id. A trailing `-N` is Workday's facet suffix only at one or two digits: whether
+# `ABC123-456` is one id or an id plus a suffix is not decidable here, so it reads nothing
+# and the row stays unknown rather than being matched against the wrong requisition.
+WD_BARE_ID = re.compile(r"_((?=[A-Za-z]*\d)[A-Za-z0-9]{6,}?)(?:-\d{1,2})?$")
+
+
+def _wd_posting_segment(path):
+    """The path segment that carries a Workday posting's slug and requisition, or ''."""
+    segs = [s for s in re.split(r"[?#]", path or "", maxsplit=1)[0].split("/") if s]
+    low = [s.lower() for s in segs]
+    if "job" in low and low.index("job") + 2 < len(segs):
+        return segs[low.index("job") + 2]
+    return segs[-1] if segs else ""
 
 
 def workday_req(path):
@@ -114,7 +140,8 @@ def workday_req(path):
     m = WD_REQ_ID.search(path or "")
     if m:
         return m.group(0)
-    m = WD_BARE_ID.search(path or "")
+    seg = _wd_posting_segment(path)
+    m = WD_BARE_ID.search("_" + seg.rsplit("_", 1)[-1]) if "_" in seg else None
     return m.group(1) if m else None
 
 
@@ -145,8 +172,21 @@ HDRS = {"User-Agent": UA, "Accept": "application/json"}
 # Not every employer writes a dollar sign. NVIDIA posts "184,000 USD - 287,500 USD",
 # so a $-anchored pattern dropped its bands entirely and every NVIDIA req came back
 # with no comp at all.
+#
+# An amount is FIVE DIGITS, not five characters. `[\d,]{5,}` counted the comma, so
+# Handshake's "$2,000 learning stipend" read as pay, and because a body figure outranks
+# the ATS's structured band in prefer_structured(), the posting's real "$200K - $350K"
+# never reached eval-prep (2026-10-19). Cents are optional: Riot writes
+# "$229,200.00 - $319,500.00", and without them the range split into two lone figures.
+_AMT = r"(?:\d{2,3}(?:,\d{3})+|\d(?:,\d{3}){2,}|\d{5,})(?:\.\d{2})?"
+# Amazon writes the currency ONCE, after the range: "154,200.00 - 208,600.00 USD
+# annually", which neither form read, so every amazon.jobs band was lost (2026-10-29).
 PAY = re.compile(
-    r"\$\s?[\d,]{5,}(?:\s*(?:-|to|–|—)\s*\$?\s?[\d,]{5,})?"
+    rf"\$\s?{_AMT}(?:\s*(?:-|to|–|\u2014)\s*\$?\s?{_AMT})?"
+    # ...but never a range that names a shorter period: "35,000 - 40,000 USD per month"
+    # is not an annual band (Codex, 2026-10-29).
+    rf"|{_AMT}\s*(?:-|to|–|\u2014)\s*{_AMT}\s*USD"
+    r"(?!\s*(?:per|/|an?|each)\s*(?:month|mo|week|wk|day|hour|hr)s?\b|\s*(?:monthly|weekly|daily|hourly)\b)"
     r"|[\d,]{6,}\s*USD(?:\s*(?:-|to|–|—)\s*[\d,]{6,}\s*USD)?")
 TAG = re.compile(r"<[^>]+>")
 
@@ -164,6 +204,7 @@ HOST_NOISE = {"www", "careers", "career", "jobs", "job", "boards", "board",
 EIGHTFOLD_DOMAINS = {
     "explore.jobs.netflix.net": "netflix.com",
     "jobs.nvidia.com": "nvidia.com",       # verified 2026-09-20, HTTP 200
+    "apply.careers.microsoft.com": "microsoft.com",   # verified 2026-10-29, HTTP 200
 }
 # Hosts belonging to an ATS rather than to an employer. A portals.yml entry is identified
 # by the company's OWN domain, so these must never be read as its identity: indexing them
@@ -173,7 +214,8 @@ ATS_HOST = re.compile(
     r"greenhouse\.io|ashbyhq\.com|lever\.co|myworkdayjobs\.com|smartrecruiters\.com|"
     r"breezy\.hr|workable\.com|successfactors|jobvite|eightfold|gem\.com|avature|"
     r"icims\.com|taleo\.net|github\.careers|jobs\.netflix\.net|jobs\.apple\.com|"
-    r"amazon\.jobs", re.I)
+    # Rippling by its ATS host only: rippling.com itself is an employer's own domain.
+    r"amazon\.jobs|ats\.rippling\.com", re.I)
 # The same vendors as they appear INSIDE A PATH, which is where a redirect puts its
 # destination when it drops the scheme. Deliberately NOT ATS_HOST, and the difference is
 # the point: that pattern answers "is this parsed HOSTNAME a vendor's" and is loose on
@@ -187,7 +229,8 @@ ATS_IN_PATH = re.compile(
     r"(?<![\w.-])(?:[\w-]+\.)*(?:greenhouse\.io|ashbyhq\.com|lever\.co"
     r"|myworkdayjobs\.com|smartrecruiters\.com|breezy\.hr|workable\.com"
     r"|successfactors\.com|jobvite\.com|eightfold\.ai|avature\.net|icims\.com"
-    r"|taleo\.net|github\.careers|amazon\.jobs|apple\.com|netflix\.net)[/?#]", re.I)
+    r"|taleo\.net|github\.careers|amazon\.jobs|apple\.com|netflix\.net"
+    r"|ats\.rippling\.com|jobs\.gem\.com)[/?#]", re.I)
 # Every spelling of a Greenhouse board URL that portals.yml actually carries: the
 # zero-token api: line, the job-boards/boards careers_url, and the embed snippet.
 GH_SLUG = re.compile(
@@ -198,7 +241,9 @@ GH_SLUG = re.compile(
 # spelling; a Workday tenant is recorded separately, in `workday`.
 BOARD_SLUG = re.compile(
     r"(?:jobs\.ashbyhq\.com/|jobs\.lever\.co/|apply\.workable\.com/|jobs\.smartrecruiters\.com/)"
-    r"([\w-]+)")
+    r"([\w-]+(?:\.[\w-]+)*)")
+# An Ashby org declared in portals.yml; dotted slugs (kraken.com, magic.dev) included.
+ASHBY_ORG = re.compile(r"jobs\.ashbyhq\.com/([\w-]+(?:\.[\w-]+)*)")
 # The snippet a company-hosted careers page uses to embed its Greenhouse board. BOTH
 # spellings have to be here. The standard loader is
 # `boards.greenhouse.io/embed/job_board/js?for=SLUG`, and a pattern that knew only the
@@ -353,7 +398,8 @@ def portals_index():
             # Every ATS board slug the entry declares, lowercased, so a caller holding a
             # slug (eval-prep naming a packet's employer) can find the entry's label.
             boards={m.lower() for m in slugs + BOARD_SLUG.findall(block)},
-            workday=(wd.group(1), wd.group(2), wd.group(3)) if wd else None))
+            workday=(wd.group(1), wd.group(2), wd.group(3)) if wd else None,
+            ashby=list(dict.fromkeys(ASHBY_ORG.findall(block)))))
     _PORTALS = entries
     return entries
 
@@ -378,6 +424,21 @@ def portal_boards(url):
         if keys & e["keys"]:
             out += e["slugs"]
     return list(dict.fromkeys(out))
+
+
+def portal_ashby(url):
+    """The ONE Ashby org portals.yml records for the company hosting `url`, or None.
+
+    elevenlabs.io/careers/<uuid> is a company-hosted face of the Ashby board `elevenlabs`
+    and carries the Ashby posting id in its path, but no adapter claimed the host, so the
+    row read "no API for this host" for ever. Strict keys only and a unique match, as in
+    portal_workday(); the caller still lets this route open a row and never close one.
+    """
+    keys = host_keys(url)
+    if not keys:
+        return None
+    orgs = list(dict.fromkeys(o for e in portals_index() if keys & e["keys"] for o in e["ashby"]))
+    return orgs[0] if len(orgs) == 1 else None
 
 
 def portal_workday(url):
@@ -773,8 +834,86 @@ def clean(h):
     return re.sub(r"\s+", " ", s.replace("\xa0", " ")).strip()
 
 
+# A NAMED foreign prefix on a dollar figure, the body-text half of what FOREIGN_MONEY
+# guards in a summary. AssemblyAI writes "USD Salary Range: $160,000 - $210,000 CAD Salary
+# Range: C$225,000 - C$285,000", and PAY read each C$ figure as a lone US amount, which
+# raised the band's top to $285K. A list of prefixes rather than "any letter before $",
+# because that rule dropped "US$150,000" and turned "from$150,000 - $200,000" into a
+# $200,000 band by losing its low end (Codex, 2026-10-18). Masked, not deleted, so a
+# foreign figure can never join a US one into a range.
+FOREIGN_DOLLAR = re.compile(r"\b(?:C|CA|CAD|A|AU|AUD|NZ|NZD|HK|HKD|S|SG|SGD|MX|MXN|R|NT)\$")
+
+
+def mask_foreign(txt):
+    """`txt` with US$ and USD$ written as "$" and every other lettered dollar masked."""
+    return FOREIGN_DOLLAR.sub("¤", us_dollars(txt))
+
+
+# What a dollar figure is FOR, when it is not pay. A body states other money beside its
+# band: "$10,000 signing bonus", "$50,000 relocation", "a $1,250,000 equity grant",
+# "raised $80,000,000", "our annual budget is $500,000". Read as pay, the first suppressed a
+# structured band in prefer_structured() and the others became band endpoints in eval-prep
+# (Codex, 2026-10-19).
+#
+# Two rules, and the order matters. A figure LABELLED as pay (a salary word just before it)
+# is pay, whatever follows: cleaning HTML joins paragraphs, so "Salary $180,000 - $220,000"
+# followed by a paragraph on stock grants read as a grant and the band vanished (round 2).
+# Otherwise a purpose stated just BEFORE the figure, through a few linking words ("signing
+# bonus of up to $50,000", "budget is $500,000"), disqualifies it; one stated just AFTER
+# disqualifies only a lone figure, never a range, because "$150,000 - $200,000 plus bonus
+# and equity" is a band.
+_PURPOSE = (r"sign(?:ing|-on)(?:\s+bonus)?|relocation|stipend|allowance|reimburse\w*|"
+            r"equity(?:\s+grant)?|rsus?|stock|grants?|bonus(?:es)?|budget|funding|raised|"
+            r"valuation|revenue|run[- ]rate|tuition|referral|per\s+(?:month|week|day)|monthly")
+_LINK = r"(?:\s+(?:of|up|to|is|are|was|were|worth|totall?ing|at|an?|the|our|its|over|about|approximately|:))"
+# "RSU eligible", "bonus also available": the noun names something ELSE the role carries,
+# not what the figure is, so it does not disqualify the figure (Codex round 3).
+# Atomic, so "equity grant available" cannot backtrack to "equity" and then read "grant"
+# as the thing after it, bypassing the exception (round 4).
+_PURPOSE_AFTER = re.compile(rf"^\s*(?:in\s+|of\s+|one[- ]time\s+|annual\s+|cash\s+)?"
+                            rf"(?>(?:{_PURPOSE})(?:\s+(?:grants?|package|award|pool|plan|program))?)\b"
+                            r"(?!\s*(?:eligib|also\b|included|available|plan\b|program\b|opportunit))", re.I)
+# "range" is a noun a purpose can take ("Bonus range: $30,000 - $50,000"), and it is NOT a
+# pay label on its own: as one it shielded bonus and budget ranges from this test (round 4).
+_PURPOSE_BEFORE = re.compile(rf"\b(?:{_PURPOSE})(?:\s+(?:assistance|package|support|benefit|program|"
+                             rf"amount|award|pool|plan|range|target))?{_LINK}{{0,4}}\s*:?\s*$", re.I)
+_PAY_LABEL = re.compile(r"\b(?:salary|salaries|pay|base|compensation|wages?|OTE|total cash|"
+                        r"hiring range|pay range)\b[^.$]{0,40}$", re.I)
+# PAY accepts "180,000 USD - 220,000 USD", so a range test has to as well (round 3).
+_RANGE_SEP = re.compile(r"\d\s*(?:USD\s*)?(?:-|to|–|\u2014)\s*\$?\s*\d", re.I)
+
+
+def pay_hits(txt):
+    """[(figure, labelled)] for every pay figure in free text, in order.
+
+    `labelled` says a salary word stands just before the figure. Callers that must choose
+    between the body and a structured band use it: an unlabelled body figure is weaker
+    evidence than an ATS field that says salary.
+    """
+    s = mask_foreign(txt)
+    out = []
+    for m in PAY.finditer(s):
+        before = s[max(0, m.start() - 60):m.start()]
+        # A purpose stated hard against the figure decides it, label or no label:
+        # "Compensation includes a $20,000 signing bonus" is a bonus (round 3). A RANGE is
+        # never disqualified by what follows it, which is what keeps a band alive when
+        # cleaned HTML runs it into the next paragraph; a lone figure followed by its own
+        # purpose noun is dropped, because a missing band is safer than a wrong one.
+        labelled = bool(_PAY_LABEL.search(before))
+        if _PURPOSE_BEFORE.search(before):
+            continue
+        # What follows a figure is its purpose for a lone figure or an UNLABELLED range
+        # ("We offer $30,000 - $50,000 signing bonus", round 3). A labelled range is a band
+        # whatever follows, since cleaned HTML runs it into the next paragraph.
+        if not (labelled and _RANGE_SEP.search(m.group(0))) and _PURPOSE_AFTER.search(s[m.end():m.end() + 30]):
+            continue
+        out.append((m.group(0), labelled))
+    return out
+
+
 def pays(txt):
-    return list(dict.fromkeys(PAY.findall(txt)))[:3]
+    """Up to three distinct pay figures or bands, in order, from free text."""
+    return list(dict.fromkeys(f for f, _ in pay_hits(txt)))[:3]
 
 
 
@@ -827,6 +966,24 @@ def apple_jobs_data(page):
     return d if isinstance(d, dict) and d else None
 
 
+def apple_route_status(page):
+    """The status Apple's router recorded for the jobDetails route, or None.
+
+    A retired Apple posting does not answer 404. It answers 200 with a client-rendered
+    shell whose hydration data says, in Apple's own words, that the jobDetails route
+    failed: `"errors":{"jobDetails":{"status":404,...,"__type":"RouteErrorResponse"}}`.
+    Read without this, all seven retired Apple rows on 2026-10-25 came back "re-check
+    the parser", while the one live row in the same batch parsed normally. Only the
+    jobDetails route counts, so an error on some other route never closes a posting.
+    """
+    m = re.search(r"__staticRouterHydrationData\s*=\s*JSON\.parse\(\"(.*?)\"\);", page or "", re.S)
+    if not m:
+        return None
+    un = m.group(1).replace('\\"', '"')
+    e = re.search(r'"errors"\s*:\s*\{[^{}]*?"jobDetails"\s*:\s*\{\s*"status"\s*:\s*(\d{3})', un)
+    return int(e.group(1)) if e else None
+
+
 def k_band(summary):
     """A K-notation band rewritten in full dollars, so PAY can read it.
 
@@ -835,9 +992,476 @@ def k_band(summary):
     posted; score comp on evidence" and the comp dimension was judged on nothing. The
     rewrite is mechanical, $200K is $200,000, and any other shape is left untouched
     rather than guessed at: a wrong band is worse than a missing one against a floor.
+
+    A decimal thousand is still a thousand: Ramp writes "$211.4K - $290.6K", which the
+    integer-only first version left untouched, so the whole band read as no band.
     """
-    return re.sub(r"\$\s?(\d{2,4})[Kk]\b",
-                  lambda m: "$" + format(int(m.group(1)) * 1000, ","), summary or "")
+    return re.sub(r"\$\s?(\d{2,4}(?:\.\d{1,2})?)[Kk]\b",
+                  lambda m: "$" + format(round(float(m.group(1)) * 1000), ","), summary or "")
+
+
+def band_pay(lo, hi, currency, interval):
+    """One STRUCTURED pay band as (pay, summary). pay is a list like pays() returns.
+
+    Shared by every adapter whose ATS publishes the band as data rather than prose (Lever
+    salaryRange, Ashby compensation.summaryComponents), so the currency and interval rules
+    below are written once.
+
+    Only a USD figure is written in a form eval-prep's comp parser will read, because that
+    parser reads `$` as dollars. A yearly band is written exactly as PAY would print it. An
+    hourly one says "per hour", which is the spelling eval-prep's HOURLY rule annualises and
+    which its annual rule cannot match (fewer than five digits). Every other interval, and
+    any other currency, goes into the summary only and never into `pay`: "$20,000 per month"
+    read as a yearly figure is the wrong-band-worse-than-none case k_band() already refuses.
+    The interval is matched as a word inside the ATS's own spelling, which is
+    "per-year-salary" and "per-hour-wage" on Lever and "1 YEAR" and "1 HOUR" on Ashby.
+    """
+    nums = [v for v in (lo, hi)
+            if isinstance(v, (int, float)) and not isinstance(v, bool) and v > 0]
+    if not nums:
+        return [], None
+    lo, hi = min(nums), max(nums)
+    cur = str(currency or "").strip().upper()
+    interval = str(interval or "").strip().lower()
+    span = lambda fmt: fmt(lo) if lo == hi else f"{fmt(lo)} - {fmt(hi)}"
+    summary = f"{span(lambda v: format(v, ',.2f').removesuffix('.00'))} {cur or '(no currency)'} " \
+              f"{interval or '(no interval)'}"
+    if cur != "USD":
+        return [], summary
+    if "year" in interval:
+        return [span(lambda v: "$" + format(round(v), ","))], summary
+    if "hour" in interval:
+        return [span(lambda v: f"${v:,.2f}") + " per hour"], summary
+    return [], summary
+
+
+def _band_figures(p):
+    """The whole-dollar figures in one pay string, as a set of ints, for comparing bands."""
+    out = set()
+    for tok in re.findall(r"\$\s?([\d,]+(?:\.\d+)?)\s*([kK])?", p or ""):
+        try:
+            v = float(tok[0].replace(",", ""))
+        except ValueError:
+            continue
+        out.add(int(round(v * (1000 if tok[1] else 1))))
+    return out
+
+
+def prefer_structured(body, structured, has_structured):
+    """`pay` when an ATS publishes a structured band as well as a body.
+
+    The structured band has been through band_pay(), which refuses a non-USD currency and
+    labels or drops any interval that is not yearly; the body has not. Body-first let a
+    Lever `salaryDescriptionPlain` reading "$35,000 - $40,000 per month" or "CAD $200,000 -
+    $250,000" reach `pay` as an annual USD band whose structured twin had been correctly
+    refused, and eval-prep disposed of the role on it (Codex, 2026-10-15). No structured
+    band means the body alone, as before.
+
+    Narrowed on purpose: when the structured band is a valid yearly USD band the body still
+    comes first even if it disagrees, because a body usually prints the location-specific
+    band and the basis words, and two pinned cases hold that. Only a structured band that
+    was REFUSED (another currency, a monthly or other interval) or that is HOURLY overrules
+    the body, since then the body's figures are in a unit the annual reader cannot see.
+    """
+    if not has_structured:
+        return body
+    if not structured:
+        return []                       # refused: the posting's own data says not annual USD
+    if any("per hour" in s for s in structured):
+        return list(structured)         # hourly: the body's figures are not annual either
+    return body or list(structured)
+
+
+def lever_pay(sr):
+    """Lever's structured `salaryRange` as (pay, summary), through band_pay().
+
+    The postings API carries the band as data, `{min, max, currency, interval}`, and the
+    adapter only ever read the description, so a posting that states its band in that field
+    and nowhere in the body came back "no band": Arcadia's Principal Agent AI Platform req
+    publishes $250,000 to $350,000 there and was prepped as comp-unknown on 2026-10-15.
+    """
+    if not isinstance(sr, dict):
+        return [], None
+    return band_pay(sr.get("min"), sr.get("max"), sr.get("currency"), sr.get("interval"))
+
+
+def lever_body(d):
+    """The whole of a Lever posting's text, as one plain string.
+
+    Lever splits a posting across fields and the adapter read only `descriptionPlain`, which
+    is the opening prose. The requirements live in `lists` (Arcadia's "What You'll Bring"),
+    the pay-transparency paragraph in `salaryDescriptionPlain`, and the closing boilerplate
+    in `additionalPlain`, so the requirements excerpt and eval-assist's gate scan (years,
+    degree, clearance) read a posting with its requirements cut off. Every other adapter
+    here reads a whole body. Of 1221 postings on twelve Lever boards on 2026-10-15, 131
+    carried a salaryDescriptionPlain and none of them repeated it in descriptionPlain; 62
+    state a figure, 53 call it base, and the nine that eval-prep's basis reader would call
+    total are CaptivateIQ's "The OTE salary range for this role is ...", which genuinely is.
+    """
+    parts = [clean(d.get("descriptionPlain") or d.get("description") or "")]
+    for l in d.get("lists") or []:
+        if isinstance(l, dict):
+            parts.append(clean(f"{l.get('text') or ''}: {l.get('content') or ''}").strip(": "))
+    for k in ("salaryDescriptionPlain", "additionalPlain"):
+        v = d.get(k)
+        parts.append(clean(v) if isinstance(v, str) else "")
+    out = []
+    for p in parts:
+        if p and not any(p in q for q in out):
+            out.append(p)
+    return " ".join(out)
+
+
+# A dollar sign that is not US dollars: "CA$138K", "S$", "A$", "NZ$", "HK$", "MX$", "R$", or
+# another currency symbol. k_band() reads any `$`, so without this an Ashby summary of
+# "CA$138K - CA$189K" became "$138,000" and eval-prep scored a Canadian band as US pay.
+# "US$" is the one lettered dollar that IS US dollars, and the letter rule read its "S$" as
+# Singapore, so "US$200K - US$260K" yielded no band (Codex, PR 14). It is folded to a bare
+# "$" by us_dollars() before this check; "AUS$" folds to "A$" and stays foreign.
+FOREIGN_MONEY = re.compile(r"[A-Za-z]\$|[£€¥₹₩]")
+
+
+def us_dollars(s):
+    """`s` with every "US$" and "USD$" written as "$"."""
+    return re.sub(r"USD?\$", "$", s or "")
+
+
+def ashby_summary_pay(summary):
+    """`pay` from an Ashby compensation SUMMARY string, under band_pay()'s rules.
+
+    The board and detail pages publish only the summaries, never the structured
+    components, so this is the page path's whole evidence and the API path's fallback.
+    Measured on six live boards on 2026-10-15: "$197K - $246K" (yearly), "CA$138K -
+    CA$189K" (Canadian), "$12.5K per month", and "$60.58 – $108.17 per hour", where the
+    scrapeable summary is null and only the tier summary carries the rate. Same discipline
+    as a structured band: another currency or a monthly, weekly or daily figure yields
+    nothing, an hourly rate is kept LABELLED, and a summary that mentions hourly pay
+    without stating a rate yields nothing rather than being read as a yearly band.
+    """
+    s = us_dollars(summary)
+    if not s.strip() or FOREIGN_MONEY.search(s):
+        return []
+    if re.search(r"\bper (?:month|week|day)\b|\b(?:monthly|weekly|daily)\b", s, re.I):
+        return []
+    if re.search(r"\bhour(?:ly)?\b", s, re.I):
+        # One or two decimals: "$60.5 - $70.5 per hour" is a rate too (Codex, PR 14).
+        m = re.search(r"\$\s?\d{1,3}(?:\.\d{1,2})?(?:\s*[-–\u2014]\s*\$\s?\d{1,3}(?:\.\d{1,2})?)?"
+                      r"\s*per hour", s, re.I)
+        return [re.sub(r"\s*[–\u2014]\s*", " - ", m.group(0))] if m else []
+    return pays(k_band(s))
+
+
+def ashby_summaries(rec):
+    """(text, summary) from an Ashby record's two compensation summaries.
+
+    `text` is what `pay` is read from: the scrapeable summary, the plainer of the two, else
+    the tier summary (the scrapeable one is null on OpenAI's hourly bands). `summary` is
+    what comp_summary keeps: the TIER summary first, because only it carries "Offers
+    Equity", and eval-prep reads comp_summary for the comp basis. One helper for the
+    posting-API and detail-page paths, which had each picked their own and disagreed: the
+    page path kept the plainer text, so an hourly band whose equity was stated only in the
+    tier summary read as total and armed the floor gate (Codex P1, PR 14).
+    """
+    tier = rec.get("compensationTierSummary") or ""
+    text = rec.get("scrapeableCompensationSalarySummary") or tier
+    return text, (tier or text or None)
+
+
+def ashby_pay(comp):
+    """Ashby posting-API `compensation` as (pay, summary).
+
+    The adapter requested `includeCompensation=true` and then never read the result, so
+    every Ashby board that publishes its band only there (ElevenLabs, Ramp and OpenAI do, on
+    most postings) reached eval-prep as no band. The structured Salary entries of
+    `summaryComponents` carry `minValue`, `maxValue`, `currencyCode` and `interval`, so they
+    go through band_pay(). Equity, bonus and commission entries are not a salary band and
+    are skipped. Only when no Salary entry exists at all does the summary string speak, and
+    then under ashby_summary_pay()'s rules: a Salary entry in CAD has already said this is
+    not a USD band, and the summary must not be allowed to overrule it.
+    """
+    if not isinstance(comp, dict):
+        return [], None
+    pay, labels, salaried, extras = [], [], False, []
+    for c in comp.get("summaryComponents") or []:
+        if not isinstance(c, dict):
+            continue
+        if c.get("compensationType") == "Salary":
+            salaried = True
+            p, s = band_pay(c.get("minValue"), c.get("maxValue"),
+                            c.get("currencyCode"), c.get("interval"))
+            pay += p
+            labels += [s] if s else []
+            continue
+        # An EquityPercentage, EquityCashValue, Bonus or Commission component is not a
+        # band, but it IS the posting saying the salary is not the whole offer. With no
+        # text summary it was dropped, and eval-prep then read a sub-floor hourly rate as
+        # total and gated it (Codex P1, PR 14). Kept as words eval-prep's basis rule reads.
+        t = str(c.get("compensationType") or "").lower()
+        extras += [w for w in ("equity", "bonus", "commission") if w in t and w not in extras]
+    text, summary = ashby_summaries(comp)
+    if not salaried:
+        pay = ashby_summary_pay(text)
+    if salaried and not pay:
+        pay, tier = ashby_us_tier(comp)
+        summary = "; ".join(x for x in (tier, summary) if x) or summary
+    summary = summary or "; ".join(labels) or ""
+    unsaid = [w for w in extras if w not in summary.lower()]
+    if unsaid:
+        summary = "; ".join(x for x in (summary, "offers " + ", ".join(unsaid)) if x)
+    summary = summary or None
+    return list(dict.fromkeys(pay))[:3], summary
+
+
+def _home_state_name():
+    """The location policy's home state name ("California"), or None if it cannot load."""
+    try:
+        import _location
+        return _location.load().home_name
+    except Exception:
+        return None
+
+
+def ashby_us_tier(comp, home=None):
+    """(pay, tier label) from Ashby's per-location `compensationTiers`, US dollars only.
+
+    Cohere's headline band is Canadian ("CA$250K - CA$535K ... Multiple Ranges"), so the
+    summary path rightly yielded nothing and every Cohere req reached eval-prep as no band,
+    while the same posting's tiers carried "USA - California, New York and Washington:
+    Base Salary $205K - $380K" and "USA - All Other States: $175K - $325K" (2026-10-18).
+    The tier naming the location policy's home state wins; failing that a lone US tier;
+    failing that every US tier, so the band spans them rather than inventing one.
+    """
+    home = home if home is not None else _home_state_name()
+    tiers = []
+    for t in (comp or {}).get("compensationTiers") or []:
+        if not isinstance(t, dict):
+            continue
+        band, equity = [], False
+        for c in t.get("components") or []:
+            if not isinstance(c, dict):
+                continue
+            if c.get("compensationType") == "Salary":
+                band += band_pay(c.get("minValue"), c.get("maxValue"),
+                                 c.get("currencyCode"), c.get("interval"))[0]
+            equity = equity or "equity" in str(c.get("compensationType") or "").lower()
+        summ = str(t.get("tierSummary") or "")
+        # Equity stated only as a tier COMPONENT still says the salary is not the whole
+        # offer; dropped, a sub-floor hourly tier read as total and armed the gate (Codex).
+        if equity and "equity" not in summ.lower():
+            summ = "; ".join(x for x in (summ, "Offers Equity") if x)
+        if band:
+            tiers.append((str(t.get("title") or ""), band, summ))
+    if home:
+        named = [x for x in tiers if re.search(rf"\b{re.escape(home)}\b", x[0], re.I)]
+        # A US dollar band is not US geography ("Canada - California team"): among the
+        # tiers naming the home state, one that also names the US wins.
+        us = [x for x in named if re.search(r"\b(?:USA?|United States)\b", x[0])]
+        tiers = us or named or tiers
+    if not tiers:
+        return [], None
+    pay = [p for _, band, _ in tiers for p in band]
+    label = "; ".join(f"{title}: {summ}" if title else summ for title, _, summ in tiers)
+    return list(dict.fromkeys(pay))[:3], label
+
+
+def stated_employer(rec, *path):
+    """The employer name an ATS record states about ITSELF, or None.
+
+    eval-prep used to title-case a board slug or a hostname label when nothing better was
+    on hand, which is how packets came out naming "Weedmaps77" and "Sonypicturesjobs"
+    (issue #12). Where the record names its own employer that name is evidence and the
+    slug is not, so the adapters that carry one return it as `company`: Greenhouse
+    `company_name`, the Ashby page's `organization.name`, SmartRecruiters `company.name`,
+    Rippling `companyName`. Lever's postings API has no such field, and neither has Gem's
+    (its REST record and its public GraphQL posting both omit one). Workday's
+    `hiringOrganization.name` is NOT one: NVIDIA's reads "2100 NVIDIA USA", a legal-entity
+    code, so it is deliberately not read here.
+    """
+    v = rec
+    for k in path:
+        v = v.get(k) if isinstance(v, dict) else None
+    v = v.strip() if isinstance(v, str) else ""
+    return v or None
+
+
+# Rippling's public job-board API (the same host providers/rippling.mjs polls for a whole
+# board). The posting endpoint answers 404 for a posting it does not hold AND for a board
+# slug that does not exist ("Job Board not found"), and this file's fetch() discards an
+# error body, so the 404 alone cannot say which. See confirmed_absence().
+RIPPLING_API = "https://api.rippling.com/platform/api/ats/v1/board"
+RIPPLING_URL = re.compile(
+    OUTER_HOST + r"ats\.rippling\.com/(?:[a-z]{2}-[A-Za-z]{2}/)?([\w.-]+)/jobs/"
+    # Bounded, so "<uuid>garbage" is not read as the posting <uuid> (Codex, 2026-10-29).
+    r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?=[/?#]|$)", re.I)
+# Gem. The public job-board REST API mirrors Greenhouse's shape (job_posts, offices,
+# content) and is what the board's own embed documentation points at. It carries no pay:
+# Gem keeps the band in `compensationHtml`, which only the public GraphQL endpoint the
+# board page itself calls returns (Nominal's "Mission Operations Engineer" states
+# "$120,000 - $195,000 per year" there and nowhere in the REST content, measured
+# 2026-10-29). So GraphQL is read for the band and the remote flags alone; it is never a
+# liveness source, because it answers `oatsExternalJobPosting: null` with HTTP 200 for a
+# retired posting and for a board that does not exist alike.
+GEM_API = "https://api.gem.com/job_board/v0"
+GEM_GQL = "https://jobs.gem.com/api/public/graphql"
+GEM_GQL_QUERY = (
+    "query ExternalJobPosting($boardId: String!, $extId: String!) {"
+    " oatsExternalJobPosting(boardId: $boardId, extId: $extId) {"
+    " extId compensationHtml locations { name isRemote } job { locationType } } }")
+# The posting id is Gem's own token: base64url ("am9icG9zdDp7...", which decodes to
+# "jobpost:...") on newer boards, a uuid on older ones. Case-sensitive, so never lowered.
+GEM_URL = re.compile(OUTER_HOST + r"jobs\.gem\.com/([\w.-]+)/([\w-]{16,})(?=[/?#]|$)")
+
+
+def confirmed_absence(ats, st, board_url, ident, pid, **extra):
+    """The verdict when a posting endpoint did not answer 200, for a board-backed ATS.
+
+    A 404 from the posting endpoint is NOT on its own a closure for Rippling or Gem: both
+    answer 404 for a posting that is gone and for a board slug that does not exist, and
+    fetch() keeps no error body to tell the two apart. So a 404 or 410 closes only when
+    the BOARD agrees: its listing read cleanly, held postings (board_absence() refuses an
+    empty or too-small read, which is also what a wrong slug returns), and this id is not
+    among them. A board that lists the id while its posting endpoint says 404 is the two
+    halves of one platform disagreeing, which settles nothing. Any other status is a
+    failure to read and stays unknown, per unresolved().
+
+    `ident(record)` returns a record's id in the same normal form as `pid`.
+    """
+    if st not in GONE:
+        return dict(ats=ats, live=None, status=st, **extra,
+                    note=f"posting endpoint answered HTTP {st}; not retrievable, so "
+                         f"liveness is unknown")
+    bst, board = board_fetch(board_url, lambda body: jload(body, want=list))
+    if board is None:
+        return dict(ats=ats, live=None, status=st, board_status=bst, **extra,
+                    note=f"posting endpoint answered HTTP {st} and the board listing "
+                         f"answered HTTP {bst}; a board slug that does not exist answers "
+                         f"404 too, so this is not evidence the posting is gone; liveness "
+                         f"is unknown")
+    if board is UNREADABLE:
+        return unreadable(ats, bst, "the board listing")
+    # Every record must yield an id, or the listing was not fully understood: a malformed
+    # row could BE this posting, and a partly-read board is not a full one (Codex,
+    # 2026-10-29). Dropping the unparsed rows and counting the rest let
+    # [other_posting, malformed_target] close the target.
+    all_ids = [ident(j) if isinstance(j, dict) else None for j in board]
+    if any(i in (None, "") for i in all_ids):
+        return dict(ats=ats, live=None, status=st, board_status=bst, **extra,
+                    note=f"posting endpoint answered HTTP {st}, but the board listing held "
+                         f"records this reader could not identify, so absence from it is "
+                         f"not evidence; liveness is unknown")
+    ids = set(all_ids)
+    if pid in ids:
+        return dict(ats=ats, live=None, status=st, **extra,
+                    note=f"posting endpoint answered HTTP {st} while the board still lists "
+                         f"this id; the platform disagrees with itself, so liveness is "
+                         f"unknown")
+    got = board_absence(ats, len(ids), status=st, **extra)
+    if got.get("live") is False:
+        got["note"] = f"posting endpoint answered HTTP {st} and the id is " + got["note"]
+    return got
+
+
+def rippling_pay(ranges, locs):
+    """Rippling `payRangeDetails` as (pay, summary, has_band), each range through band_pay().
+
+    Rippling states one range PER LOCATION ({rangeStart, rangeEnd, currency, frequency,
+    location}; frequency is YEAR, HOUR, MONTH, WEEK, DAY or QUADRENNIUM, read from the
+    board page's own i18n strings). Ranges are never merged, since a span across locations
+    is nobody's offer. One distinct band is the posting's band. Several are narrowed to
+    those whose `location` EQUALS one of the posting's own work locations, the same
+    equality rule as the Greenhouse band fields, and if that does not leave exactly one,
+    `pay` is empty and every range is kept in the summary for a person to read.
+    """
+    rows = [r for r in (ranges or []) if isinstance(r, dict)]
+    if not rows:
+        return [], None, False
+    want = {str(l).strip().lower() for l in locs}
+    parts, cands = [], []
+    for r in rows:
+        p, s = band_pay(r.get("rangeStart"), r.get("rangeEnd"), r.get("currency"),
+                        r.get("frequency"))
+        place = str(r.get("location") or "").strip()
+        if s:
+            parts.append(f"{s} ({place})" if place else s)
+            cands.append((place.lower(), tuple(p)))
+    if not cands:
+        return [], None, False
+    bands = {b for _, b in cands}
+    if len(bands) > 1:
+        bands = {b for place, b in cands if place in want}
+    pay = list(next(iter(bands))) if len(bands) == 1 else []
+    return pay, "; ".join(parts), True
+
+
+def rippling_record(d, slug, **extra):
+    """One Rippling posting record (the job-board API's detail answer) as a result."""
+    desc = d.get("description")
+    raw = (" ".join(str(desc.get(k) or "") for k in ("company", "role"))
+           if isinstance(desc, dict) else str(desc or ""))
+    txt = clean(raw)
+    # workLocations is the posting's whole list, and the board listing's single
+    # `workLocation` is one row of it; read both, labels or plain strings, so a remote
+    # entry is never dropped the way Ashby's secondaryLocations once were.
+    places = list(d.get("workLocations") or []) + [d.get("workLocation")]
+    locs = []
+    for L in places:
+        s = L if isinstance(L, str) else (
+            (L.get("label") or L.get("name") or L.get("id")) if isinstance(L, dict) else None)
+        if isinstance(s, str) and s.strip():
+            locs.append(s.strip())
+    locs = list(dict.fromkeys(locs))
+    r_pay, r_summary, has_band = rippling_pay(d.get("payRangeDetails"), locs)
+    return dict(ats="rippling", live=True, title=d.get("name"), org=slug,
+                company=(stated_employer(d, "companyName")
+                         or stated_employer(d, "board", "companyName")),
+                location=" | ".join(locs) or None, jd=txt,
+                pay=prefer_structured(pays(txt), r_pay, has_band),
+                comp_summary=r_summary, remote_txt=says_remote(*locs), **extra)
+
+
+def gem_record(d, board, gql=None, **extra):
+    """One Gem posting (the REST job_posts record) as a result; `gql` is the GraphQL posting.
+
+    Locations: the REST `location.name` is one place ("New York, United States") while
+    `offices[]` lists every one ("Los Angeles, CA" among six on Nominal's evals req), the
+    Greenhouse shape again, so offices are read and come FIRST, being the spelling the
+    location gate reads best. A place already named by city is not repeated. Remote lives
+    in `location_type` ("remote", beside "hybrid" and "in_office") and, per location, in
+    GraphQL `isRemote`; either adds a Remote entry the gate can see.
+
+    Pay: GraphQL `compensationHtml` is the posting's stated band and outranks the body.
+    One figure there is the band; several are kept in the summary and not merged.
+    """
+    gql = gql if isinstance(gql, dict) else {}
+    txt = clean(d.get("content") or d.get("content_plain") or "")
+    names = []
+    for o in d.get("offices") or []:
+        if isinstance(o, dict):
+            names.append(o.get("name") or (o.get("location") or {}).get("name"))
+    gql_locs = [l for l in (gql.get("locations") or []) if isinstance(l, dict)]
+    names += [l.get("name") for l in gql_locs]
+    names.append((d.get("location") or {}).get("name"))
+    locs, seen = [], set()
+    for n in names:
+        if not isinstance(n, str) or not n.strip():
+            continue
+        city = n.split(",")[0].strip().lower()
+        if city not in seen:
+            seen.add(city)
+            locs.append(n.strip())
+    ltype = str(d.get("location_type") or (gql.get("job") or {}).get("locationType")
+                or "").strip().lower() or None
+    remote = ltype == "remote" or any(l.get("isRemote") is True for l in gql_locs)
+    if remote and not says_remote(*locs):
+        locs.append("Remote")
+    comp = clean(gql.get("compensationHtml") or "")
+    figs = pays(comp)
+    pay = figs if len(figs) == 1 else ([] if figs else pays(txt))
+    return dict(ats="gem", live=True, title=d.get("title"), org=board,
+                location=" | ".join(locs) or None, jd=txt, pay=pay,
+                comp_summary=comp or None, workplace=ltype,
+                req_id=d.get("requisition_id") or None,
+                remote_txt=remote or says_remote(*locs), **extra)
 
 
 def ashby_from_page(page_html, org, jid):
@@ -872,17 +1496,139 @@ def ashby_from_page(page_html, org, jid):
     locs = [l for l in dict.fromkeys(locs) if l]
     txt = clean(p.get("descriptionHtml") or p.get("descriptionPlain") or "")
     # The scrapeable summary is the plainer of the two: "$200K - $260K" against
-    # "$200K <en-dash> $260K <bullet> Offers Equity". Both are kept verbatim in
-    # comp_summary and
-    # expanded through k_band() for `pay`, because the JD frequently states no band at all.
-    comp = (p.get("scrapeableCompensationSalarySummary")
-            or p.get("compensationTierSummary") or "")
+    # "$200K <en-dash> $260K <bullet> Offers Equity". The plainer is read through
+    # ashby_summary_pay() for `pay`, because the JD frequently states no band at all; the
+    # tier summary is what comp_summary keeps (see ashby_summaries()). The page has no
+    # structured components, so the summary's own currency and interval words are the
+    # only discipline available.
+    comp, summary = ashby_summaries(p)
     work = str(p.get("workplaceType") or "")
     return dict(ats="ashby", live=True, title=p.get("title"), org=org,
+                company=stated_employer(data, "organization", "name"),
                 location=" | ".join(locs), jd=txt,
-                pay=pays(txt) or pays(k_band(comp)), comp_summary=comp or None,
+                # A summary carrying figures is a structured band; "Offers Equity" alone is not.
+                pay=prefer_structured(pays(txt), ashby_summary_pay(comp), bool(_band_figures(comp))),
+                comp_summary=summary,
                 embedded=True, listed=bool(p.get("isListed", True)),
                 remote_txt=says_remote(work, *locs))
+
+
+# A metadata field that states SALARY, by its name or its own words. A bonus, a budget or a
+# relocation figure carries a dollar amount too, and is not a band.
+_META_SALARY = re.compile(r"\b(?:salary|salaries|pay|compensation|wages?|location range|hiring range)\b", re.I)
+
+
+def greenhouse_meta_pay(meta, loc):
+    """(pay, comp_summary) from Greenhouse custom fields, for a body that states no band.
+
+    Riot publishes its band only as metadata: "Location Range 1" = "(Los Angeles Only)
+    Base salary range between $229,200.00 - $319,500.00 USD + incentive compensation +
+    equity", so every Riot req reached eval-prep as no band (2026-10-19). Only fields that
+    say salary count (Codex: a bonus or budget field would otherwise BE the band). Several
+    ranges are never merged, because eval-prep spans every figure it is given and a span
+    across two locations describes no one's offer: one range is taken when it is the only
+    one or the only one naming a place in this posting's location; otherwise the fields
+    go to comp_summary for a human and `pay` stays empty. The field NAME is kept in the
+    summary, since a location qualifier may live only there.
+    """
+    fields = [(k, v) for k, v in meta.items() if pays(v) and (_META_SALARY.search(k) or _META_SALARY.search(v))]
+    if not fields:
+        return [], None
+    # One field can hold several ranges ("Los Angeles $150K - $180K; New York $200K -
+    # $250K"), so the unit of choice is a SEGMENT, never a field: choosing a field and taking
+    # all of its figures merged the two (Codex round 2).
+    # Segments end at ; | and newlines, and at a comma that opens another labelled band
+    # ("Los Angeles $150K - $180K, New York $200K - $250K", round 3).
+    segs = [(k, s.strip()) for k, v in fields
+            # A comma ends a band only when it comes right after one (a figure, a K or a
+            # USD), so the comma inside "Los Angeles, CA: $X" no longer splits the place
+            # from its band (round 5).
+            for s in re.split(r"[;|\n]|(?:(?<=\d)|(?<=[Kk])|(?<=USD)),(?=\s*[A-Za-z(])", v) if pays(s)]
+    summary = "; ".join(f"{k}: {v}" for k, v in fields)
+    # Never merge: a segment that still carries two figures is not one band.
+    segs = [(k, s) for k, s in segs if len(pays(s)) == 1]
+    # A band is this posting's only when its own text names the posting's CITY, as whole
+    # words. Four rounds of review each broke the cleverer version (substrings let "York,
+    # PA" claim New York; state equivalence let "(San Francisco, CA)" claim a Los Angeles
+    # posting; aliases like NYC and SF never resolved), so states, codes and aliases no
+    # longer count at all. What this misses ("California: $X" for Los Angeles) is left
+    # unread for a person, which is the safe direction: a missing band is judged on
+    # evidence, a wrong one is believed.
+    # The match is a place phrase EQUAL to the city's words: containment let "York" claim
+    # "New York" even as whole words.
+    cities = {frozenset(re.findall(r"[a-z][a-z'-]*", c)) for c in _posting_cities(loc)}
+    quals = [(k, s, _qualifier(k, s)) for k, s in segs]
+    here = [(k, s) for k, s, q in quals if any(ph in cities for ph in q)]
+    if len(here) == 1:
+        k, s = here[0]
+        return pays(s), f"{k}: {s}"
+    # A lone segment counts only if it names no place at all: "Salary London" or "(Seattle
+    # Only)" on a posting elsewhere is somebody else's band.
+    if not here and len(quals) == 1 and not quals[0][2]:
+        k, s, _ = quals[0]
+        return pays(s), f"{k}: {s}"
+    return [], summary
+
+
+# Words that describe a pay field rather than name a place. Anything else capitalised in a
+# pay segment, or left in a field's name, is read as a place qualifier.
+_PAY_VOCAB = {
+    "salary", "salaries", "pay", "range", "ranges", "location", "base", "compensation", "annual",
+    "annually", "us", "usd", "hiring", "band", "transparency", "the", "for", "and", "of", "in",
+    "only", "between", "plus", "per", "year", "yearly", "hour", "hourly", "target", "total",
+    "cash", "incentive", "equity", "bonus", "benefits", "this", "role", "position", "is",
+    "expected", "starting", "minimum", "maximum", "min", "max", "to", "a", "an", "at", "with",
+    "offers", "eligible", "level", "tier", "zone", "geo", "geographic", "market",
+    "estimated", "estimate", "approximately", "approx", "around", "about", "up", "from",
+    "range's", "ranges", "posted", "starting", "typical", "typically", "will", "be", "are",
+}
+_PLACEISH = {"remote", "hybrid", "onsite", "on-site", "united", "states", "usa"}
+
+
+def _posting_cities(loc):
+    """The city of each location option a posting names, lowercase: the first comma piece
+    of every "|" option, less the words that are not places ("Remote", "United States")."""
+    out = []
+    for opt in (loc or "").split("|"):
+        c = re.sub(r"\s+", " ", opt.split(",")[0]).strip().lower()
+        if c and c not in _PLACEISH and c not in ("united states", "us", "usa", "remote"):
+            out.append(c)
+    return out
+
+
+def _qualifier(field, segment):
+    """The places a pay field or segment names for itself, as a list of word sets (phrases).
+
+    Read only from the places a qualifier is written, never from capitalisation, which
+    made "Estimated" a place and missed a lowercase "seattle:" (round 3): the field's name,
+    a parenthesised note ("(Los Angeles Only)"), a label ending in a colon just before the
+    figure ("New York: $200,000"), and a "for X" / "in X" just after it. Less pay
+    vocabulary. An empty list means the band names no place, so it is unqualified.
+    """
+    word = r"[A-Za-z][A-Za-z'-]*"
+    parts = [field]
+    parts += [m.group(1) for m in re.finditer(r"\(\s*([^)]*?)\s*\)", segment)]
+    # The words leading a segment up to its first figure: "New York: $200,000",
+    # "Los Angeles $150,000 - ...", "Estimated $180,000" (vocabulary, so no place).
+    lead = re.match(r"\s*([A-Za-z][A-Za-z .,'-]{0,40}?)\s*:?\s*(?=\$|\d)", segment)
+    if lead:
+        parts.append(lead.group(1))
+    for m in PAY.finditer(segment):
+        t = re.match(r"\s*(?:USD\s*)?(?:for|in)\s+((?:[A-Za-z][A-Za-z'-]*\s?){1,4})", segment[m.end():], re.I)
+        if t:
+            parts.append(t.group(1))
+    # Returned as PHRASES, one per place named: "California and New York" names two
+    # places and either can be this posting's, while "New York" is one place whose words
+    # must all match (round 4: a flat word set rejected the first and could not tell the
+    # second from "York, PA").
+    phrases = []
+    for p in parts:
+        for chunk in re.split(r",|/|&|\band\b|\bor\b", p, flags=re.I):
+            ws = {w.lower() for w in re.findall(word, chunk)}
+            ws = {w for w in ws if w not in _PAY_VOCAB and w not in _PLACEISH and len(w) > 1}
+            if ws:
+                phrases.append(frozenset(ws))
+    return phrases
 
 
 def greenhouse_record(d, board, **extra):
@@ -933,10 +1679,18 @@ def greenhouse_record(d, board, **extra):
     remote_meta = meta.get("careers page remote eligible", "")
     if remote_meta.strip().lower() in ("yes", "true"):
         loc = (loc + " | Remote").strip(" |")
+    # The body's band wins when the body LABELS it as pay. An unlabelled body figure ("our
+    # annual budget is $500,000") is weaker evidence than a custom field that says salary,
+    # and taking it whenever it existed hid the field's real band (Codex round 2).
+    hits = pay_hits(txt)
+    meta_pay, meta_summary = ([], None) if any(lab for _, lab in hits) else greenhouse_meta_pay(meta, loc)
+    body_pay = list(dict.fromkeys(f for f, _ in hits))[:3]
     return dict(ats="greenhouse", live=True, title=d.get("title"),
                 location=loc, jd=txt, offices=offices, org=board,
+                company=stated_employer(d, "company_name"),
                 remote_eligible=remote_meta or None,
-                pay=pays(txt),
+                pay=meta_pay or body_pay,
+                comp_summary=meta_summary,
                 remote_txt=(remote_meta.strip().lower() in ("yes", "true")
                             if remote_meta else
                             says_remote(txt)),
@@ -963,8 +1717,15 @@ def workday_record(info, **extra):
 
 
 def cxs_base(tenant, wd, site):
-    """The CXS API root for one Workday (tenant, data centre, site)."""
-    return f"https://{tenant}.{wd}.myworkdayjobs.com/wday/cxs/{tenant}/{site}"
+    """The CXS API root for one Workday (tenant, data centre, site).
+
+    `tenant` is the HOSTNAME label. A hostname cannot carry an underscore, so Workday
+    writes a tenant's underscores as hyphens there, while the CXS path wants the tenant's
+    real name: A10 Networks is host `osv-a10networks` and tenant `osv_a10networks`, and
+    the hyphenated path answers HTTP 422 for every request (2026-10-28), which read as
+    "not retrievable" for the whole tenant.
+    """
+    return f"https://{tenant}.{wd}.myworkdayjobs.com/wday/cxs/{tenant.replace('-', '_')}/{site}"
 
 
 def cxs_record(st, body, what, **extra):
@@ -1026,7 +1787,7 @@ def workday_search(base, rid, send=None):
     # clean absence and close the row.
     if not rid or canon_req(workday_req("_" + rid) or "") != want:
         return None, False
-    seen, total = 0, None
+    seen, total, blind = 0, None, False
     for page in range(WD_SEARCH_PAGES):
         st, body = send(base + "/jobs",
                         {"appliedFacets": {}, "limit": WD_SEARCH_LIMIT,
@@ -1038,7 +1799,13 @@ def workday_search(base, rid, send=None):
             return None, False
         posts = d.get("jobPostings") or []
         for p in posts:
-            ep = (p.get("externalPath") or "").lstrip("/")
+            ep = (p.get("externalPath") or "").lstrip("/") if isinstance(p, dict) else ""
+            if not ep:
+                # A result served with no path could be THIS requisition (NVIDIA serves a
+                # few that way transiently). It counts toward `total`, so letting it pass
+                # as a non-match made an unread entry part of a clean absence.
+                blind = True
+                continue
             got = workday_req(ep)
             if got and canon_req(got) == want:
                 return ep, True
@@ -1046,12 +1813,12 @@ def workday_search(base, rid, send=None):
         if page == 0:
             total = d.get("total") if isinstance(d.get("total"), int) else None
         if total is not None and seen >= total:
-            return None, True
+            return None, not blind
         if len(posts) < WD_SEARCH_LIMIT:
             # The stream ended. With no total that is the end of the results; short of a
             # stated total, the two halves of one response disagree, and a disagreement is
             # not an absence.
-            return None, total is None
+            return None, total is None and not blind
     return None, False
 
 
@@ -1705,7 +2472,27 @@ def resolve(url):
     if gh:
         return gh
 
-    m = re.search(OUTER_HOST + r"jobs\.ashbyhq\.com/([\w-]+)/([0-9a-f-]{16,})", ou)
+    # A company-hosted front end over a portals.yml Ashby board, carrying the posting uuid
+    # in its path. The uuid is READ from the company's path, not declared by Ashby, so this
+    # route may report the posting it finds and never an absence: a front end that minted
+    # its own uuid would otherwise retire every live row on the board.
+    org = portal_ashby(ou)
+    # Matched against the PATH alone: the host is portal_ashby()'s question, already asked.
+    am = re.search(r"/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?=/|$)",
+                   urllib.parse.urlsplit(ou if "://" in ou else "https://" + ou).path)
+    if org and am and not re.match(OUTER_HOST + r"jobs\.ashbyhq\.com/", ou):
+        got = resolve(f"https://jobs.ashbyhq.com/{org}/{am.group(1)}")
+        if got and got.get("live") is True:
+            return dict(got, via=f"portals.yml Ashby board {org}")
+        return dict(ats="ashby", live=None, org=org,
+                    note=f"company front end over the Ashby board {org}; the id is read from "
+                         f"the company's path, not declared by Ashby, so its absence from the "
+                         f"board closes nothing; liveness is unknown")
+
+    # An Ashby org slug may carry a DOT (kraken.com, magic.dev); `[\w-]+` routed none of
+    # them, so every such posting fell through to an unread "unknown" (2026-10-27).
+    # inbox-liveness.py already spelled it `[\w.-]+`.
+    m = re.search(OUTER_HOST + r"jobs\.ashbyhq\.com/([\w.-]+)/([0-9a-f-]{16,})", ou)
     if m:
         org, jid = m.group(1), m.group(2)
         st, d = board_fetch(f"https://api.ashbyhq.com/posting-api/job-board/{org}?includeCompensation=true",
@@ -1726,8 +2513,21 @@ def resolve(url):
                         (sl or {}).get("location", "")
                         for sl in (j.get("secondaryLocations") or [])]
                     locs = [l for l in dict.fromkeys(locs) if l]
+                    # includeCompensation=true was requested and never read; the band
+                    # often lives only there. When it exists it is the authority; see
+                    # prefer_structured().
+                    jc = j.get("compensation") or {}
+                    a_pay, a_summary = ashby_pay(jc)
+                    has_band = isinstance(jc, dict) and (
+                        any(isinstance(c, dict) and c.get("compensationType") == "Salary"
+                            and (c.get("minValue") or c.get("maxValue"))
+                            for c in jc.get("summaryComponents") or [])
+                        or bool(_band_figures(jc.get("scrapeableCompensationSalarySummary")
+                                              or jc.get("compensationTierSummary") or "")))
                     return dict(ats="ashby", live=True, title=j.get("title"),
-                                location=" | ".join(locs), pay=pays(txt), jd=txt,
+                                location=" | ".join(locs),
+                                pay=prefer_structured(pays(txt), a_pay, has_band),
+                                comp_summary=a_summary, jd=txt,
                                 org=org, remote_txt=bool(j.get("isRemote")))
             # AN EMPTY BOARD CLOSES NOTHING. `{"jobs": []}`
             # parses, so `need=("jobs",)` is satisfied and the loop above simply finds
@@ -1754,7 +2554,7 @@ def resolve(url):
                 # rather than as missing evidence.
                 return dict(ats="ashby", live=True, title=r.get("title"), org=org,
                             location=r.get("location") or None, jd="",
-                            pay=pays(k_band(r.get("comp") or "")), embedded=True, status=st,
+                            pay=ashby_summary_pay(r.get("comp")), embedded=True, status=st,
                             comp_summary=r.get("comp") or None,
                             note="read from the embedded board; the listing carries no JD",
                             remote_txt=says_remote(r.get("workplace"), r.get("location")))
@@ -1769,7 +2569,7 @@ def resolve(url):
             d = jload(body, need=("text",))
             if d is UNREADABLE:
                 return unreadable("lever", st, "the postings API response")
-            txt = clean(d.get("descriptionPlain") or d.get("description") or "")
+            txt = lever_body(d)
             # Lever keeps the remote option in categories.allLocations while
             # categories.location shows only ONE of them, and they disagree. Waabi's
             # "Simulation Assets & Content Systems" req reads "Toronto, ON" as its
@@ -1780,13 +2580,64 @@ def resolve(url):
             cats = d.get("categories") or {}
             locs = [cats.get("location", "")] + list(cats.get("allLocations") or [])
             locs = [l for l in dict.fromkeys(locs) if l]
+            # The band often lives ONLY in the structured salaryRange, never in the body.
+            # When it exists it is the authority; see prefer_structured().
+            sr = d.get("salaryRange")
+            sr_pay, sr_summary = lever_pay(sr)
+            has_sr = isinstance(sr, dict) and any(sr.get(k) not in (None, "") for k in ("min", "max"))
             return dict(ats="lever", live=True, title=d.get("text"), org=m.group(1),
                         location=" | ".join(locs),
-                        pay=pays(txt), jd=txt,
+                        pay=prefer_structured(pays(txt), sr_pay, has_sr),
+                        comp_summary=sr_summary, jd=txt,
                         workplace=d.get("workplaceType"),
                         remote_txt=says_remote(*locs, txt))
         return dict(ats="lever", live=unresolved(st), status=st,
                     note=gone_note(st))
+
+    # Rippling. The posting page is a Next.js render of the same record the public
+    # job-board API serves, so the API is read and the page never is. `uuid` is the
+    # posting's own field and is checked against the url's, because finding a posting is
+    # not finding THIS posting.
+    m = RIPPLING_URL.search(ou)
+    if m:
+        slug, uuid = m.group(1), m.group(2).lower()
+        st, body = fetch(f"{RIPPLING_API}/{slug}/jobs/{uuid}")
+        if st == 200 and body:
+            d = jload(body, need=("uuid", "name"))
+            if d is UNREADABLE:
+                return unreadable("rippling", st, "the job-board API response")
+            if str(d.get("uuid")).lower() != uuid:
+                return unreadable("rippling", st, "a record for a different posting uuid")
+            return rippling_record(d, slug, status=st)
+        return confirmed_absence("rippling", st, f"{RIPPLING_API}/{slug}/jobs",
+                                 lambda j: str(j.get("uuid") or "").lower(), uuid, org=slug)
+
+    # Gem. REST for the posting (liveness, title, JD, offices), GraphQL for the band only;
+    # see GEM_GQL. A GraphQL failure costs the band and the remote flags, never the verdict.
+    m = GEM_URL.search(ou)
+    if m:
+        board, pid = m.group(1), m.group(2)
+        st, body = fetch(f"{GEM_API}/{board}/job_posts/{pid}")
+        if st == 200 and body:
+            d = jload(body, need=("id", "title"))
+            if d is UNREADABLE:
+                return unreadable("gem", st, "the job-board API response")
+            if str(d.get("id")) != pid:
+                return unreadable("gem", st, "a record for a different posting id")
+            gst, body2 = post(GEM_GQL, {"operationName": "ExternalJobPosting",
+                                        "query": GEM_GQL_QUERY,
+                                        "variables": {"boardId": board, "extId": pid}})
+            g = (jload(body2, need=("data.oatsExternalJobPosting.extId",))
+                 if gst == 200 and body2 else UNREADABLE)
+            gp = None if g is UNREADABLE else g["data"]["oatsExternalJobPosting"]
+            if gp is not None and gp.get("extId") != pid:
+                gp = None
+            return gem_record(d, board, gp, status=st)
+        # base64 padding is not identity: the URL pattern admits no "=", so a listing id
+        # written padded must still match it. Case is kept (Codex, 2026-10-29).
+        return confirmed_absence("gem", st, f"{GEM_API}/{board}/job_posts/",
+                                 lambda j: str(j.get("id") or "").rstrip("="), pid.rstrip("="),
+                                 org=board)
 
     # The locale used to be a LENGTH test, `(?:[\w-]{2,5}/)?`, and CLAUDE.md already
     # records why that is wrong in the other direction: Autodesk's Workday site is
@@ -1828,6 +2679,11 @@ def resolve(url):
             if searched:
                 return dict(ats="workday", live=False, status=403,
                             note="slug stale and req absent from tenant search = closed")
+            if not workday_req(path.split("?")[0]):
+                return dict(ats="workday", live=None, status=403,
+                            note="slug stale and no requisition id could be read from the "
+                                 "path, so there was nothing to search for; liveness "
+                                 "unknown, not closed")
             return dict(ats="workday", live=None, status=403,
                         note="slug stale and the tenant search was unreadable, so nothing "
                              "was checked; liveness unknown, not closed")
@@ -1906,7 +2762,7 @@ def resolve(url):
             parts = [loc.get("city"), loc.get("region"), loc.get("country")]
             txt = clean(json.dumps(d.get("jobAd", {})))
             return dict(ats="smartrecruiters", live=True, title=d.get("name"),
-                        org=company,
+                        org=company, company=stated_employer(d, "company", "name"),
                         location=", ".join([p for p in parts if p]), jd=txt, pay=pays(txt),
                         remote_txt=bool(loc.get("remote")) or
                                    says_remote(txt))
@@ -1942,6 +2798,10 @@ def resolve(url):
         if st in GONE:
             return dict(ats="apple", live=False, status=st,
                         note=f"detail page gone (HTTP {st}) = closed")
+        rs = apple_route_status(body) if st == 200 else None
+        if rs in GONE:
+            return dict(ats="apple", live=False, status=st,
+                        note=f"detail page's own router reports jobDetails {rs} = closed")
         return dict(ats="apple", live=None, status=st,
                     note="page fetched but no jobsData block; Apple may have changed the "
                          "embed, re-check the parser before trusting a verdict")
@@ -2267,6 +3127,14 @@ ROUTE_CASES = [
     # An Ashby org whose posting API is switched off. It must still route to ashby, since
     # the fallback that reads the board page lives inside that branch.
     ("https://jobs.ashbyhq.com/whatnot/e8760e88-1ecc-0bb9-564e-a726f5e7f568", "ashby"),
+    # An org slug with a dot. `[\w-]+` could not route it (2026-10-27, from LinkedIn).
+    ("https://jobs.ashbyhq.com/kraken.com/244da78f-b1fa-a1d2-6ece-a94612923f86", "ashby"),
+    # Rippling and Gem answered "no API for this host" until 2026-10-29. Both have public
+    # job-board APIs; Gem's ids are base64url on newer boards and uuids on older ones.
+    ("https://ats.rippling.com/cerby/jobs/a2acbe6f-e43e-c9c2-1aef-4c03864e893f", "rippling"),
+    ("https://ats.rippling.com/en-US/cerby/jobs/a2acbe6f-e43e-c9c2-1aef-4c03864e893f", "rippling"),
+    ("https://jobs.gem.com/nominal/am9icG9zdDp7LtWwyt-ZLX3N-M7SHGRV", "gem"),
+    ("https://jobs.gem.com/nominal/37c9854b-f1ea-4da6-a3f5-51e64923ae08", "gem"),
 ]
 
 # A miniature Ashby detail page. The real one is 52KB; what matters is the shape:
@@ -2676,6 +3544,25 @@ def behaviour_cases():
     # K-notation it reads downstream as "no band posted" for a posting that states one.
     check(bool(got) and got.get("pay") == ["$200,000 - $260,000"],
           f"K-notation band did not reach pay: {(got or {}).get('pay')}")
+    # At the CALL SITE, not only in the shared reader: a Canadian band on the page used to
+    # reach pay as US dollars, because k_band() reads any `$`.
+    got = ashby_from_page(_ASHBY_PAGE.replace("$200K - $260K", "CA$138K - CA$189K"),
+                          "whatnot", "e8760e88-1ecc-0bb9-564e-a726f5e7f568")
+    check(bool(got) and got.get("pay") == [] and "CA$" in (got.get("comp_summary") or ""),
+          f"a CAD band on the page must stay out of pay: {(got or {}).get('pay')}")
+    # With BOTH summaries on the page, pay comes from the plainer one and comp_summary
+    # keeps the tier one, the only one that says "Offers Equity". The API path already
+    # did this; the page path kept the plainer text, and eval-prep reads comp_summary
+    # for the basis, so a sub-floor hourly band read as total (Codex P1, PR 14).
+    got = ashby_from_page(_ASHBY_PAGE.replace(
+        '"scrapeableCompensationSalarySummary":"$200K - $260K"',
+        '"scrapeableCompensationSalarySummary":"$45 - $60 per hour",'
+        '"compensationTierSummary":"$45 \u2013 $60 per hour \u2022 Offers Equity"'),
+        "whatnot", "e8760e88-1ecc-0bb9-564e-a726f5e7f568")
+    check(bool(got) and "Offers Equity" in (got.get("comp_summary") or "")
+          and got.get("pay") == ["$45 - $60 per hour"],
+          f"the page path must keep the tier summary: {(got or {}).get('comp_summary')!r} "
+          f"/ {(got or {}).get('pay')}")
     check(k_band("$200K \u2013 $260K \u2022 Offers Equity")
           == "$200,000 \u2013 $260,000 \u2022 Offers Equity",
           "the en-dash summary form must expand too")
@@ -2685,6 +3572,196 @@ def behaviour_cases():
           "a full-dollar band must pass through untouched")
     check(k_band("$39.54 - $73.16 an hour") == "$39.54 - $73.16 an hour",
           "an hourly rate must pass through untouched")
+    # A body that states a second, foreign-currency band keeps only the US one.
+    got = pays("USD Salary Range: $160,000 - $210,000 CAD Salary Range: C$225,000 - C$285,000")
+    check(got == ["$160,000 - $210,000"], f"a C$ band must not read as US dollars: {got}")
+    check(pays("CA$138,000 - CA$189,000 or A$150,000") == [],
+          "CA$ and A$ figures are not US dollars")
+    # A Canadian headline band with US bands only in the per-location tiers (Cohere).
+    def _tier(title, lo, hi, cur):
+        return {"title": title, "tierSummary": f"Base Salary {cur} {lo}-{hi}", "components": [
+            {"compensationType": "EquityPercentage"},
+            {"compensationType": "Salary", "minValue": lo, "maxValue": hi,
+             "currencyCode": cur, "interval": "1 YEAR"}]}
+    _coh = {"compensationTierSummary": "CA$250K – CA$535K • Offers Equity • Multiple Ranges",
+            "summaryComponents": [{"compensationType": "Salary", "minValue": 250000,
+                                   "maxValue": 535000, "currencyCode": "CAD", "interval": "1 YEAR"}],
+            "compensationTiers": [_tier("Canada", 250000, 460000, "CAD"),
+                                  _tier("USA - California, New York and Washington", 205000, 380000, "USD"),
+                                  _tier("USA - All Other States", 175000, 325000, "USD")]}
+    got, lab = ashby_us_tier(_coh, home="California")
+    check(len(got) == 1 and "205,000" in got[0] and "380,000" in got[0] and "California" in lab,
+          f"the home-state US tier must win: {got} / {lab}")
+    got, _ = ashby_us_tier(_coh, home="Texas")
+    check(len(got) == 2, f"with no named tier every US tier speaks, never a CAD one: {got}")
+    _geo = {"compensationTiers": [_tier("Canada - California team", 300000, 400000, "USD"),
+                                  _tier("USA - California", 205000, 380000, "USD")]}
+    got, _ = ashby_us_tier(_geo, home="California")
+    check(got and "205,000" in got[0], f"a US-named tier beats a USD one abroad: {got}")
+    _eq = {"compensationTiers": [{"title": "USA", "tierSummary": "", "components": [
+        {"compensationType": "Salary", "minValue": 45, "maxValue": 60, "currencyCode": "USD",
+         "interval": "1 HOUR"}, {"compensationType": "EquityPercentage"}]}]}
+    _, lab = ashby_us_tier(_eq, home="California")
+    check("equity" in (lab or "").lower(), f"tier-component equity must reach the label: {lab}")
+    got, summ = ashby_pay(_coh)
+    check(got and all("CA" not in g for g in got) and "Offers Equity" in (summ or ""),
+          f"ashby_pay must fall through to the US tiers and keep the equity words: {got} / {summ}")
+    # An amount is five DIGITS: a stipend is not pay, and must not outrank the ATS band.
+    check(pays("a $2,000 learning stipend and a $500 wellness stipend") == [],
+          "a four-digit figure is not a pay band")
+    got = prefer_structured(pays("$2,000 learning stipend"), ["$200,000 - $350,000"], True)
+    check(got == ["$200,000 - $350,000"], f"a stipend must not outrank the structured band: {got}")
+    got = pays("Base salary range between $229,200.00 - $319,500.00 USD")
+    check(got == ["$229,200.00 - $319,500.00"], f"a band written with cents is one band: {got}")
+    check(pays("USA, CA, Santa Monica - 154,200.00 - 208,600.00 USD annually")
+          == ["154,200.00 - 208,600.00 USD"], "Amazon's currency-after-the-range band is pay")
+    check(pays("Total compensation: 35,000 - 40,000 USD per month") == []
+          and pays("Salary 35,000 - 40,000 USD monthly") == [],
+          "a currency-after range that names a month is not an annual band")
+    check(pays("$1,250,000") == ["$1,250,000"] and pays("$185000 - $240000") == ["$185000 - $240000"],
+          "a seven-figure amount and an uncommaed band still read")
+    # A figure that states its own non-pay purpose is not pay, on either side of it...
+    for txt in ("a $10,000 signing bonus", "$50,000 relocation package", "a $1,250,000 equity grant",
+                "We raised $80,000,000 in 2025", "sign-on bonus of $25,000", "up to $15,000 in tuition",
+                "Relocation: $40,000"):
+        check(pays(txt) == [], f"a non-salary figure must not read as pay: {txt!r} -> {pays(txt)}")
+    # ...and nothing beside a band takes the band with it.
+    for txt, want in (("Base salary $150,000 - $200,000 plus bonus and equity", ["$150,000 - $200,000"]),
+                      ("$180,000 - $245,000 + equity + benefits", ["$180,000 - $245,000"]),
+                      ("A $20,000 signing bonus. Salary: $195,000 - $250,000.", ["$195,000 - $250,000"]),
+                      ("Pay range $160,000 - $210,000 USD; eligible for annual bonus", ["$160,000 - $210,000"])):
+        got = pays(txt)
+        check(got == want, f"a band beside other money must survive alone: {txt!r} -> {got}")
+    got = prefer_structured(pays("$10,000 signing bonus"), ["$200,000 - $350,000"], True)
+    check(got == ["$200,000 - $350,000"], f"a signing bonus must not outrank the structured band: {got}")
+    # Round 2 (Codex): a LABELLED band survives whatever the next paragraph says, and a
+    # purpose reached through several linking words still disqualifies.
+    for txt in ("<p>Salary $180,000 - $220,000</p><p>Stock grants vest annually.</p>",
+                "Salary $180,000 - $220,000 grant-funded position",
+                "Salary $180,000 - $220,000. Referral program available.",
+                "Salary $180,000 - $220,000 RSUs also provided"):
+        got = pays(clean(txt))
+        check(got == ["$180,000 - $220,000"], f"a labelled band must survive what follows it: {txt!r} -> {got}")
+    # A salary word nearby does not rescue a figure whose own purpose sits against it.
+    for txt in ("Compensation includes a $20,000 signing bonus",
+                "pay transparency: we offer a $5,000,000 equity pool",
+                "base of operations $100,000 grant", "A $185,000 RSU grant"):
+        check(pays(txt) == [], f"a label must not rescue a purpose figure: {txt!r} -> {pays(txt)}")
+    # ...while labelled figures with no purpose of their own stay pay, and the label is reported.
+    for txt, want in (("Salary $185,000 (plus signing bonus)", ["$185,000"]),
+                      ("Total target cash $250,000 including bonus", ["$250,000"]),
+                      ("monthly stipend of $500. Base salary $195,000", ["$195,000"])):
+        check(pays(txt) == want, f"a labelled figure must stay pay: {txt!r} -> {pays(txt)}")
+    check(pay_hits("Base salary $150,000 - $200,000") == [("$150,000 - $200,000", True)]
+          and pay_hits("Up to $150,000 - $200,000") == [("$150,000 - $200,000", False)],
+          "pay_hits must report whether a salary word labels the figure")
+    for txt in ("Our annual budget is $500,000", "A signing bonus of up to $50,000",
+                "Relocation assistance of about $40,000"):
+        check(pays(txt) == [], f"a purpose through linking words must disqualify: {txt!r} -> {pays(txt)}")
+    # One field, two ranges: the segment naming this posting's place, never a merged span.
+    got = greenhouse_meta_pay({"salary": "Los Angeles $150,000 - $180,000; New York $200,000 - $250,000"},
+                              "Los Angeles, CA")
+    check(got[0] == ["$150,000 - $180,000"], f"the segment naming this place must win: {got}")
+    got = greenhouse_meta_pay({"salary": "Los Angeles $150,000 - $180,000; New York $200,000 - $250,000"},
+                              "Remote")
+    check(got[0] == [], f"two segments with no way to choose stay unread: {got}")
+    # A lone band that names ANOTHER place is that place's band.
+    for meta in ({"salary london": "$150,000 - $180,000"},
+                 {"location range 1": "(Seattle Only) Base salary range between $250,000 - $350,000"}):
+        got = greenhouse_meta_pay(meta, "Los Angeles, CA")
+        check(got[0] == [], f"another place's band must not be this posting's: {meta} -> {got}")
+    check(greenhouse_meta_pay({"salary range": "$180,000 - $220,000"}, "Los Angeles, CA")[0]
+          == ["$180,000 - $220,000"], "a lone unqualified salary field is the band")
+    # Real field spellings are read; a band qualified only by a STATE is left for a person,
+    # by design since round 4 (state equivalence let "(San Francisco, CA)" claim LA).
+    for meta, want in (({"pay transparency range": "$180,000 - $220,000"}, ["$180,000 - $220,000"]),
+                       ({"us salary range": "$180,000 - $220,000"}, ["$180,000 - $220,000"]),
+                       ({"salary": "Los Angeles: $180,000 - $220,000; New York: $200,000 - $250,000"},
+                        ["$180,000 - $220,000"]),
+                       ({"salary range (ca)": "$180,000 - $220,000"}, []),
+                       ({"salary": "California: $180,000 - $220,000"}, []),
+                       ({"salary": "San Francisco, CA: $150,000 - $200,000"}, []),
+                       ({"salary": "(San Francisco, CA): $150,000 - $200,000"}, [])):
+        got = greenhouse_meta_pay(meta, "Los Angeles, CA")[0]
+        check(got == want, f"a field is read only for its own city: {meta} -> {got}, want {want}")
+    got = greenhouse_meta_pay({"salary range": "$180,000 - $220,000 for New York"}, "York, PA")[0]
+    check(got == [], f"'York' must not claim New York's band: {got}")
+    # Round 3: a lowercase place is still a place, pay wording is not, and a comma between
+    # two labelled bands is a boundary.
+    rec = greenhouse_record({"title": "x", "content": "The range for this role is $180,000 - $220,000.",
+                             "location": {"name": "Los Angeles, CA"},
+                             "metadata": [{"name": "Salary", "value": "seattle: $300,000 - $400,000"}]}, "acme")
+    check(rec["pay"] == ["$180,000 - $220,000"],
+          f"a lowercase other-place field must not displace the body's labelled band: {rec['pay']}")
+    check(greenhouse_meta_pay({"salary": "Estimated $180,000 - $220,000"}, "Los Angeles, CA")[0]
+          == ["$180,000 - $220,000"], "pay wording must not read as a place")
+    got = greenhouse_meta_pay({"salary": "Los Angeles $150,000 - $180,000, New York $200,000 - $250,000"},
+                              "Los Angeles, CA | New York, NY")
+    check(got[0] == [], f"two places' bands for a two-place posting must stay unread, never merged: {got}")
+    got = greenhouse_meta_pay({"salary": "Los Angeles: $150,000 - $180,000, New York: $200,000 - $250,000"},
+                              "Los Angeles, CA")
+    check(got[0] == ["$150,000 - $180,000"], f"a comma between labelled bands is a boundary: {got}")
+    # The purpose noun after a figure names what the figure IS only if nothing says otherwise.
+    check(pays("Salary $180,000 RSU eligible") == ["$180,000"], "'RSU eligible' is not what the figure is")
+    check(pays("Salary 180,000 USD - 220,000 USD stock grants are additional") == ["180,000 USD - 220,000 USD"],
+          "a labelled USD-suffix range is a range")
+    check(pays("We offer $30,000 - $50,000 signing bonus") == [], "an unlabelled bonus range is not pay")
+    # Round 5: a city and its state stay one qualifier, in or out of parentheses.
+    for v in ("Los Angeles, CA: $150,000 - $200,000", "(Los Angeles, CA: $150,000 - $200,000)",
+              "Los Angeles, CA: $150,000 - $200,000, New York, NY: $200,000 - $250,000"):
+        got = greenhouse_meta_pay({"salary range": v}, "Los Angeles, CA")[0]
+        check(got == ["$150,000 - $200,000"], f"'City, ST: band' must read as that city's band: {v!r} -> {got}")
+    # Round 4: "range" alone is not a pay label, and an exception after a two-word purpose holds.
+    for txt in ("Bonus range: $30,000 - $50,000", "Budget range: $150,000 - $200,000"):
+        check(pays(txt) == [], f"a purpose range must not pass as pay: {txt!r} -> {pays(txt)}")
+    check(pays("$150,000 - $200,000 equity grant available") == ["$150,000 - $200,000"],
+          "'equity grant available' describes the role, not the figure")
+    # Round 4: a qualifier names PLACES, any of which may be this posting's.
+    for v, want in (("Tier 1 (SF, NYC): $180,000 - $220,000", []),
+                    ("California and New York: $150,000 - $200,000", []),
+                    ("Los Angeles and New York: $150,000 - $200,000", ["$150,000 - $200,000"]),
+                    ("US Zone 1: $150,000 - $200,000", ["$150,000 - $200,000"]),
+                    ("Remote (US): $150,000 - $200,000", ["$150,000 - $200,000"]),
+                    ("Zone A: $150,000 - $200,000; Zone B: $130,000 - $170,000", [])):
+        got = greenhouse_meta_pay({"salary range": v}, "Los Angeles, CA")[0]
+        check(got == want, f"place phrases must decide the band: {v!r} -> {got}, want {want}")
+    # An unlabelled body figure does not hide a salary field.
+    rec = greenhouse_record({"title": "x", "content": "Our annual budget is $500,000 for tooling.",
+                             "location": {"name": "Los Angeles, CA"},
+                             "metadata": [{"name": "Location Range 1", "value": "(Los Angeles Only) "
+                                           "Base salary range between $229,200.00 - $319,500.00 USD"}]},
+                            "riotgames")
+    check(rec["pay"] == ["$229,200.00 - $319,500.00"],
+          f"an unlabelled body figure must not hide the salary field: {rec['pay']}")
+    # A band published only as Greenhouse metadata (Riot's "Location Range 1").
+    _gh = {"title": "Staff ML Engineer", "content": "&lt;p&gt;No pay here.&lt;/p&gt;",
+           "location": {"name": "Los Angeles, CA"},
+           "metadata": [{"name": "Craft", "value": "Data"},
+                        {"name": "Location Range 1", "value": "(Los Angeles Only) Base salary "
+                         "range between $229,200.00 - $319,500.00 USD + incentive compensation"}]}
+    rec = greenhouse_record(_gh, "riotgames")
+    check(rec["pay"] == ["$229,200.00 - $319,500.00"] and "Base salary" in (rec["comp_summary"] or ""),
+          f"a metadata band must reach pay and comp_summary: {rec['pay']} / {rec['comp_summary']}")
+    # A bonus field is not a band; two location ranges are never merged into one span; the
+    # range naming this posting's own place wins; a body band leaves metadata out entirely.
+    got = greenhouse_meta_pay({"signing bonus": "$50,000 signing bonus"}, "Los Angeles, CA")
+    check(got == ([], None), f"a bonus field must not become the band: {got}")
+    two = {"location range 1": "(Seattle Only) Base salary range between $250,000.00 - $350,000.00",
+           "location range 2": "(Los Angeles Only) Base salary range between $229,200.00 - $319,500.00"}
+    got = greenhouse_meta_pay(two, "Los Angeles, USA")
+    check(got[0] == ["$229,200.00 - $319,500.00"], f"the range naming this posting's place must win: {got}")
+    got = greenhouse_meta_pay(two, "Remote")
+    check(got[0] == [] and "Seattle" in (got[1] or "") and "Los Angeles" in (got[1] or ""),
+          f"two ranges with no way to choose stay unread, never spanned: {got}")
+    rec = greenhouse_record({**_gh, "content": "Base pay $180,000 - $220,000."}, "riotgames")
+    check(rec["pay"] == ["$180,000 - $220,000"] and rec["comp_summary"] is None,
+          f"a body band keeps metadata out of pay and comp_summary: {rec['pay']} / {rec['comp_summary']}")
+    # ...while every spelling of a US dollar keeps its whole band.
+    for txt in ("US$150,000 - US$200,000", "USD$150,000 - USD$200,000",
+                "from$150,000 - $200,000", "Salary:$150,000 - $200,000"):
+        got = pays(txt)
+        check(len(got) == 1 and "150,000" in got[0] and "200,000" in got[0],
+              f"a US band must survive the foreign mask: {txt!r} -> {got}")
     # A closed posting: 200, still has __appData, no `posting` key.
     check(ashby_from_page(_ASHBY_GONE, "whatnot", "e8760e88") is None,
           "a page with no posting object must yield nothing")
@@ -2717,6 +3794,32 @@ def behaviour_cases():
     # as an empty one: that is the confident negative this whole toolchain designs against.
     r = with_fetch(_ashby_fetch("", ""), f"https://jobs.ashbyhq.com/whatnot/{AID}")
     check(r.get("live") is None, f"two unreadable pages must stay unknown: {r.get('note')}")
+    # The board ROW's summary is pay evidence under the same rules as the detail page: a
+    # yearly USD band reaches pay, a Canadian one does not.
+    # PAY keeps the summary's own en-dash, which eval-prep's MONEY reader is indifferent to.
+    for summary, want in (("$197K – $246K • Offers Equity", ["$197,000 – $246,000"]),
+                          ("CA$138K – CA$189K • Offers Equity", [])):
+        row = ('<script>window.__appData = {"jobBoard":{"jobPostings":[{"id":"' + AID +
+               '","title":"AI Tooling Engineer","locationName":"Remote",'
+               '"compensationTierSummary":' + json.dumps(summary) + '}]}};</script>')
+        r = with_fetch(_ashby_fetch(_ASHBY_GONE, row), f"https://jobs.ashbyhq.com/whatnot/{AID}")
+        check(r.get("live") is True and r.get("embedded") and r.get("pay") == want,
+              f"embedded board row {summary!r}: pay {r.get('pay')}, want {want}")
+
+    # A company front end over a portals.yml Ashby board (elevenlabs.io/careers/<uuid>):
+    # found opens the row, absent from a parsed board closes nothing, because the uuid
+    # was read from the company's path rather than declared by Ashby.
+    _front = [dict(label="Acme", base="Acme", keys={"acme"}, loose={"acme"}, slugs=[],
+                   boards={"whatnot"}, workday=None, ashby=["whatnot"])]
+    FRONT = f"https://careers.acme.com/careers/{AID}/ai-tooling-engineer"
+    with mock.patch.object(sys.modules[__name__], "portals_index", lambda: _front):
+        check(portal_ashby(FRONT) == "whatnot", f"front end maps to its board: {portal_ashby(FRONT)}")
+        r = with_fetch(_ashby_fetch(_ASHBY_PAGE, ""), FRONT)
+        check(r.get("live") is True, f"a front-end uuid found on the board is live: {r.get('note')}")
+        r = with_fetch(_ashby_fetch(_ASHBY_GONE, other), FRONT)
+        check(r.get("live") is None, f"a front-end uuid absent from the board must not close: {r}")
+    check(ASHBY_ORG.findall("careers_url: https://jobs.ashbyhq.com/kraken.com/x") == ["kraken.com"],
+          "a dotted Ashby org in portals.yml must be read whole")
 
     # ── BUG 5: a failure to READ is not a closure, and is not liveness either ──
     # Six branches ended `live=(st != 404)`, so a timeout (0), a 429, a 500 or a WAF 403
@@ -2942,6 +4045,195 @@ def behaviour_cases():
                    "https://jobs.lever.co/magnopus/3f63e800-a195-3071-ffbc-5586041c6472")
     check(r.get("live") is True and r.get("title") == "Staff Agent Engineer",
           f"a well-formed Lever 200 must still resolve: {r.get('live')} / {r.get('title')}")
+
+    # ── Lever salaryRange: the band as DATA, absent from the body ────────────
+    # Arcadia's Principal Agent AI Platform req, field shape as the live postings API
+    # returned it on 2026-10-15: no figure anywhere in the description, the whole band in
+    # salaryRange. The adapter read only the body and reported "no band".
+    LEVER_URL = "https://jobs.lever.co/arcadia/cf126e76-a224-b8e1-96ad-f3e758aba042"
+
+    def _lever(sr, body="Remote (USA). Build the agent platform."):
+        return json.dumps({"text": "Principal Software Engineer - Agent AI Platform",
+                           "descriptionPlain": body, "workplaceType": "remote",
+                           "categories": {"location": "Remote (USA)",
+                                          "allLocations": ["Remote (USA)"]},
+                           "salaryRange": sr})
+    YEAR = {"currency": "USD", "interval": "per-year-salary", "min": 250000, "max": 350000}
+    r = with_fetch(lambda *a, **k: (200, _lever(YEAR)), LEVER_URL)
+    check(r.get("pay") == ["$250,000 - $350,000"],
+          f"Lever salaryRange must reach pay as a yearly band: {r.get('pay')}")
+    check("per-year-salary" in (r.get("comp_summary") or ""),
+          f"the summary must keep the interval: {r.get('comp_summary')!r}")
+    # The body's own figure still wins, as on Ashby: eval-prep reads base-or-total from
+    # the words around a figure the body prints, and a structured string is not in it.
+    r = with_fetch(lambda *a, **k: (200, _lever(YEAR, "Base salary $260,000 - $300,000.")),
+                   LEVER_URL)
+    check(r.get("pay") == ["$260,000 - $300,000"],
+          f"a band printed in the body must still come first: {r.get('pay')}")
+    # ...except when the structured band was REFUSED. Its currency or interval is the
+    # posting's own statement that the figures are not annual USD, and the body's copy of
+    # them is no more annual for being prose (Codex, 2026-10-15; both inputs are its).
+    MONTH = {"currency": "USD", "interval": "per-month-salary", "min": 35000, "max": 40000}
+    r = with_fetch(lambda *a, **k: (200, _lever(MONTH, "Total compensation: $35,000 - $40,000 per month.")),
+                   LEVER_URL)
+    check(r.get("pay") == [], f"a monthly salaryRange must keep a body copy out of pay: {r.get('pay')}")
+    CAD = {"currency": "CAD", "interval": "per-year-salary", "min": 200000, "max": 250000}
+    r = with_fetch(lambda *a, **k: (200, _lever(CAD, "Base salary: CAD $200,000 - $250,000 per year.")),
+                   LEVER_URL)
+    check(r.get("pay") == [], f"a CAD salaryRange must keep a body copy out of pay: {r.get('pay')}")
+    # Hourly is LABELLED, in eval-prep's HOURLY spelling, and never shaped like PAY: $45
+    # read as a yearly figure is a wrong band, which is worse than none against a floor.
+    r = with_fetch(lambda *a, **k: (200, _lever({"currency": "USD", "interval": "per-hour-wage",
+                                                 "min": 45, "max": 60})), LEVER_URL)
+    check(r.get("pay") == ["$45.00 - $60.00 per hour"],
+          f"an hourly salaryRange must be labelled per hour: {r.get('pay')}")
+    check(not any(PAY.search(p) for p in r.get("pay") or []),
+          f"an hourly band must not be readable as a yearly figure: {r.get('pay')}")
+    # Any other interval or currency reaches the summary and never `pay`.
+    for sr, why in (({"currency": "USD", "interval": "per-month-salary",
+                      "min": 35000, "max": 40000}, "a monthly band"),
+                    ({"currency": "CAD", "interval": "per-year-salary",
+                      "min": 200000, "max": 250000}, "a CAD band"),
+                    ({"currency": "USD", "interval": "per-year-salary"}, "a range with no figures"),
+                    (None, "no salaryRange at all")):
+        r = with_fetch(lambda *a, **k: (200, _lever(sr)), LEVER_URL)
+        check(r.get("live") is True and r.get("pay") == [],
+              f"{why} must not become a yearly USD band: {r.get('pay')}")
+    check("CAD" in (lever_pay({"currency": "CAD", "interval": "per-year-salary",
+                               "min": 200000, "max": 250000})[1] or ""),
+          "a non-USD band must still be labelled in the summary")
+
+    # The WHOLE Lever posting is the body: the requirements in `lists` and the pay paragraph
+    # in salaryDescriptionPlain were never read, so a band stated only there, and the words
+    # that say whether it is base or total, never reached eval-prep.
+    whole = json.dumps({"text": "Staff Agent Engineer", "descriptionPlain": "Build agents.",
+                        "categories": {"location": "Remote (USA)"},
+                        "lists": [{"text": "What You'll Bring",
+                                   "content": "<li>8+ years building platforms</li>"}],
+                        "salaryDescriptionPlain": "The OTE salary range for this role is "
+                                                  "$210,000 - $230,000.",
+                        "additionalPlain": "About Acme."})
+    r = with_fetch(lambda *a, **k: (200, whole), LEVER_URL)
+    check("8+ years building platforms" in (r.get("jd") or ""),
+          f"Lever `lists` must reach the body: {(r.get('jd') or '')[:120]!r}")
+    check(r.get("pay") == ["$210,000 - $230,000"] and "OTE" in (r.get("jd") or ""),
+          f"salaryDescriptionPlain must reach the body with its basis words: {r.get('pay')}")
+
+    # ── Ashby posting API: compensation requested and never read ─────────────
+    # Shapes as the live API returned them on 2026-10-15. Ramp: the band only in the
+    # structured Salary component, with a DECIMAL K in the summaries. OpenAI: an hourly
+    # rate with a null scrapeable summary. Plus a CAD band and a monthly one, both real.
+    def _ashby_api(org, comp, body="Build agent tooling."):
+        jid = "34413f8d-26bf-4bbc-8ade-eb309a0e2245"
+        listing = json.dumps({"jobs": [{"id": jid, "title": "Staff Agent Engineer",
+                                        "location": "Remote", "isRemote": True,
+                                        "descriptionPlain": body, "compensation": comp}]})
+
+        def _f(url, *a, **k):
+            return (200, listing) if "api.ashbyhq.com" in url else (404, "")
+        return with_fetch(_f, f"https://jobs.ashbyhq.com/{org}/{jid}")
+
+    def _ac(ctype, interval, cur, lo, hi):
+        return {"compensationType": ctype, "interval": interval, "currencyCode": cur,
+                "minValue": lo, "maxValue": hi}
+    RAMP = {"compensationTierSummary": "$211.4K – $290.6K • Offers Equity",
+            "scrapeableCompensationSalarySummary": "$211.4K - $290.6K",
+            "summaryComponents": [_ac("EquityPercentage", "NONE", None, None, None),
+                                  _ac("Salary", "1 YEAR", "USD", 211400, 290600)]}
+    r = _ashby_api("ashbyyear", RAMP)
+    check(r.get("pay") == ["$211,400 - $290,600"],
+          f"an Ashby API Salary component must reach pay: {r.get('pay')}")
+    check("Offers Equity" in (r.get("comp_summary") or ""),
+          f"the tier summary must be kept verbatim: {r.get('comp_summary')!r}")
+    r = _ashby_api("ashbybody", RAMP, "Base salary $200,000 - $250,000.")
+    check(r.get("pay") == ["$200,000 - $250,000"],
+          f"a band printed in the Ashby body must still come first: {r.get('pay')}")
+    HOURLY_C = {"compensationTierSummary": "$60.58 – $108.17 per hour • Offers Equity",
+                "scrapeableCompensationSalarySummary": None,
+                "summaryComponents": [_ac("EquityCashValue", "1 YEAR", "USD", None, None),
+                                      _ac("Salary", "1 HOUR", "USD", 60.58, 108.17)]}
+    r = _ashby_api("ashbyhour", HOURLY_C)
+    check(r.get("pay") == ["$60.58 - $108.17 per hour"],
+          f"an hourly Ashby component must be labelled per hour: {r.get('pay')}")
+    # Components only, no text summary: the equity component is still basis evidence, and
+    # must reach comp_summary as a word eval-prep's basis rule reads.
+    r = _ashby_api("ashbyhourbare", {"summaryComponents": HOURLY_C["summaryComponents"]})
+    check(r.get("pay") == ["$60.58 - $108.17 per hour"]
+          and re.search(r"\bequity\b", r.get("comp_summary") or "", re.I),
+          f"an equity component with no summary must still say equity: {r.get('comp_summary')!r}")
+    for org, comp, why in (
+            ("ashbycad", {"compensationTierSummary": "CA$138K – CA$189K",
+                          "scrapeableCompensationSalarySummary": "CA$138K - CA$189K",
+                          "summaryComponents": [_ac("Salary", "1 YEAR", "CAD", 138000, 189000)]},
+             "a CAD Salary component"),
+            ("ashbymonth", {"compensationTierSummary": "$12.5K per month",
+                            "scrapeableCompensationSalarySummary": None,
+                            "summaryComponents": [_ac("Salary", "1 MONTH", "USD", 12500, 12500)]},
+             "a monthly Salary component"),
+            ("ashbyequity", {"compensationTierSummary": "Offers Equity",
+                             "summaryComponents": [_ac("EquityCashValue", "1 YEAR", "USD",
+                                                       250000, 350000)]},
+             "an equity-only component, which is not a salary band"),
+            ("ashbynone", None, "no compensation object at all")):
+        r = _ashby_api(org, comp)
+        check(r.get("live") is True and r.get("pay") == [],
+              f"{why} must not become a yearly USD band: {r.get('pay')}")
+    # No structured Salary entry: the summary speaks, under the same rules. These are the
+    # page path's only evidence, so they are pinned on the shared reader directly.
+    for s, want, why in (("$197K - $246K", ["$197,000 - $246,000"], "a plain yearly summary"),
+                         ("$211.4K - $290.6K", ["$211,400 - $290,600"], "a decimal-K summary"),
+                         ("CA$138K - CA$189K", [], "a Canadian-dollar summary"),
+                         ("US$200K - US$260K", ["$200,000 - $260,000"], "US$ is US dollars"),
+                         ("AUS$150K - AUS$180K", [], "AUS$ is not US dollars"),
+                         ("£80K - £100K", [], "a sterling summary"),
+                         ("$12.5K per month", [], "a monthly summary"),
+                         ("$35K per month", [], "a monthly summary PAY would otherwise read"),
+                         ("$57 – $70 per hour", ["$57 - $70 per hour"], "an hourly summary"),
+                         ("$60.5 – $70.5 per hour", ["$60.5 - $70.5 per hour"], "one-decimal hourly rates"),
+                         ("$60K – $70K • This role will be paid hourly with a "
+                          "minimum hourly expectation.", [], "hourly pay with no stated rate"),
+                         ("", [], "an empty summary")):
+        got = ashby_summary_pay(s)
+        check(got == want, f"{why}: ashby_summary_pay({s!r}) gave {got}, want {want}")
+    r = _ashby_api("ashbysummary", {"compensationTierSummary": "$197K – $246K",
+                                    "scrapeableCompensationSalarySummary": "$197K - $246K",
+                                    "summaryComponents": []})
+    check(r.get("pay") == ["$197,000 - $246,000"],
+          f"with no Salary component the summary must still be read: {r.get('pay')}")
+
+    # ── The employer as the ATS record states it (issue #12) ─────────────────
+    # eval-prep falls back to a slug only when no record names its employer, so each
+    # adapter that CAN name one must keep doing so, and one that cannot must say None.
+    _gh_named = json.dumps({"title": "Applied AI/ML Engineer",
+                            "company_name": "Certum Legal Solutions",
+                            "location": {"name": "United States (Remote)"},
+                            "content": "&lt;p&gt;Remote, US.&lt;/p&gt;"})
+    r = with_fetch(_fake_gh("certumlegalsolutions", body=_gh_named),
+                   "https://job-boards.greenhouse.io/certumlegalsolutions/jobs/4165332906")
+    check(r.get("company") == "Certum Legal Solutions",
+          f"Greenhouse company_name must reach the result: {r.get('company')!r}")
+    r = with_fetch(_fake_gh("acmeco", body=_GH_HIDDEN_LOC),
+                   "https://job-boards.greenhouse.io/acmeco/jobs/1234567")
+    check(r.get("live") is True and r.get("company") is None,
+          f"a Greenhouse record naming no employer must say None: {r.get('company')!r}")
+    got = ashby_from_page(_ASHBY_PAGE, "whatnot", "e8760e88-1ecc-0bb9-564e-a726f5e7f568")
+    check((got or {}).get("company") == "Whatnot {HQ}",
+          f"the Ashby page's organization.name must reach the result: {(got or {}).get('company')!r}")
+    _sr_named = json.dumps({"name": "Senior Engineer", "company": {"identifier": "Experian",
+                                                                   "name": "Experian"},
+                            "location": {"city": "Costa Mesa", "region": "CA",
+                                         "country": "us"}, "jobAd": {}})
+    r = with_fetch(lambda *a, **k: (200, _sr_named),
+                   "https://jobs.smartrecruiters.com/NBCUniversal3/794330812622252")
+    check(r.get("ats") == "smartrecruiters" and r.get("company") == "Experian",
+          f"SmartRecruiters company.name must reach the result: {r.get('company')!r}")
+    check(stated_employer({"company": "a string, not a record"}, "company", "name") is None
+          and stated_employer({"company_name": "  "}, "company_name") is None,
+          "a malformed or blank employer field is None, never a crash or an empty name")
+    r = with_fetch(lambda *a, **k: (200, _lever(YEAR)), LEVER_URL)
+    check(r.get("company") is None,
+          f"Lever's postings API names no employer, so the result must not invent one: "
+          f"{r.get('company')!r}")
 
     # The shared helper itself, not only what the callers do with it.
     check(jload('{"a": 1}') == {"a": 1}, "jload must return a parsed object unchanged")
@@ -3266,6 +4558,11 @@ def behaviour_cases():
         _m = WD_POSTING_URL.match(_url)
         check((_m.group(3) if _m else None) == _site,
               f"Workday url parse read site {(_m.group(3) if _m else None)!r} from {_url}, want {_site!r}")
+    # The CXS path takes the tenant's real name, whose underscores the hostname writes as
+    # hyphens; the host keeps its hyphens.
+    check(cxs_base("osv-a10networks", "wd503", "A10CareerSite")
+          == "https://osv-a10networks.wd503.myworkdayjobs.com/wday/cxs/osv_a10networks/A10CareerSite",
+          "cxs_base must put the tenant's underscore form in the CXS path and keep the host")
     # A wrapper the DETECTOR cannot see, because the embedded address carries no scheme of
     # its own and wraps_another_url() counts schemes. Every
     # adapter is anchored at the outer host now, which is the rule inbox-liveness.py took
@@ -3915,6 +5212,33 @@ def behaviour_cases():
           "a bare-number requisition must be matched by the same rule on both sides")
     check(walk([([wdp("104142220")], None)], rid="10414222") == (None, True),
           "a longer bare number is a different requisition")
+    # Cotality-style REQ ids, which the shared pattern cannot read past the letters.
+    check(walk([([wdp("REQ19072-1")], None)], rid="REQ19072") == ("job/X/Role_REQ19072-1", True),
+          "a REQ-prefixed requisition must be matched by the same rule on both sides")
+    check(walk([([wdp("REQ190720")], None)], rid="REQ19072") == (None, True),
+          "a longer REQ number is a different requisition")
+    check(workday_req("job/United-States/Senior-QA_REQ19351") == "REQ19351",
+          "a REQ-prefixed id must be readable off a Workday path")
+    # Snap's quarterly evergreen codes, and the guard that keeps a title word out.
+    check(workday_req("job/Palo-Alto-California/MLE--Level-5_Q426SWEML5-1") == "Q426SWEML5",
+          "an evergreen alphanumeric id must be readable, facet suffix dropped")
+    check(walk([([wdp("H226SWEGML3")], None)], rid="H226SWEGML5") == (None, True),
+          "a sibling evergreen id is a different requisition")
+    check(workday_req("job/X/Senior_Engineer") is None,
+          "a tail with no digit is a title fragment, never an id")
+    # Codex counterexamples, 2026-10-27: the loose reader must read only the posting
+    # segment, or a location token or a fragment becomes the id that closes a live row.
+    check(workday_req("job/US_CA2026/Role_H226SWEGML5") == "H226SWEGML5",
+          "a location segment's token must never be read as the requisition")
+    check(workday_req("job/US/Role_NoId#panel_ABC123") is None,
+          "a fragment must never supply the requisition")
+    check(walk([([{"externalPath": "/job/US_CA2026/Role_H226SWEGML5"}], None)],
+               rid="H226SWEGML5") == ("job/US_CA2026/Role_H226SWEGML5", True),
+          "the search side must find the posting whatever its location segment holds")
+    check(workday_req("job/X/Role_ABC123-456") is None,
+          "a hyphenated tail that may be one id is not read as a shorter one")
+    check(walk([([{}], 1)], rid="H226SWEGML5") == (None, False),
+          "a search result with no path is unread, so the absence is not clean")
     # An id the reader cannot read off a path can never be matched, so a walk for it
     # proves nothing and must not report a clean absence.
     check(walk([([], 0)], rid="Engineer") == (None, False),
@@ -3961,6 +5285,24 @@ def behaviour_cases():
                    "https://jobs.apple.com/en-us/details/275158197-0670/lead-dev")
     check(r.get("ats") == "apple" and r.get("live") is False,
           f"apple: HTTP 410 must be a closure, got live={r.get('live')}")
+    # Apple answers a retired posting with HTTP 200 and records the 404 in its router's
+    # hydration data instead. That is a closure; the same error on another route is not,
+    # and a page with neither stays unknown.
+    def _apple_shell(errors):
+        return (200, '<script>window.__staticRouterHydrationData = JSON.parse("'
+                + ('{"loaderData":{"root":{}},"actionData":null,"errors":' + errors + '}')
+                .replace('"', '\\"') + '");</script>')
+    AP = "https://jobs.apple.com/en-us/details/275158197-0670/lead-dev"
+    r = with_fetch(lambda *a, **k: _apple_shell(
+        '{"jobDetails":{"status":404,"statusText":"","__type":"RouteErrorResponse"}}'), AP)
+    check(r.get("live") is False,
+          f"apple: a jobDetails 404 in the router data must close, got {r.get('live')}")
+    r = with_fetch(lambda *a, **k: _apple_shell('{"search":{"status":404}}'), AP)
+    check(r.get("live") is None,
+          f"apple: a 404 on another route must not close, got {r.get('live')}")
+    r = with_fetch(lambda *a, **k: _apple_shell("null"), AP)
+    check(r.get("live") is None,
+          f"apple: a shell with no error and no jobsData stays unknown, got {r.get('live')}")
     # Greenhouse keeps its guessed-slug ambiguity for 410 as well. A 410 on a board that
     # EXISTS is a closure; a 410 reached through a guessed slug where no board exists is
     # a bad guess, and closing on it is the SentinelOne failure with a different number.
@@ -4142,6 +5484,176 @@ def behaviour_cases():
           "the requisition pattern must be the one in workday-sweep.py, not a fifth copy")
     check("JR" in WD_REQ_ID.pattern and "WD" in WD_REQ_ID.pattern,
           f"the pattern read from workday-sweep.py looks wrong: {WD_REQ_ID.pattern!r}")
+
+    # ── Rippling and Gem (2026-10-29) ────────────────────────────────────────────────
+    # Both answer 404 on the posting endpoint for a retired posting AND for a board slug
+    # that does not exist, so a 404 closes only when the board listing agrees. Every case
+    # below runs offline through a fake fetch() and a fake post().
+    def with_net(routes, url, gql=(0, "")):
+        fake_fetch = lambda u, *a, **k: routes.get(u, (404, ""))
+        fake_post = lambda u, *a, **k: gql
+        with mock.patch.object(sys.modules[__name__], "fetch", fake_fetch), \
+             mock.patch.object(sys.modules[__name__], "post", fake_post):
+            return resolve(url)
+
+    RU = "a2acbe6f-e43e-c9c2-1aef-4c03864e893f"
+    R_URL = f"https://ats.rippling.com/cerby/jobs/{RU}"
+    R_API = f"{RIPPLING_API}/cerby/jobs/{RU}"
+    R_BOARD = f"{RIPPLING_API}/cerby/jobs"
+    _r_rec = lambda **kw: json.dumps({
+        "uuid": RU, "name": "Staff AI Engineer, Agentic Automation", "companyName": "Cerby",
+        "description": {"company": "<p>About Cerby</p>", "role": "<p>Build agents.</p>"},
+        "workLocations": ["San Francisco, CA", "Remote (United States)"],
+        "payRangeDetails": [], **kw})
+    _r_board = lambda *ids: json.dumps([
+        {"uuid": i, "name": "X", "workLocation": {"label": "Remote (United States)"}}
+        for i in ids])
+    OTHER = ["146dd421-0b8c-4d64-bf8d-69eaa52d0388", "310320f4-98fa-438b-83d9-7d1a0c6468c6"]
+
+    r = with_net({R_API: (200, _r_rec())}, R_URL)
+    check(r.get("ats") == "rippling" and r.get("live") is True
+          and r.get("title") == "Staff AI Engineer, Agentic Automation",
+          f"rippling: a posting record must read live: {r.get('live')} / {r.get('note')}")
+    check(r.get("company") == "Cerby", f"rippling: companyName is the employer: {r.get('company')}")
+    check("Remote (United States)" in (r.get("location") or "") and r.get("remote_txt") is True,
+          f"rippling: every work location must be folded in, remote included: {r.get('location')}")
+    check("Build agents" in (r.get("jd") or ""), "rippling: the role description is the JD")
+    # A locale prefix is the same posting.
+    r = with_net({R_API: (200, _r_rec())}, f"https://ats.rippling.com/en-US/cerby/jobs/{RU}")
+    check(r.get("live") is True and r.get("org") == "cerby",
+          f"rippling: a /en-US/ url must route to the same board: {r.get('org')}")
+    # Pay: one band is the band; ranges per location are never merged.
+    band = lambda lo, hi, loc, cur="USD", fr="YEAR": dict(
+        rangeStart=lo, rangeEnd=hi, currency=cur, frequency=fr, location=loc)
+    r = with_net({R_API: (200, _r_rec(payRangeDetails=[band(180000, 220000, "San Francisco, CA")]))},
+                 R_URL)
+    check(r.get("pay") == ["$180,000 - $220,000"],
+          f"rippling: a single structured band must reach pay: {r.get('pay')}")
+    p, s, has = rippling_pay([band(180000, 220000, "San Francisco, CA"),
+                              band(150000, 190000, "Austin, TX")], ["San Francisco, CA"])
+    check(p == ["$180,000 - $220,000"] and has and "Austin" in (s or ""),
+          f"rippling: of several bands, the one whose place EQUALS the posting's is its band: {p}")
+    p, s, has = rippling_pay([band(180000, 220000, "San Francisco, CA"),
+                              band(150000, 190000, "Remote (United States)")],
+                             ["San Francisco, CA", "Remote (United States)"])
+    check(p == [] and has and "150,000" in (s or "") and "220,000" in (s or ""),
+          f"rippling: two bands that both fit must leave pay empty, both in the summary: {p} / {s}")
+    p, _, has = rippling_pay([band(200000, 250000, "London", cur="GBP")], ["London"])
+    check(p == [] and has, f"rippling: a non-USD band is refused, not read as dollars: {p}")
+    p, _, _ = rippling_pay([band(60, 80, "Remote (United States)", fr="HOUR")], [])
+    check(p == ["$60.00 - $80.00 per hour"], f"rippling: an hourly band is labelled hourly: {p}")
+    # Unread answers are unknown, never a verdict.
+    for label, res in (("an empty object", (200, "{}")),
+                       ("an error object", (200, '{"ok": false, "error": "x"}')),
+                       ("a server error", (500, "")),
+                       ("a transport failure", (0, ""))):
+        r = with_net({R_API: res, R_BOARD: (200, _r_board(*OTHER))}, R_URL)
+        check(r.get("live") is None,
+              f"rippling: {label} must be unknown, got live={r.get('live')} ({r.get('note')})")
+    r = with_net({R_API: (200, _r_rec(uuid=OTHER[0]))}, R_URL)
+    check(r.get("live") is None, f"rippling: another posting's record is not this one: {r.get('live')}")
+    # The closure, and the three shapes that must NOT close.
+    r = with_net({R_API: (404, ""), R_BOARD: (200, _r_board(*OTHER))}, R_URL)
+    check(r.get("live") is False,
+          f"rippling: a 404 the clean board agrees with must close: {r.get('live')} ({r.get('note')})")
+    r = with_net({R_API: (404, ""), R_BOARD: (404, "")}, R_URL)
+    check(r.get("live") is None,
+          f"rippling: a 404 with no board (a wrong slug answers 404 too) must be unknown: "
+          f"{r.get('live')}")
+    r = with_net({R_API: (404, ""), R_BOARD: (200, "[]")}, R_URL)
+    check(r.get("live") is None, f"rippling: an empty board closes nothing: {r.get('live')}")
+    r = with_net({R_API: (404, ""), R_BOARD: (200, _r_board(RU, *OTHER))}, R_URL)
+    check(r.get("live") is None,
+          f"rippling: a board still listing the id disagrees with the 404, so unknown: {r.get('live')}")
+    # Codex 2026-10-29: a listing with a record the reader cannot identify is not a full read.
+    partial = json.dumps(json.loads(_r_board(*OTHER)) + [{"name": "no uuid here"}])
+    r = with_net({R_API: (404, ""), R_BOARD: (200, partial)}, R_URL)
+    check(r.get("live") is None,
+          f"rippling: a board with an unidentifiable record closes nothing: {r.get('live')}")
+    check(not RIPPLING_URL.search(f"https://ats.rippling.com/cerby/jobs/{RU}garbage"),
+          "rippling: a uuid with trailing characters is not that posting")
+
+    GID = "am9icG9zdDp7LtWwyt-ZLX3N-M7SHGRV"
+    G_URL = f"https://jobs.gem.com/nominal/{GID}"
+    G_API = f"{GEM_API}/nominal/job_posts/{GID}"
+    G_BOARD = f"{GEM_API}/nominal/job_posts/"
+    _g_rec = lambda **kw: json.dumps({
+        "id": GID, "title": "Staff Research Engineer, Agent Evals", "requisition_id": "R146",
+        "content": "<p>Build eval harnesses.</p>", "location": {"name": "New York, United States"},
+        "location_type": "in_office",
+        "offices": [{"name": "New York, NY", "location": {"name": "New York, United States"}},
+                    {"name": "Los Angeles, CA", "location": {"name": "Los Angeles, United States"}}],
+        **kw})
+    _g_gql = lambda comp=None, ext=GID, locs=(): (200, json.dumps({"data": {
+        "oatsExternalJobPosting": {"extId": ext, "compensationHtml": comp,
+                                   "locations": list(locs), "job": {"locationType": "IN_OFFICE"}}}}))
+    _g_board = lambda *ids: json.dumps([{"id": i, "title": "X"} for i in ids])
+    G_OTHER = ["37c9854b-f1ea-4da6-a3f5-51e64923ae08", "am9icG9zdDpL-JNJq5xAAt03bX9HVpDi"]
+
+    r = with_net({G_API: (200, _g_rec())}, G_URL,
+                 gql=_g_gql("<h2>Compensation</h2><div>The base pay range for this role is "
+                            "$120,000 – $195,000 per year.</div>"))
+    check(r.get("ats") == "gem" and r.get("live") is True,
+          f"gem: a posting record must read live: {r.get('live')} / {r.get('note')}")
+    check("Los Angeles, CA" in (r.get("location") or "")
+          and (r.get("location") or "").count("New York") == 1,
+          f"gem: offices are folded in, a city named twice is named once: {r.get('location')}")
+    check(r.get("pay") == ["$120,000 – $195,000"],
+          f"gem: the GraphQL compensation section is the band: {r.get('pay')}")
+    check(r.get("req_id") == "R146" and r.get("workplace") == "in_office",
+          f"gem: requisition id and workplace are read: {r.get('req_id')} / {r.get('workplace')}")
+    # Remote from either source.
+    r = with_net({G_API: (200, _g_rec(location_type="remote"))}, G_URL)
+    check(r.get("remote_txt") is True and "Remote" in (r.get("location") or ""),
+          f"gem: location_type remote must reach the location: {r.get('location')}")
+    r = with_net({G_API: (200, _g_rec())}, G_URL,
+                 gql=_g_gql(locs=[{"name": "United States", "isRemote": True}]))
+    check(r.get("remote_txt") is True and "Remote" in (r.get("location") or ""),
+          f"gem: a GraphQL isRemote location must reach the location: {r.get('location')}")
+    # GraphQL is the band only: its failure costs the band, never the verdict, and a body
+    # band then stands; a record for another posting is not read; two bands are not merged.
+    r = with_net({G_API: (200, _g_rec(content="<p>Salary: $200,000 - $250,000</p>"))}, G_URL,
+                 gql=(500, ""))
+    check(r.get("live") is True and r.get("pay") == ["$200,000 - $250,000"],
+          f"gem: a GraphQL failure must leave the REST verdict and the body band: "
+          f"{r.get('live')} / {r.get('pay')}")
+    r = with_net({G_API: (200, _g_rec())}, G_URL,
+                 gql=_g_gql("<p>$300,000 - $400,000</p>", ext=G_OTHER[1]))
+    check(r.get("pay") == [] and r.get("comp_summary") is None,
+          f"gem: another posting's GraphQL record must not lend its band: {r.get('pay')}")
+    r = with_net({G_API: (200, _g_rec())}, G_URL,
+                 gql=_g_gql("<p>NYC: $180,000 - $220,000. Austin: $150,000 - $195,000.</p>"))
+    check(r.get("pay") == [] and "Austin" in (r.get("comp_summary") or ""),
+          f"gem: several bands stay in the summary and are not merged: {r.get('pay')}")
+    for label, res in (("an error object", (200, '{"code": 404, "message": "x"}')),
+                       ("an empty object", (200, "{}")),
+                       ("a server error", (503, ""))):
+        r = with_net({G_API: res, G_BOARD: (200, _g_board(*G_OTHER))}, G_URL)
+        check(r.get("live") is None,
+              f"gem: {label} must be unknown, got live={r.get('live')} ({r.get('note')})")
+    r = with_net({G_API: (200, _g_rec(id=G_OTHER[1]))}, G_URL)
+    check(r.get("live") is None, f"gem: another posting's record is not this one: {r.get('live')}")
+    r = with_net({G_API: (404, ""), G_BOARD: (200, _g_board(*G_OTHER))}, G_URL)
+    check(r.get("live") is False,
+          f"gem: a 404 the clean board agrees with must close: {r.get('live')} ({r.get('note')})")
+    r = with_net({G_API: (404, ""), G_BOARD: (404, "")}, G_URL)
+    check(r.get("live") is None, f"gem: a 404 with no board must be unknown: {r.get('live')}")
+    r = with_net({G_API: (404, ""), G_BOARD: (200, _g_board(GID, *G_OTHER))}, G_URL)
+    check(r.get("live") is None,
+          f"gem: a board still listing the id disagrees with the 404, so unknown: {r.get('live')}")
+    # Ids are case-sensitive base64url: a lower-cased twin is a different posting.
+    r = with_net({G_API: (404, ""), G_BOARD: (200, _g_board(GID.lower(), *G_OTHER))}, G_URL)
+    check(r.get("live") is False, f"gem: ids must compare case-sensitively: {r.get('live')}")
+
+    # Both patterns are compiled above resolve(), so the source scan cannot see them.
+    check(RIPPLING_URL.pattern.startswith(OUTER_HOST) and GEM_URL.pattern.startswith(OUTER_HOST),
+          "the Rippling and Gem patterns must be anchored at the outer host")
+    check(wraps_another_url(f"https://tracker.example/r/ats.rippling.com/cerby/jobs/{RU}") is True
+          and wraps_another_url(f"https://tracker.example/c?u=jobs.gem.com/nominal/{GID}") is True,
+          "a wrapper carrying a Rippling or Gem posting without a scheme is still a wrapper")
+    check(wraps_another_url(R_URL) is False and wraps_another_url(G_URL) is False,
+          "a plain Rippling or Gem posting url is not a wrapper of itself")
+    check(host_keys(R_URL) == set(), "ats.rippling.com is the vendor, never an employer identity")
     return bad, total
 
 
@@ -4207,7 +5719,7 @@ if __name__ == "__main__":
     else:
         for r in out:
             state = {True: "LIVE  ", False: "CLOSED", None: "UNKNWN"}[r.get("live")]
-            print(f"[{state}] {(r.get('title') or r.get('role') or '')[:66]:66s} {r.get('location','')[:48]}")
+            print(f"[{state}] {(r.get('title') or r.get('role') or '')[:66]:66s} {(r.get('location') or '')[:48]}")
             if r.get("pay"):
                 print(f"          pay {r['pay']}")
             if r.get("note"):

@@ -225,12 +225,36 @@ export function extractJobId(url) {
  * The rules are DATA in host-ids.json, which scripts/eval-blockers.py reads too, so the
  * two cannot hold different lists. That file states the contract (case-insensitive, the
  * query and fragment cut, group 1 lowercased under its namespace) and why each rule is
- * anchored at its host. Its `per_employer` flag is not read here: every consumer of these
- * ids compares within ONE company already (merge-tracker and dedup-tracker filter by
- * company first, eval-write keys its index on id plus company).
+ * anchored at its host. Its `per_employer` flag is read only by globalNamespaces() below:
+ * merge-tracker and dedup-tracker filter by company first, and eval-write keys its index
+ * on id plus company.
  */
-const HOSTED_ID = JSON.parse(readFileSync(new URL('./host-ids.json', import.meta.url), 'utf-8'))
-  .rules.map(r => [new RegExp(r.re, 'i'), r.ns]);
+const HOST_RULES = JSON.parse(readFileSync(new URL('./host-ids.json', import.meta.url), 'utf-8')).rules;
+const HOSTED_ID = HOST_RULES.map(r => [new RegExp(r.re, 'i'), r.ns]);
+
+/**
+ * The id namespaces that name ONE posting whatever the employer: the host-ids.json
+ * namespaces whose every rule is anchored at one employer's own host (Apple, Google, EA),
+ * i.e. no `per_employer` rule and no generic rule producing the same namespace. An id in one
+ * of these may be compared across company spellings. scan.mjs and pipeline-audit.mjs both
+ * join a posting to the tracker by company and id, and a decorated portals.yml label
+ * ("Google / Alphabet (DeepMind, ...)") is not the tracker's "Google", so three Google reqs
+ * evaluated on the morning of 2026-10-29 topped that afternoon's triage as new.
+ *
+ * `gh` and `uuid` are deliberately NOT here, though a Greenhouse or Ashby id is close to
+ * unique: the generic rules extract them from foreign hosts (a redirect path carrying
+ * "greenhouse.io/acme/jobs/N", a numeric-prefixed gh_jid, any UUID-shaped segment), and an
+ * id compared without the company RETIRES a row (Codex, 2026-10-29).
+ */
+const GENERIC_NS = new Set(['gh', 'uuid', 'id', 'wd']);
+export function globalNamespaces(rules = HOST_RULES) {
+  const perEmployer = new Set(rules.filter(r => r.per_employer).map(r => r.ns));
+  return new Set(rules.map(r => r.ns).filter(ns => !perEmployer.has(ns) && !GENERIC_NS.has(ns)));
+}
+const GLOBAL_NS = globalNamespaces();
+
+/** True when `id` (`<ns>:<value>`) names one posting across every employer. */
+export const isGlobalId = (id) => !!id && GLOBAL_NS.has(String(id).split(':')[0]);
 
 function hostedId(pathOnly) {
   for (const [re, ns] of HOSTED_ID) {
@@ -348,6 +372,27 @@ export function rowIdReader(trackerDir) {
 export function idSetsOverlap(a, b) {
   for (const id of a) if (b.has(id)) return true;
   return false;
+}
+
+const idNamespace = (id) => String(id).slice(0, String(id).indexOf(':'));
+
+/**
+ * Two postings are PROVABLY different requisitions: their ids are disjoint AND at least
+ * one namespace appears on both sides, so the two sides read the same numbering system
+ * and disagree.
+ *
+ * Disjoint ids from DIFFERENT namespaces prove nothing: one Riot posting reads `gh:7873504`
+ * from a `?gh_jid=` URL and `id:7873504` from the same URL without its query, and one NVIDIA
+ * posting can carry an Eightfold id in one record and a JR id in another. idSetsConflict()
+ * counts those as distinct; this does not. Use this wherever a title match is allowed to
+ * stand unless the ids prove otherwise (scan, pipeline-audit, verify-pipeline). Stated here
+ * once after verify-pipeline had it alone and scan reached for idSetsConflict instead, which
+ * resurfaced two tracked rows as new (Codex review).
+ */
+export function idSetsProvablyDistinct(a, b) {
+  if (!idSetsConflict(a, b)) return false;
+  const nsB = new Set([...b].map(idNamespace));
+  return [...a].some((x) => nsB.has(idNamespace(x)));
 }
 
 /** Two rows are PROVABLY distinct only when both have ids and share none. An empty set

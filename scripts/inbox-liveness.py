@@ -315,6 +315,12 @@ def fetch_workday(slug):
     tenant, wd, site = slug.split("/")
     w = workday()
     base = w._prep.rr.cxs_base(tenant, wd, site)
+    # A tenant portals.yml reads as a SLICE (workday_facets) is too big to walk whole, and
+    # an id absent from the slice may simply have another job family, so it is not read
+    # here at all. None, not False: an unread board HOLDS its rows away from the resolver,
+    # and these rows must reach the per-requisition lookup instead (Codex, 2026-10-29).
+    if any(t["base"] == base and t.get("facets") for t in w.tenants()):
+        return set(), None
     try:
         posts, st, truncated = w.enumerate_board(base, pages=WORKDAY_PAGES, limit=20,
                                                  quiet=True)
@@ -454,10 +460,17 @@ def sweep(quiet=False):
         # is sitting right there.
         r["why"] = ("no requisition id in the url" if READABLE_HOST.search(r["url"] or "")
                     else "no board reader for this host")
-    live, closed, unknown = [], [], list(unroutable)
+    live, closed, unknown, confirm = [], [], list(unroutable), []
     boards = sorted(by_board.items())
     reads = in_order(lambda board: fetch_board(*board[0]), boards)
     for ((prov, slug), group), (ids, ok) in zip(boards, reads):
+        if ok is None:
+            # Deliberately not read (a sliced Workday tenant): unknown but NOT held, so
+            # settle_unknowns() asks the resolver one requisition at a time.
+            for r in group:
+                r["why"] = f"board {prov}/{slug} is read as a slice; asked per requisition"
+            unknown.extend(group)
+            continue
         if not ok:
             for r in group:
                 r["why"] = f"board {prov}/{slug} would not load"
@@ -480,17 +493,76 @@ def sweep(quiet=False):
                 print(f"  {prov}/{slug[:26]:28s} board is EMPTY, {len(group)} row(s) "
                       f"held back for a manual look", file=sys.stderr)
             continue
+        # A Workday board is a paginated SEARCH, not a listing, and its result cap made a
+        # walk that ended at 2000 of 2732 NVIDIA postings look whole: JR2110993 was retired
+        # here while live and CA-remote (2026-10-18). enumerate_board now walks past the cap,
+        # but a search has no snapshot guarantee either, so a Workday absence is only a
+        # reason to ASK: confirm_workday() reads the row's own detail record and closes it
+        # only on one that says so (Codex, 2026-10-18). Greenhouse, Lever, Ashby and Breezy
+        # publish whole listings, so their absence stays evidence.
         for r in group:
-            (live if r["pid"] in ids else closed).append(r)
+            if r["pid"] in ids:
+                live.append(r)
+            elif prov == "workday":
+                r["slug"] = slug
+                confirm.append(r)
+            else:
+                closed.append(r)
         if not quiet:
             n_dead = sum(1 for r in group if r["pid"] not in ids)
+            verb = "to confirm" if prov == "workday" else "closed"
             print(f"  {prov}/{slug[:26]:28s} {len(ids):4d} on board, {len(group):3d} row(s), "
-                  f"{n_dead} closed", file=sys.stderr)
+                  f"{n_dead} {verb}", file=sys.stderr)
+    # Workday absences: each row's OWN detail record decides, nothing else.
+    for r, verdict in zip(confirm, in_order(confirm_workday, confirm)):
+        if verdict is True:
+            live.append(r)
+        elif verdict is False:
+            closed.append(r)
+        else:
+            r["why"] = f"absent from the {r['slug']} walk and its own record was not readable"
+            r["held"] = True
+            unknown.append(r)
     # Whatever no board could answer, ask the resolver about it one row at a time.
     unknown, alive, gone = settle_unknowns(unknown, quiet=quiet)
     live.extend(alive)
     closed.extend(gone)
     return live, closed, unknown
+
+
+WD_POSTING_PATH = re.compile(r"myworkdayjobs\.com/(?:[a-z]{2}(?:-[A-Za-z]{2})?/)?[^/]+/(job/[^?#]+)")
+
+
+def confirm_workday(r):
+    """True, False or None for a Workday row absent from its tenant's walk.
+
+    A Workday board is a search, and its absence closed live rows twice over: a capped walk
+    retired NVIDIA JR2110993, and resolve() could close on a 403 followed by an empty fuzzy
+    search (Codex, 2026-10-18). So the row's own detail record decides when it is readable.
+
+    It usually is not: Workday answers a retired posting's detail with 403, so every one of
+    them sat held for ever, all absent from the full walk. The rule since then is that a
+    posting removed from public view is closed for a lead nobody has applied to, and the
+    inbox holds only such leads. So an unreadable record falls back to a SECOND,
+    independent search: workday_search() for this exact id, walked to its end. Absent from
+    both, the row closes; a search that did not read cleanly still hands the question back.
+    """
+    m = WD_POSTING_PATH.search((r.get("url") or "").split("?")[0])
+    if not m:
+        return None
+    rr_ = resolver()
+    tenant, wd, site = r["slug"].split("/")
+    base = rr_.cxs_base(tenant, wd, site)
+    rec = rr_.workday_detail(base, m.group(1), "the CXS detail response for this inbox row")
+    if rec.get("status", 200) == 200:
+        return rec.get("live")
+    rid = rr_.workday_req(m.group(1))
+    if not rid:
+        return None
+    path, searched = rr_.workday_search(base, rid)
+    if path:
+        return True
+    return False if searched else None
 
 
 def settle_unknowns(unknown, quiet=False):
@@ -890,6 +962,47 @@ def _selftest():
             print(f"  FAIL a complete Workday walk must yield its ids: ok={ok2} {ids2}")
     finally:
         w.enumerate_board = real_enum
+
+    # A Workday ABSENCE is a question, not a closure: a search walk has no snapshot
+    # guarantee, and a capped one retired live NVIDIA JR2110993. The row must reach the
+    # per-requisition lookup and close only when that lookup says so.
+    # resolve() must never be reached, since it can close on a 403 plus an empty fuzzy
+    # search (Codex, round 3). An unreadable record falls back to the exact-id search
+    # walked to its END, and only a clean read of that search may close.
+    g = globals()
+    rr_ = resolver()
+    saved = {k: g[k] for k in ("unchecked_rows", "fetch_board")}
+    real = (rr_.resolve, rr_.workday_detail, rr_.workday_search)
+    try:
+        url = ("https://nvidia.wd5.myworkdayjobs.com/NVIDIAExternalCareerSite/job/"
+               "US-TX-Austin/Example-Engineering-Role_JR2110993")
+        g["unchecked_rows"] = lambda: [dict(line_no=1, url=url, company="NVIDIA", title="x")]
+        g["fetch_board"] = lambda prov, slug: ({"jr2391853"}, True)
+        rr_.resolve = lambda u: {"live": False}
+        seen, asked = [], []
+        gone = {"live": None, "status": 403}
+        for rec, found, want in ((gone, (None, False), "unknown"),
+                                 (gone, (None, True), "closed"),
+                                 (gone, ("job/US-CA-Remote/x_JR2110993", True), "live"),
+                                 ({"live": True}, (None, True), "live"),
+                                 ({"live": False}, ("job/x_JR2110993", True), "closed")):
+            rr_.workday_detail = lambda base, ep, what, r=rec: seen.append(ep) or r
+            rr_.workday_search = lambda base, rid, send=None, f=found: asked.append(rid) or f
+            lv, cl, un = sweep(quiet=True)
+            got = "live" if lv else "closed" if cl else "unknown" if un else "lost"
+            if got != want:
+                bad += 1
+                print(f"  FAIL a Workday absence, record {rec}, search {found}: ended {got}, "
+                      f"want {want}")
+        if not asked or rr_.workday_req("_" + asked[0]) is None:
+            bad += 1
+            print(f"  FAIL the fallback search must ask for the row's requisition id: {asked[:1]}")
+        if not seen or not seen[0].startswith("job/US-TX-Austin/"):
+            bad += 1
+            print(f"  FAIL confirm_workday must read the row's own posting path, read {seen[:1]}")
+    finally:
+        g.update(saved)
+        rr_.resolve, rr_.workday_detail, rr_.workday_search = real
 
     # No fifth copy of the requisition pattern. Four hand copies have already drifted in
     # this repo and every divergence was a silent miss rather than an error, so the rule is

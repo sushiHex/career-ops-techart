@@ -17,6 +17,7 @@ import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { load as yamlLoad } from 'js-yaml';
 import { normalizeStatus, trackerRows } from './tracker-rows.mjs';
+import { localDate } from './local-date.mjs';
 
 const CAREER_OPS = dirname(fileURLToPath(import.meta.url));
 const APPS_FILE = existsSync(join(CAREER_OPS, 'data/applications.md'))
@@ -546,7 +547,7 @@ function analyze() {
     metadata: {
       total: enriched.length,
       dateRange: { from: dates[0], to: dates[dates.length - 1] },
-      analysisDate: new Date().toISOString().split('T')[0],
+      analysisDate: localDate(),
       byOutcome: {
         positive: enriched.filter(e => e.outcome === 'positive').length,
         negative: enriched.filter(e => e.outcome === 'negative').length,

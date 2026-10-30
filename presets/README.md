@@ -117,13 +117,16 @@ pass costs one line of triage, so when the text does not settle the question the
    `<TX>` before any pattern reads it, so a code can never be mistaken for a word. A name
    counts unless it is part of a city name ("New York City", "Kansas City", "Washington,
    PA") or of a street address, a house number and a direction before it ("1450 W.
-   Washington"; "one of 2 Texas counties" is still Texas); a code counts only in capitals and in a field position ("Irvine, CA", "US, TX,
-   Remote", "Remote - TX", "Remote: CA, OR, WA", "CA/TX"). "LA" and "IN" count only after a
-   comma or in a list of codes; "CT" and "MT" are time zones beside a time-zone word or in
-   "US (CT)", even for someone who lives in Connecticut or Montana; "CA" and "IN" beside a
-   foreign place are Canada and India. DC and New York City have one spelling each after
-   folding, and DC is one city, so any DC place is Washington, DC; "New York, USA" stays
-   the state.
+   Washington"; "one of 2 Texas counties" is still Texas); a code counts only in capitals and
+   in a field position ("Irvine, CA", "US, TX, Remote", "Remote - TX", "Remote: CA, OR, WA",
+   "CA/TX"). "LA" and "IN" count only after a comma or in a list of codes; "CT" and "MT" are
+   time zones beside a time-zone word or in "US (CT)", even for someone who lives in
+   Connecticut or Montana; "CA" and "IN" beside a foreign place are Canada and India. DC and
+   New York City have one spelling each after folding, and DC is one city, so any DC place is
+   Washington, DC; "New York, USA" stays the state. An Americas region label directly before
+   a US country marker is folded away ("AMER - United States - Texas - Remote" reads as
+   "United States - Texas - Remote"), since it says nothing the country does not; EMEA, APAC
+   and LATAM are never folded, and "AMER" before anything else stays and is unrecognised.
 3. **Exclusions come out.** A state list after "except", "excluding", "not available in",
    "residents of" and the like, or before "excluded" / "not eligible", names states that are
    OUT: the home state among them fails that remote offer, and the rest are removed before

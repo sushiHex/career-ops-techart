@@ -76,11 +76,24 @@
       "key": "ea:200001"
     },
     {
+      "ns": "linkedin",
+      "re": "^(?:https?://)?(?:[\\w-]+\\.)?linkedin\\.com/jobs/view/(\\d{6,})",
+      "example": "https://www.linkedin.com/jobs/view/4532225990/",
+      "key": "linkedin:4532225990"
+    },
+    {
       "ns": "breezy",
       "per_employer": true,
       "re": "^(?:https?://)?[\\w-]+\\.breezy\\.hr/p/([0-9a-f]{8,})",
       "example": "https://example-studio.breezy.hr/p/3e7c3a9f0349-example-role",
       "key": "breezy:3e7c3a9f0349"
+    },
+    {
+      "ns": "gh",
+      "_why": "Databricks' own career pages end the path with the Greenhouse job id, the same id its ?gh_jid= links carry, so both spellings share the gh: key. Unread, the slug form had no identity and merge-tracker could fold two different reqs together on a title match.",
+      "re": "^(?:https?://)?(?:www\\.)?databricks\\.com/company/careers/[^/?#]+/[^/?#]+-(\\d{7,})/?$",
+      "example": "https://www.databricks.com/company/careers/engineering/example-role-1310184655",
+      "key": "gh:1310184655"
     }
   ]
 }

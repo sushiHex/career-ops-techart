@@ -144,7 +144,10 @@ export function buildRow(o, colmap) {
  */
 export function setCell(line, colmap, key, text) {
   const c = line.split('|');
-  c[colmap[key]] = c[colmap[key]].replace(/\S(?:[\s\S]*\S)?/, text);
+  const old = c[colmap[key]];
+  // An EMPTY cell has no text to replace, and the replace() was then a silent no-op
+  // (Codex, 2026-10-29: a rescore note never landed on a row with blank notes).
+  c[colmap[key]] = /\S/.test(old) ? old.replace(/\S(?:[\s\S]*\S)?/, () => text) : ` ${text} `;
   return c.join('|');
 }
 

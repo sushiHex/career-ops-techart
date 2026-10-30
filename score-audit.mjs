@@ -25,7 +25,7 @@
 import { columnsOf, setCell, trackerRows } from './tracker-rows.mjs';
 import { readFileSync, writeFileSync, readdirSync, existsSync } from 'fs';
 import { join } from 'path';
-import { applyModel, loadPrefs, persistedArrangement } from './score-model.mjs';
+import { applyModel, loadPrefs, persistedArrangement, reportModelText } from './score-model.mjs';
 import { guardArgs } from './cli-guard.mjs';
 
 const CUTOVER = '2026-07-27';   // the day score-model.mjs became the only rubric
@@ -79,17 +79,6 @@ const field = (t, k) => {
 
 const near = (a, b) => a !== null && b !== null && Math.abs(a - b) <= TOL;
 
-// What separates the location from the reason inside `location_final`.
-// eval-write.mjs wrote an em dash until the repository's rule against that
-// character was applied to generated output, and now writes " -- ". Both have
-// to parse: several hundred reports already on disk carry the old separator and
-// they must not silently drop out of the model replay. The legacy branch is
-// compatibility for reports already written, NOT a form still emitted.
-// The character is built by code point rather than typed, because nothing in
-// this repository may contain it literally, including this file.
-const EM_DASH = String.fromCharCode(0x2014);
-const LOC_SEP = new RegExp('\\s+(?:' + EM_DASH + '|--)\\s+');
-
 let history = 0, disagree = [], unreadable = [], legacy = [];
 for (const f of readdirSync('reports').sort()) {
   // Three digits is the floor, not the ceiling. A \d{3} scan stops seeing the
@@ -127,38 +116,21 @@ for (const f of readdirSync('reports').sort()) {
   // different string than the model was originally handed, and the replay then
   // disagrees with a report that is perfectly self-consistent. Seven such false
   // positives is worse than no second opinion on those seven.
-  const locRaw = field(t, 'location_final');
-  if (field(t, 'model_base') !== null && locRaw !== null && LOC_SEP.test(locRaw)
+  // reportModelText() decides which reports are replayable (writer stamp, else the
+  // separator), so this gate and apply-model cannot disagree about it (Codex, 2026-10-29).
+  const replayText = reportModelText(t);
+  if (field(t, 'model_base') !== null && replayText !== null
       && ![mcv, ns, cp, cu].some(v => v === null || Number.isNaN(v))) {
     const base = (mcv + ns + cp + cu) / 4 + (n('red_flags_adj') || 0);
     // location_final is "<location> <sep> <why>" and comp_posted may read "not
     // published", but the model was handed the bare location and an empty string.
-    const locFinal = locRaw.split(LOC_SEP)[0].trim();
-    const cpPosted = field(t, 'comp_posted');
-    // A posted band is only re-armed as a comp gate when the report says it
-    // measures TOTAL compensation. This replay used to relabel every
-    // comp_posted figure as comp_total_est, which is the same mislabelling
-    // eval-write.mjs carried: score-model gates on total, most postings print
-    // base, and a sub-floor BASE band says nothing about total because bonus
-    // and equity are unknown. eval-write now withholds the field for a
-    // non-total basis, so a replay that kept relabelling would disagree with
-    // every correctly-written report from here on.
-    //
-    // Only the answers that positively deny a total basis suppress it. The
-    // legacy corpus writes "posted" and "not_posted", which say whether a
-    // figure exists rather than what it measures, so those keep the old
-    // behaviour and this change is a no-op on the 565 rows already audited.
-    const cpBasis = String(field(t, 'comp_basis') || '').trim().toLowerCase();
-    const notTotal = cpBasis === 'base' || cpBasis === 'unknown';
-    // A comp_total_est the report states outright is what eval-write handed the model,
-    // whether it came from a total-basis posting or from the evaluator's own judgement,
-    // so it wins over the reconstruction. The arrangement is replayed the same way: the
-    // persisted verdict, not one re-derived from the bare location.
-    const est = field(t, 'comp_total_est');
-    const compLine = est !== null ? est
-      : (!cpPosted || cpPosted === 'not published' || notTotal) ? '' : cpPosted;
+    // The replay's input is reportModelText() in score-model.mjs, shared with
+    // apply-model.mjs since 2026-10-29: comp_total_est when stated, else a posted band
+    // only when its basis is not base/unknown, plus the bare location. It used to be
+    // built here alone while apply-model read the whole report, and the two passes
+    // disagreed on every eval-write report whose prose named a pay range.
     model = applyModel(Math.round(base * 1000) / 1000, {
-      text: `comp_total_est: "${compLine}"\n` + `location: "${locFinal}"\n`,
+      text: replayText,
       company: field(t, 'company'), role: field(t, 'role'), prefs,
       arrangement: persistedArrangement(t),
     }).final;

@@ -117,9 +117,17 @@ def same_role(a, b):
 
 
 # --- LinkedIn feed parser --------------------------------------------------
-POSTED = re.compile(r"^\s*(?:Posted\s+)?(\d+\s+\w+\s+ago|Be an early applicant)", re.I)
+# "Reposted 2 weeks ago" is LinkedIn's other spelling of the closing date line. Unread, it
+# left its card open and the next card's date closed both, merging two roles and their
+# LinkedIn ids into one buffer (Codex, PR 14).
+POSTED = re.compile(r"^\s*(?:(?:Re)?posted\s+)?(\d+\s+\w+\s+ago|Be an early applicant)", re.I)
 COMP = re.compile(r"\$[\d.,]+\s*(?:K|M)?\s*/?\s*(?:yr|hr|year|hour)?"
                   r"(?:\s*-\s*\$[\d.,]+\s*(?:K|M)?\s*/?\s*(?:yr|hr|year|hour)?)?", re.I)
+# The LinkedIn job id, as linkedin-tree-to-feed.py writes it on its own line inside a card
+# (and as a pasted feed can carry it). Read here so the id stays bound to ITS card: the
+# sweep report used to re-join ids by company and title, which pairs one requisition's id
+# with another's location when a company posts one title in several places (Codex, PR 14).
+JOBVIEW = re.compile(r"linkedin\.com/jobs/view/(\d+)", re.I)
 LOCLINE = re.compile(
     r"^(.*(?:United States|Remote|,\s*[A-Z]{2}\b|Metropolitan Area|"
     r"California|New York|Texas|Washington).*)$")
@@ -179,6 +187,8 @@ def parse_feed(text):
 def _close(buf, age):
     clean = [dedupe_doubled(b) for b in buf]
     clean = [c for c in clean if c and not NOISE.match(c)]
+    ids = [m.group(1) for m in map(JOBVIEW.search, clean) if m]
+    clean = [c for c in clean if not JOBVIEW.search(c)]
     if len(clean) < 2:
         return None
     role, company = clean[0], clean[1]
@@ -191,7 +201,8 @@ def _close(buf, age):
                 "".join(COMP.findall(c)[1:]) if len(COMP.findall(c)) > 1 else "")
             m = re.findall(r"\$[\d.,]+\s*[KM]?", c)
             comp = " - ".join(m[:2]) if m else comp
-    return dict(company=company, role=role, location=loc, comp=comp, age=age)
+    return dict(company=company, role=role, location=loc, comp=comp, age=age,
+                linkedin_id=ids[0] if ids else "")
 
 
 # --- tracker ---------------------------------------------------------------
@@ -284,6 +295,27 @@ def selftest():
                   f"      got {got}, expected {want}\n      {why}")
     print(f"{bad} of {len(ROLE_CASES)} role-matching cases failed" if bad
           else f"all {len(ROLE_CASES)} role-matching cases pass")
+    # One title, two requisitions: each id must stay with its own card's location, and the
+    # id line must never be read as a location or a role.
+    feed = ("Technical Artist\nAcme Games\nIrvine, CA\nlinkedin.com/jobs/view/111\n2 days ago\n\n"
+            "Technical Artist\nAcme Games\nRemote, United States\n$150K/yr - $180K/yr\n"
+            "linkedin.com/jobs/view/222\n3 days ago\n\n"
+            # A pasted card can carry its link first; the role and company are positional,
+            # so the link line has to come out before they are read.
+            "https://www.linkedin.com/jobs/view/333/\nRigging Artist\nBeta Studio\n"
+            "Los Angeles, CA\nReposted 2 weeks ago\n\n"
+            # ...and "Reposted" closes a card as "Posted" does, or the next card merges in.
+            "Character TD\nGamma Pictures\nBurbank, CA\nlinkedin.com/jobs/view/444\n1 day ago\n")
+    got = [(r["linkedin_id"], r["location"], r["role"]) for r in parse_feed(feed)]
+    want = [("111", "Irvine, CA", "Technical Artist"),
+            ("222", "Remote, United States", "Technical Artist"),
+            ("333", "Los Angeles, CA", "Rigging Artist"),
+            ("444", "Burbank, CA", "Character TD")]
+    if got != want:
+        bad += 1
+        print(f"FAIL  a card's LinkedIn id must stay bound to that card\n      got {got}")
+    else:
+        print("the LinkedIn id stays bound to its own card")
     return bad + gate_selftest()
 
 

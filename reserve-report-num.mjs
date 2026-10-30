@@ -64,7 +64,10 @@ function maxSlot() {
   const entries = readdirSync(REPORTS_DIR);
   let max = 0;
   for (const name of entries) {
-    const m = name.match(/^(\d{3})-/);
+    // Three digits is the floor, not the width: report 1000 arrived on 2026-10-25, and
+    // `^(\d{3})-` never matched it, so the max stalled at 999 and slot 1000 would be
+    // handed out again. eval-write's numOf() already reads `\d{3,}`.
+    const m = name.match(/^(\d{3,})-/);
     if (m) max = Math.max(max, parseInt(m[1], 10));
   }
   return max;

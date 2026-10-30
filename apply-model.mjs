@@ -42,7 +42,7 @@ const REPORTS = args.has('--reports');
 // data it reads (data/, reports/) stays relative to where it is run.
 const here = (f) => new URL(f, import.meta.url).href;
 const { parseScores, computeGlobal } = await import(here('audit-scores.mjs'));
-const { applyModel, loadPrefs, MODEL, persistedArrangement } = await import(here('score-model.mjs'));
+const { applyModel, loadPrefs, MODEL, persistedArrangement, reportModelText } = await import(here('score-model.mjs'));
 
 const TRACKER = join('data', 'applications.md');
 const TODAY = '2026-07-27';
@@ -96,8 +96,11 @@ for (const row of trackerRows(lines, colmap)) {
   // would hide the rest, and writing around them would leave those rows silently stale.
   let r;
   try {
+    // An eval-write report is replayed on the same inputs eval-write used; see
+    // reportModelText(). Only a legacy hand-written report is read whole.
     r = applyModel(base, {
-      text, company: row.company, role: row.role, prefs, arrangement: persistedArr,
+      text: reportModelText(text) ?? text, company: row.company, role: row.role, prefs,
+      arrangement: persistedArr,
     });
   } catch (e) {
     invalid.push(`#${num} ${p}: ${e.message}`);
@@ -238,6 +241,12 @@ for (const x of scored) {
     `${m[1]}model_pref_factor: ${x.pf.toFixed(3)}`,
     `${m[1]}model_arrangement: ${x.arr}`,
   ].join('\n');
-  writeFileSync(x.path, text.replace(m[0], block), 'utf-8');
+  text = text.replace(m[0], block);
+  // The stated `final:` and the header move with `global`. score-audit treats `final`
+  // as the report's word, so annotating `global` alone left the old value standing and
+  // `score-audit --fix` then undid this very pass, churning rows (Codex, 2026-10-29).
+  text = text.replace(/^final:\s*[\d.]+/m, `final: ${x.to.toFixed(2)}`)
+    .replace(/^\*\*Score:\*\*\s*[\d.]+\/5/m, `**Score:** ${x.to.toFixed(1)}/5`);
+  writeFileSync(x.path, text, 'utf-8');
 }
 console.log(`  reports annotated: ${touched} new, ${refreshed} refreshed`);

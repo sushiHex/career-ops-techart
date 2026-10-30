@@ -37,6 +37,7 @@ import { readFileSync, writeFileSync, copyFileSync, existsSync, mkdirSync, statS
 import { createHash } from 'crypto';
 import { dirname, resolve } from 'path';
 import { pathToFileURL } from 'url';
+import { localDate } from './local-date.mjs';
 import yaml from 'js-yaml';
 
 import { guardArgs, isMain } from './cli-guard.mjs';
@@ -255,7 +256,7 @@ function reportDiagnostics(diag) {
 
 function syncIndex(db, states) {
   const { apps, diag } = parseTracker(states);
-  const today = new Date().toISOString().slice(0, 10);
+  const today = localDate();
 
   db.exec('BEGIN');
   db.exec('PRAGMA defer_foreign_keys = ON'); // full rebuild — FKs settle at commit

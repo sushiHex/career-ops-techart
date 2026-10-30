@@ -1808,6 +1808,41 @@ try {
     rmSync(dirname(tmpTracker), { recursive: true, force: true });
   }
 
+  // verify-pipeline's duplicate warning keyed on company + title alone, so two Zillow reqs
+  // sharing a title (P732510, P711740) read as a duplicate on every run (2026-10-20). Rows
+  // with disjoint requisition ids are provably distinct; rows without ids still warn.
+  {
+    const dir = mkdtempSync(join(tmpdir(), 'co-verify-dupes-'));
+    mkdirSync(join(dir, 'reports'));
+    const wd = (id) => `**URL:** https://acme.wd5.myworkdayjobs.com/External/job/Remote-USA/ML-Engineer_${id}\n`;
+    writeFileSync(join(dir, 'reports', '1.md'), wd('JR1000101'));
+    writeFileSync(join(dir, 'reports', '2.md'), wd('JR1000202'));
+    writeFileSync(join(dir, 'reports', '3.md'), '**URL:** https://beta.example/careers\n');
+    writeFileSync(join(dir, 'reports', '4.md'), '**URL:** https://beta.example/careers\n');
+    // Disjoint but NOT comparable: a Greenhouse id and a company-hosted id can be one posting.
+    writeFileSync(join(dir, 'reports', '5.md'), '**URL:** https://job-boards.greenhouse.io/gamma/jobs/1234567\n');
+    writeFileSync(join(dir, 'reports', '6.md'), '**URL:** https://gamma.example/careers/jobs/7654321\n');
+    writeFileSync(join(dir, 'applications.md'), [
+      '| # | Date | Company | Role | Score | Status | PDF | Report | Notes |',
+      '|---|------|---------|------|-------|--------|-----|--------|-------|',
+      '| 1 | 2026-10-01 | Acme | ML Engineer | 3.0/5 | SKIP | ❌ | [1](reports/1.md) | n |',
+      '| 2 | 2026-10-02 | Acme | ML Engineer | 3.0/5 | SKIP | ❌ | [2](reports/2.md) | n |',
+      '| 3 | 2026-10-03 | Beta | Designer | 3.0/5 | SKIP | ❌ | [3](reports/3.md) | n |',
+      '| 4 | 2026-10-04 | Beta | Designer | 3.0/5 | SKIP | ❌ | [4](reports/4.md) | n |',
+      '| 5 | 2026-10-05 | Gamma | Engineer | 3.0/5 | SKIP | ❌ | [5](reports/5.md) | n |',
+      '| 6 | 2026-10-06 | Gamma | Engineer | 3.0/5 | SKIP | ❌ | [6](reports/6.md) | n |',
+    ].join('\n') + '\n');
+    const out = run('node', [join(ROOT, 'verify-pipeline.mjs')],
+      { env: { ...process.env, CAREER_OPS_TRACKER: join(dir, 'applications.md') }, cwd: ROOT }) || '';
+    if (!/Possible duplicates: #1, #2/.test(out) && /Possible duplicates: #3, #4/.test(out)
+        && /Possible duplicates: #5, #6/.test(out)) {
+      pass('verify-pipeline flags a same-title pair only when its req ids do not tell them apart');
+    } else {
+      fail(`verify-pipeline duplicate check wrong: ${(out.match(/Possible duplicates.*/g) || ['none']).join('; ')}`);
+    }
+    rmSync(dir, { recursive: true, force: true });
+  }
+
   // ── Score units: the tracker states FINAL, not BASE ───────────────
   // board-recompute.mjs and audit-scores.mjs both compared the tracker's score
   // against `base` while the tracker records `final = base * comp * pref * arr`.
@@ -1924,6 +1959,12 @@ try {
     ['company', 'Anduril Industries — Costa Mesa (defense-AI / real-time 3D)', 'anduril industries'],
     ['company', 'SentinelOne (AI Developer Experience / enablement) [REMOTE-US]', 'sentinelone'],
     ['company', 'NVIDIA', 'nvidia'],
+    // A dash INSIDE a parenthetical used to cut the string mid-paren (2026-10-23).
+    ['company', 'Zillow (Agentic AI org \u2014 Zillow AI Copilot) [REMOTE-US]', 'zillow'],
+    ['company', 'Grafana Labs (Senior AI Engineer \u2014 multi-agent) [REMOTE-US]', 'grafana labs'],
+    ['company', 'Future / future.co (Applied AI Engineer \u2014 agents + eval) [REMOTE-US]', 'future'],
+    ['company', 'Appian Corporation', 'appian'],
+    ['company', 'ThirdLaw Inc', 'thirdlaw'],
     ['role', 'Senior AI Platform & Tools Engineer', 'senior ai platform and tools engineer'],
     ['role', 'Senior AI Platform and Tools Engineer', 'senior ai platform and tools engineer'],
     ['role', 'Staff Software Engineer, DevEx - VALORANT (REQ-0645134)', 'staff software engineer devex valorant'],
@@ -1945,6 +1986,60 @@ try {
     // A short number in a title is not an id.
     ['role', 'Senior Engineer, Team 2026 Launch (Year 3)', 'senior engineer team 2026 launch year 3'],
   ];
+  // A tracked req re-titled on a differently spelled URL is still the tracked req
+  // (NVIDIA JR2935363, re-listed as new on 2026-10-23); a different req of the same
+  // company is not; a decorated portals.yml name reaches the same key.
+  {
+    const { loadSeenReqIds, reqIdKey } = await import(pathToFileURL(join(ROOT, 'scan.mjs')).href);
+    const tracker = [
+      '| # | Date | Company | Role | Score | Status | PDF | Report | Notes |',
+      '|---|---|---|---|---|---|---|---|---|',
+      '| 1 | 2026-09-26 | NVIDIA | Technical Marketing Engineer - Example (JR1000731) | 4.0/5 | SKIP | x | [1](../reports/none.md) | n |',
+    ].join('\n');
+    const seen = loadSeenReqIds(tracker);
+    const base = 'https://acme.wd5.myworkdayjobs.com/Site/job/US-CA-Santa-Clara/';
+    const hit = seen.get(reqIdKey('NVIDIA', `${base}Senior-Technical-Marketing-Engineer---Example_JR1000731`));
+    const miss = seen.get(reqIdKey('NVIDIA', `${base}Senior-Technical-Marketing-Engineer---Example_JR1000732`));
+    const decorated = seen.get(reqIdKey('NVIDIA (Omniverse) [REMOTE-US]', `${base}X_JR1000731`));
+    if (hit?.num === '1' && !miss && decorated?.num === '1') {
+      pass('scan dedups a tracked req by requisition id across a re-title and a changed URL');
+    } else {
+      fail(`scan req-id dedup: hit=${JSON.stringify(hit)} miss=${JSON.stringify(miss)} decorated=${JSON.stringify(decorated)}`);
+    }
+    // An employer-unique id ignores the company spelling; a tenant-local one never does.
+    const g = 'https://www.google.com/about/careers/applications/jobs/results/114723757451217499-example';
+    const sameG = reqIdKey('Google / Alphabet (DeepMind, Pixel)', g) === reqIdKey('Google', g);
+    const wd = `${base}X_R1000731`;
+    const splitWd = reqIdKey('Acme', wd) !== reqIdKey('Other Co', wd);
+    if (sameG && splitWd) pass('scan keys a Google id across company spellings and a bare Workday id per company');
+    else fail(`scan global-id key: google same=${sameG} workday split=${splitWd}`);
+  }
+  // A title match must not override a requisition conflict. A live req was dropped
+  // every scan as a tracked row that is a different req with the same title. Both carry ids and share none, so the posting is new; a
+  // posting or a row with no id still falls back to the title.
+  {
+    const { loadSeenCompanyRoles, titleDupOf } = await import(pathToFileURL(join(ROOT, 'scan.mjs')).href);
+    const { extractJobId } = await import(pathToFileURL(join(ROOT, 'role-matcher.mjs')).href);
+    const tracker = [
+      '| # | Date | Company | Role | Score | Status | PDF | Report | Notes |',
+      '|---|---|---|---|---|---|---|---|---|',
+      '| 7 | 2026-10-13 | CrowdStrike | Sr. AI Agent Developer (Remote) (R37811) | 3.8/5 | Discarded | x | [7](../reports/none.md) | n |',
+      '| 8 | 2026-10-13 | Acme | Staff Agent Engineer | 3.0/5 | SKIP | x | [8](../reports/none.md) | n |',
+    ].join('\n');
+    const seen = loadSeenCompanyRoles(tracker);
+    const cs = `${canonicalCompany('CrowdStrike')}::${canonicalRole('Sr. AI Agent Developer (Remote)')}`;
+    const base = 'https://crowdstrike.wd5.myworkdayjobs.com/crowdstrikecareers/job/USA---Remote/';
+    const other = titleDupOf(seen, cs, extractJobId(`${base}Example-Role-A_R21535`));
+    const same = titleDupOf(seen, cs, extractJobId(`${base}Example-Role-B_R37811`));
+    const noId = titleDupOf(seen, cs, null);
+    const acme = `${canonicalCompany('Acme')}::${canonicalRole('Staff Agent Engineer')}`;
+    const rowNoId = titleDupOf(seen, acme, 'R12345');
+    if (!other && same?.num === '7' && noId?.num === '7' && rowNoId?.num === '8') {
+      pass('scan title dedup yields to a requisition conflict (a different req with the same title is new)');
+    } else {
+      fail(`scan title dedup vs req conflict: other=${other?.num} same=${same?.num} noId=${noId?.num} rowNoId=${rowNoId?.num}`);
+    }
+  }
   for (const [kind, input, expected] of canonCases) {
     const got = kind === 'company' ? canonicalCompany(input) : canonicalRole(input);
     if (got === expected) pass(`canonical ${kind}: ${JSON.stringify(input)} → ${JSON.stringify(expected)}`);
@@ -1952,8 +2047,9 @@ try {
   }
   // The known hazard: stripping req ids collapses distinct reqs that share a
   // title. This asserts the collapse HAPPENS, so the behaviour is deliberate and
-  // documented rather than discovered later — it is why every dedup drop is
-  // written to data/already-evaluated.tsv instead of vanishing.
+  // documented rather than discovered later. The collapse is now answered by
+  // titleDupOf() (case above), which lets a requisition conflict override it; the
+  // already-evaluated.tsv log alone was not a safeguard, since nobody reads it.
   if (canonicalRole('Senior Engineer - AI Agents and Systems (JR2462112)')
       === canonicalRole('Senior Engineer - AI Agents and Systems (JR2525326)')) {
     pass('canonical role collapses same-title different-req pairs (logged, not silently dropped)');
@@ -1969,10 +2065,21 @@ try {
   const { buildTitleFilter: makeTitle } = await import(pathToFileURL(join(ROOT, 'scan.mjs')).href);
   const titlePass = makeTitle({
     positive: ['Technical Artist', 'Rigging', 'Agent*', 'Eval*', 'AI Engineer*',
-      'Technical Marketing', 'Applied AI', 'Pipeline', 'Graphics'],
-    negative: ['Intern', 'Sales', 'Product Marketing', 'Advertis*', 'Finance'],
+      'Technical Marketing', 'Applied AI', 'Pipeline', 'Graphics', 'Forward Deployed',
+      'Solutions Architect'],
+    negative: ['Intern', 'Sales', 'Sales Director', 'Product Marketing', 'Advertis*', 'Finance'],
+    override: ['Solutions Architect', 'Applied AI'],
+    override_lifts: ['Sales'],
   });
   const titleCases = [
+    // 2026-10-29: a space in a keyword matches a hyphen, and an override lifts a veto
+    // (a profile may want technical pre-sales architects in scope) but never stands in for a positive.
+    ['Forward-Deployed Engineer, AI', true, '"Forward Deployed" matches the hyphenated spelling'],
+    ['Pre-Sales Solutions Architect, Agentic AI', true, 'the override lifts the "Sales" veto'],
+    ['Sales Engineer', false, 'a sales title with no override still goes'],
+    ['Sales Director, Solutions Architect Team', false, 'a sales-function negative is never lifted'],
+    ['Applied AI Intern', false, 'an override never lifts an early-career veto'],
+    ['Applied AI Sales Intern', false, 'a liftable veto beside an unliftable one still vetoes'],
     // Word boundaries: substring matching ate these.
     ['Internal Tools Engineer, Pipeline', true, '"Intern" must not match "Internal"'],
     // Carries a positive ("Pipeline") so this isolates the veto: the only way
@@ -2539,6 +2646,175 @@ try {
   fail(`breezy provider tests crashed: ${e.message}`);
 }
 
+// ── PROVIDERS: Rippling ATS ────────────────────────────────────────
+
+console.log('\nProvider: rippling');
+
+try {
+  const mod = await import(pathToFileURL(join(ROOT, 'providers/rippling.mjs')).href);
+  const rippling = mod.default;
+  const { parseRipplingJobs } = mod;
+
+  if (rippling.id === 'rippling') pass('rippling.id is "rippling"');
+  else fail(`rippling.id is ${JSON.stringify(rippling.id)}`);
+
+  const hit = rippling.detect({ name: 'Layer', careers_url: 'https://ats.rippling.com/layer/jobs' });
+  if (hit && hit.url === 'https://api.rippling.com/platform/api/ats/v1/board/layer/jobs') {
+    pass('rippling.detect() resolves ats.rippling.com/{slug} to the board API');
+  } else {
+    fail(`rippling.detect() returned ${JSON.stringify(hit)}`);
+  }
+  if (rippling.detect({ name: 'X', careers_url: 'https://example.com/careers' }) === null) {
+    pass('rippling.detect() returns null for non-rippling URLs');
+  } else {
+    fail('rippling.detect() claimed a non-rippling URL');
+  }
+
+  // One row per (posting, location): rows sharing a uuid are ONE posting with every location.
+  const board = [
+    { uuid: 'a1', name: 'Staff Engineer, AI', url: 'https://ats.rippling.com/x/jobs/a1', workLocation: { label: 'San Francisco, CA' } },
+    { uuid: 'a1', name: 'Staff Engineer, AI', url: 'https://ats.rippling.com/x/jobs/a1', workLocation: { label: 'Remote (United States)' } },
+    { uuid: 'b2', name: 'Rigging TD', url: 'https://ats.rippling.com/x/jobs/b2', workLocation: { label: 'Los Angeles, CA' } },
+    { name: 'No URL' },
+  ];
+  const rows = parseRipplingJobs(board, 'X');
+  if (rows.length === 2) pass('parseRipplingJobs folds per-location duplicates and drops rows with no url');
+  else fail(`parseRipplingJobs returned ${rows.length} rows, expected 2`);
+  if (rows[0] && /San Francisco/.test(rows[0].location) && /Remote/.test(rows[0].location)) {
+    pass('parseRipplingJobs keeps every location of a folded posting (a remote entry is not discarded)');
+  } else {
+    fail(`parseRipplingJobs location: ${JSON.stringify(rows[0]?.location)}`);
+  }
+  if (parseRipplingJobs([], 'X').length === 0) pass('parseRipplingJobs yields nothing for an empty board');
+  else fail('parseRipplingJobs invented rows from an empty board');
+
+  // A missing board answers an error OBJECT; it must throw, not read as an empty board.
+  let threw = false;
+  try {
+    await rippling.fetch({ name: 'Ghost', careers_url: 'https://ats.rippling.com/ghost' },
+      { fetchJson: async () => ({ error_code: 'RESOURCE_NOT_FOUND', message: 'Job Board not found' }) });
+  } catch { threw = true; }
+  if (threw) pass('rippling.fetch() throws on a missing board instead of reporting it empty');
+  else fail('rippling.fetch() read an error object as an empty board');
+} catch (e) {
+  fail(`rippling provider tests crashed: ${e.message}`);
+}
+
+// ── PROVIDERS: Eightfold (PCS) ─────────────────────────────────────
+
+console.log('\nProvider: eightfold');
+
+try {
+  const mod = await import(pathToFileURL(join(ROOT, 'providers/eightfold.mjs')).href);
+  const ef = mod.default;
+  const { resolveBoard, parsePage, postingLocations, toJob } = mod;
+
+  if (ef.id === 'eightfold') pass('eightfold.id is "eightfold"');
+  else fail(`eightfold.id is ${JSON.stringify(ef.id)}`);
+
+  // The tenant domain is DECLARED (a verified host, or ?domain= on the careers URL) and
+  // never derived: explore.jobs.netflix.NET answers to netflix.COM.
+  const nf = resolveBoard({ careers_url: 'https://explore.jobs.netflix.net/careers' });
+  if (nf && nf.domain === 'netflix.com' && nf.api === 'v2') pass('eightfold: a recorded host resolves to its verified domain, not one derived from the hostname');
+  else fail(`eightfold: Netflix host resolved to ${JSON.stringify(nf)}`);
+  if (resolveBoard({ careers_url: 'https://acme.eightfold.ai/careers' }) === null) pass('eightfold: an unrecorded host with no declared domain is refused, not guessed');
+  else fail('eightfold: derived a tenant domain from an unrecorded hostname');
+  const decl = resolveBoard({ careers_url: 'https://acme.eightfold.ai/careers?domain=acme.com' });
+  if (decl && decl.domain === 'acme.com' && decl.api === null) pass('eightfold: ?domain= on a /careers URL is a declaration, with the API variant left to probe');
+  else fail(`eightfold: declared domain resolved to ${JSON.stringify(decl)}`);
+  if (ef.detect({ careers_url: 'https://jobs.netflix.com/careers/games' }) === null
+      && ef.detect({ careers_url: 'https://example.com/search?domain=example.com' }) === null) {
+    pass('eightfold.detect() claims neither a non-Eightfold Netflix page nor a stray domain parameter');
+  } else fail('eightfold.detect() claimed a URL that is not an Eightfold board');
+
+  // A 200 with no positions array is unreadable, never an empty board.
+  const throws = (fn) => { try { fn(); return false; } catch { return true; } };
+  if (throws(() => parsePage({}, 'v2')) && throws(() => parsePage({ data: {} }, 'pcsx'))
+      && throws(() => parsePage({ status: 200, error: { message: 'Not authorized' }, data: { positions: [] } }, 'pcsx'))) {
+    pass('eightfold.parsePage() refuses a body with no positions array or a pcsx error');
+  } else fail('eightfold.parsePage() read an unreadable body as a page');
+
+  // Every location is kept, and the remote flag is qualified by each place, never bare.
+  const locs = postingLocations({ location: 'Los Gatos,California,United States of America',
+    locations: ['Los Gatos,California,United States of America', 'Los Angeles,California,United States of America'],
+    work_location_option: 'onsite' });
+  if (locs.length === 2 && locs.some((l) => /Los Angeles/.test(l))) pass('eightfold: a secondary location is folded in, not dropped');
+  else fail(`eightfold: locations ${JSON.stringify(locs)}`);
+  const rl = postingLocations({ locations: ['London,England,United Kingdom', 'Remote, United States'], workLocationOption: 'remote_local' });
+  if (rl.includes('London,England,United Kingdom (Remote)') && rl.includes('Remote, United States') && !rl.includes('Remote')) {
+    pass('eightfold: the remote flag qualifies each place and adds no bare "Remote" option');
+  } else fail(`eightfold: remote folding gave ${JSON.stringify(rl)}`);
+  // Microsoft's list payload says `onsite` for every posting; a declared remote-only filter
+  // is the remote signal, and must not turn a Redmond-listed remote role into a WA-only one.
+  const msBoard = resolveBoard({ careers_url: 'https://apply.careers.microsoft.com/careers?domain=microsoft.com&filter_work_site=0%20days%20%2F%20week%20in-office%20%E2%80%93%20remote' });
+  const { filtersDeclareRemote, pageUrl } = mod;
+  if (msBoard && msBoard.remoteOnly && pageUrl(msBoard, 'pcsx', 0).includes('&filter_work_site=0%20days')
+      && !filtersDeclareRemote([['filter_work_site', '0 days / week in-office – remote'], ['filter_work_site', 'fully on-site']])) {
+    pass('eightfold: a filter_* on the careers url is passed through, and is remote-only only when every value says remote');
+  } else fail(`eightfold: filter handling gave ${JSON.stringify(msBoard)}`);
+  const msLocs = postingLocations({ locations: ['United States, Washington, Redmond', 'India, Karnataka, Bengaluru'], workLocationOption: 'onsite' }, { remoteOnly: true });
+  if (msLocs.includes('Remote, United States') && msLocs.includes('India, Karnataka, Bengaluru (Remote)') && !msLocs.includes('Remote')) {
+    pass('eightfold: a declared remote-only board reads a US place as remote-US and keeps a foreign place foreign');
+  } else fail(`eightfold: remote-only folding gave ${JSON.stringify(msLocs)}`);
+  const pj = toJob({ id: 1256963385116965, name: 'Senior SWE', positionUrl: '/careers/job/1256963385116965', locations: ['US'] },
+    { origin: 'https://apply.careers.microsoft.com' }, 'Microsoft');
+  if (pj && pj.url === 'https://apply.careers.microsoft.com/careers/job/1256963385116965') pass('eightfold: a pcsx posting gets the absolute /careers/job/<id> url');
+  else fail(`eightfold: toJob gave ${JSON.stringify(pj)}`);
+
+  // The walk: count latched from page one, pages of 10 until a short page.
+  const page = (n, from) => Array.from({ length: n }, (_, i) => ({ id: 1000 + from + i, name: `Role ${from + i}`, locations: ['Remote, United States'], work_location_option: 'remote_local' }));
+  const ctxFor = (count, sizes, { breakAt = -1 } = {}) => ({
+    async fetchJson(url) {
+      const start = Number(new URL(url).searchParams.get('start'));
+      const idx = start / 10;
+      if (idx === breakAt) return { error: 'waf' };
+      return { positions: page(sizes[idx] ?? 0, start), count };
+    },
+  });
+  const entry = { name: 'Netflix', careers_url: 'https://explore.jobs.netflix.net/careers' };
+  const whole = await ef.fetch(entry, ctxFor(24, [10, 10, 4]));
+  if (whole.length === 24 && !whole.truncated) pass('eightfold.fetch() walks every page to a short page and reports the board whole');
+  else fail(`eightfold.fetch() read ${whole.length} (truncated=${whole.truncated})`);
+  const short = await ef.fetch(entry, ctxFor(30, [10, 10, 4]));
+  if (short.length === 24 && /TRUNCATED/.test(short.truncated || '')) pass('eightfold.fetch() reports a walk that read fewer postings than the board count as TRUNCATED');
+  else fail(`eightfold.fetch() absorbed a shortfall: ${short.length}, ${short.truncated}`);
+  // A posting skipped by offset shift on the first walk is recovered by the second.
+  let calls = 0;
+  const shiftCtx = {
+    async fetchJson(url) {
+      const start = Number(new URL(url).searchParams.get('start'));
+      calls++;
+      const all = page(24, 0);
+      // First walk: postings 10..23 served one slot late from page 2 on, so id 1010 is never seen.
+      const served = calls <= 3 && start >= 10 ? all.slice(start + 1, start + 11) : all.slice(start, start + 10);
+      return { positions: served, count: 24 };
+    },
+  };
+  const healed = await ef.fetch(entry, shiftCtx);
+  if (healed.length === 24 && !healed.truncated) pass('eightfold.fetch() recovers an offset-shift skip with one second walk instead of flagging it');
+  else fail(`eightfold.fetch() shift recovery: ${healed.length}, ${healed.truncated}`);
+  let threw = false;
+  try { await ef.fetch(entry, ctxFor(24, [10, 10, 4], { breakAt: 1 })); } catch { threw = true; }
+  if (threw) pass('eightfold.fetch() throws on an unreadable mid-walk page instead of ending the board there');
+  else fail('eightfold.fetch() read an unreadable page as the end of the board');
+
+  // An unrecorded tenant answering v2 with 403 is a pcsx tenant (Microsoft's shape).
+  const asked = [];
+  const pcsxCtx = {
+    async fetchJson(url) {
+      asked.push(new URL(url).pathname);
+      if (url.includes('/api/apply/v2/')) { const e = new Error('HTTP 403'); e.status = 403; throw e; }
+      const start = Number(new URL(url).searchParams.get('start'));
+      return { status: 200, error: { message: '' }, data: { positions: start === 0 ? page(3, 0) : [], count: 3 } };
+    },
+  };
+  const viaPcsx = await ef.fetch({ name: 'Acme', careers_url: 'https://acme.eightfold.ai/careers?domain=acme.com' }, pcsxCtx);
+  if (viaPcsx.length === 3 && asked[0].includes('/api/apply/v2/') && asked[1] === '/api/pcsx/search') pass('eightfold.fetch() falls back to pcsx when an unrecorded tenant refuses v2 with 403');
+  else fail(`eightfold.fetch() variant probe: ${viaPcsx.length} jobs, asked ${JSON.stringify(asked)}`);
+} catch (e) {
+  fail(`eightfold provider tests crashed: ${e.message}`);
+}
+
 // ── PROVIDERS — Ashby embedded-board fallback ───────────────────────
 
 console.log('\nProvider — ashby (embedded board fallback)');
@@ -2608,8 +2884,148 @@ try {
   } else {
     fail('parseEmbeddedBoard invented rows from a page with no board');
   }
+
+  // The posting API's secondary address: its country must never stand alone as a
+  // location option, or every office role with a US address reads as "a country, not a
+  // place" (unknown) instead of a far-metro reject (Perplexity, 2026-10-18).
+  // Asserted through the GATE, not just the string, since the verdict is what matters.
+  const { buildSignals, decideLocations, effectiveLocationFilter, loadLocationPolicy } =
+    await import(pathToFileURL(join(ROOT, 'location-core.mjs')).href);
+  // A pinned policy with a commute area, never the installed one: the verdicts below need
+  // a home state and a far metro, which the neutral fallback does not have.
+  const sig = buildSignals(effectiveLocationFilter({},
+    loadLocationPolicy(join(ROOT, 'presets', 'locations', 'california-socal.json'))));
+  const addr = (location, addressLocality, addressCountry, addressRegion) =>
+    ({ location, address: { postalAddress: { addressLocality, addressCountry, addressRegion } } });
+  const verdictOf = (...secondaries) => decideLocations(
+    mod.formatLocation({ location: 'San Francisco', secondaryLocations: secondaries }), sig).verdict;
+  const cases = [
+    // The bug: every office far, so a reject, never "a country, not a place".
+    [[addr('Seattle', 'Seattle', 'United States'), addr('New York City', 'New York', 'United States')], 'reject'],
+    // Verdicts the old shape got right must not move (Codex's probes, 2026-10-18).
+    [[addr('Remote, United States', 'New York', 'United States')], 'accept'],
+    [[addr('United States', 'Los Angeles', 'United States')], 'accept'],
+    [[addr('Remote', undefined, 'United States')], 'accept'],
+    // A bare Remote label is qualified by its own address, region included.
+    [[addr('Remote', undefined, 'Canada')], 'reject'],
+    [[addr('Remote', undefined, 'United States', 'Texas')], 'reject'],
+    [[addr('Remote', undefined, 'United States', 'California')], 'accept'],
+    // A label that names its country keeps its meaning over an office region.
+    [[addr('Remote, United States', undefined, 'United States', 'New York')], 'accept'],
+  ];
+  const bad = cases.filter(([s, want]) => verdictOf(...s) !== want)
+    .map(([s, want]) => `${JSON.stringify(mod.formatLocation({ location: 'San Francisco', secondaryLocations: s }))} -> ${verdictOf(...s)}, want ${want}`);
+  if (!bad.length) pass(`ashby formatLocation: ${cases.length} secondary-address shapes reach the right gate verdict`);
+  else fail(`ashby formatLocation: ${bad.join(' | ')}`);
 } catch (e) {
   fail(`ashby embedded-board tests crashed: ${e.message}`);
+}
+
+// ── PROVIDERS: Google careers (embedded results list) ──────────────
+
+console.log('\nProvider: google (careers results page)');
+
+try {
+  const mod = await import(pathToFileURL(join(ROOT, 'providers/google.mjs')).href);
+  const google = mod.default;
+  const { parseResultsPage, locationOptions, walkSearch } = mod;
+  const RESULTS = 'https://www.google.com/about/careers/applications/jobs/results/';
+
+  if (google.id === 'google') pass('google.id is "google"');
+  else fail(`google.id is ${JSON.stringify(google.id)}`);
+  if (google.detect({ name: 'G', careers_url: RESULTS }) && google.detect({ name: 'G', careers_url: RESULTS.slice(0, -1) })
+      && !google.detect({ name: 'G', careers_url: 'https://tracker.example/r/www.google.com/about/careers/applications/jobs/results/' })) {
+    pass('google.detect() claims the results URL, anchored at the host');
+  } else {
+    fail('google.detect() routing is wrong');
+  }
+
+  // Fixture in the live shape (2026-10-29): ds:0 is a company list, ds:1 the job list
+  // [records, null, total, pageSize]; a record is [id, title, ..., [7] company, ...,
+  // [9] locations, ..., [16] remote flag, [17], [18] [null, note]].
+  const rec = (id, title, locs, { remote = false, note = '', company = 'Google' } = {}) => {
+    const r = new Array(21).fill(null);
+    r[0] = id; r[1] = title; r[7] = company;
+    r[9] = locs.map(([display, cc]) => [display, [display], null, null, null, cc]);
+    r[10] = [null, `<p>About ${title}</p>`];
+    if (remote) r[16] = 1;
+    if (note) r[18] = [null, note];
+    return r;
+  };
+  const page = (records, total, slugs = []) =>
+    `<html><script>AF_initDataCallback({key: 'ds:0', hash: '1', data:[[["c","DeepMind","deepmind"]]], sideChannel: {}});</script>`
+    + `<script>AF_initDataCallback({key: 'ds:1', hash: '2', data:${JSON.stringify([records, null, total, 20])}, sideChannel: {}});</script>`
+    + slugs.map(([id, s]) => `<a href="jobs/results/${id}-${s}?q=&amp;page=1">x</a>`).join('') + '</html>';
+
+  const p = parseResultsPage(page([rec('111111111', 'A', [['Los Angeles, CA, USA', 'US']])], 1, [['111111111', 'a-aiml']]));
+  if (p && p.total === 1 && p.records.length === 1 && p.slugs.get('111111111') === 'a-aiml') {
+    pass('parseResultsPage finds the job list by shape, with its total and the page\'s own slugs');
+  } else {
+    fail(`parseResultsPage returned ${JSON.stringify(p && { total: p.total, n: p.records.length })}`);
+  }
+  if (parseResultsPage('<html>consent</html>') === null) pass('a page with no job list is UNREADABLE (null), not empty');
+  else fail('parseResultsPage read a page with no job list as a result');
+  const past = parseResultsPage(page(null, 41));
+  if (past && past.records.length === 0 && past.total === 41) pass('a page past the end parses as zero records with the total kept');
+  else fail('parseResultsPage mishandled the past-the-end page');
+
+  const mixed = locationOptions(rec('2', 'B', [['Kirkland, WA, USA', 'US'], ['California, USA', 'US'], ['Ontario, CA', 'CA']], {
+    remote: true,
+    note: 'Note: ... from the following:<br><br><b>In-office locations: Kirkland, WA, USA.</b><br><b>Remote location(s): California, USA; Ontario, CA.</b>',
+  }));
+  if (JSON.stringify(mixed) === JSON.stringify(['Kirkland, WA, USA', 'California, USA - Remote', 'Ontario, Canada - Remote'])) {
+    pass('locationOptions marks the note\'s remote places " - Remote", keeps offices plain, and spells out a non-US "CA"');
+  } else {
+    fail(`locationOptions returned ${JSON.stringify(mixed)}`);
+  }
+  const single = locationOptions(rec('3', 'C', [['Colorado, USA', 'US']], { remote: true, note: '<b>Remote location: Colorado, USA.</b>' }));
+  if (JSON.stringify(single) === JSON.stringify(['Colorado, USA - Remote'])) pass('locationOptions reads the singular "Remote location:" note');
+  else fail(`locationOptions (singular note) returned ${JSON.stringify(single)}`);
+
+  // A fake fetchText serving pages by query string.
+  const serve = (routes) => ({
+    fetchText: async (url) => {
+      const u = new URL(url);
+      const key = `${u.searchParams.get('has_remote') ? 'R' : 'L'}${u.searchParams.get('page')}`;
+      if (!(key in routes)) throw Object.assign(new Error('HTTP 500'), { status: 500 });
+      return routes[key];
+    },
+  });
+  const twenty = Array.from({ length: 20 }, (_, i) => rec(String(500000000 + i), `Role ${i}`, [['Sacramento, CA, USA', 'US']]));
+  // Onsite places are the entry's to name (no default since 2026-10-29), so the fixture names one.
+  const entry = { name: 'Google', careers_url: RESULTS, provider: 'google', google_pause_ms: 0,
+    google_locations: ['Example City, CA, USA'] };
+  const jobs = await google.fetch(entry, serve({
+    L1: page(twenty, 21, [['500000000', 'role-0']]),
+    L2: page([rec('600880921', 'Last', [['Los Angeles, CA, USA', 'US']])], 21),
+    R1: page([twenty[0], rec('700000000', 'Remote Role', [['United States', 'US']], { remote: true, note: '<b>Remote location: United States.</b>' })], 2),
+  }));
+  if (jobs.length === 22 && !jobs.truncated) pass('google.fetch walks every page to the total and dedups across searches by id');
+  else fail(`google.fetch returned ${jobs.length} jobs, truncated=${jobs.truncated}`);
+  const r0 = jobs.find((j) => j.url.includes('500000000'));
+  if (r0 && r0.url === `${RESULTS}500000000-role-0`) pass('a row\'s URL uses the page\'s own slug for the id');
+  else fail(`row URL is ${r0 && r0.url}`);
+  if (jobs.find((j) => j.title === 'Remote Role')?.location === 'United States - Remote') pass('a remote posting reaches the gate as "<scope> - Remote"');
+  else fail('the remote posting lost its remote marker');
+
+  const short = await google.fetch(entry, serve({ L1: page(twenty, 45), L2: page(null, 45), R1: page([], 0) }));
+  if (short.length === 20 && /served 20 of 45/.test(short.truncated || '')) pass('a server that runs out of rows before its total marks the result truncated');
+  else fail(`short walk: ${short.length} rows, truncated=${short.truncated}`);
+
+  const oneDead = await google.fetch(entry, serve({ L1: page(twenty, 20), R1: '<html>consent</html>' }));
+  if (oneDead.length === 20 && /UNREADABLE/.test(oneDead.truncated || '')) pass('one unreadable search is reported, not read as empty, and the rest is kept');
+  else fail(`one unreadable search: ${oneDead.length} rows, truncated=${oneDead.truncated}`);
+
+  let threw = false;
+  try { await google.fetch(entry, serve({ L1: '<html></html>', R1: '<html></html>' })); } catch { threw = true; }
+  if (threw) pass('google.fetch throws when no search could be read, instead of reporting no jobs');
+  else fail('google.fetch read an unreadable board as empty');
+
+  const capped = await walkSearch(serve({ L1: page(twenty, 45) }), { q: '', locations: ['Sacramento, CA, USA'], remote: false }, { maxPages: 1, pauseMs: 0 });
+  if (/^TRUNCATED at 1 pages: 20 of 45/.test(capped.truncated || '')) pass('a walk that hits its page bound says TRUNCATED');
+  else fail(`page bound: truncated=${capped.truncated}`);
+} catch (e) {
+  fail(`google provider tests crashed: ${e.message}`);
 }
 
 // ── PROVIDERS — GitHub (github.careers) ─────────────────────────────
@@ -3392,7 +3808,7 @@ try {
   const { extractJobId, roleFuzzyMatch, idSetsOverlap, idSetsConflict } = await import(pathToFileURL(join(ROOT, 'role-matcher.mjs')).href);
 
   // unit: extractJobId distinguishes the real-world URLs that were mis-merged
-  const zSenior = extractJobId('https://zillow.wd5.myworkdayjobs.com/zillow_group_external/job/remote-usa/example-role-08_p747039');
+  const zSenior = extractJobId('https://zillow.wd5.myworkdayjobs.com/zillow_group_external/job/remote-usa/example-role-08_p739064');
   const zPrincipal = extractJobId('https://zillow.wd5.myworkdayjobs.com/en-US/Zillow_Group_External/job/Remote-USA/Example-Role-04_P711740-2');
   const aSpace = extractJobId('https://job-boards.greenhouse.io/andurilindustries/jobs/4223404714');
   const aModsim = extractJobId('https://job-boards.greenhouse.io/andurilindustries/jobs/5932781535');
@@ -3461,6 +3877,23 @@ try {
     else fail('identity set semantics wrong (overlap / conflict / empty)');
   }
 
+  // PROVABLY distinct needs the same numbering system on both sides. Riot's
+  // ".../job/7873504?gh_jid=7873504" reads gh: and the report's query-less URL reads id:;
+  // calling that a conflict resurfaced tracked rows as new. R21535 against a row
+  // holding R37811 is the same system disagreeing.
+  {
+    const { idSetsProvablyDistinct } = await import(pathToFileURL(join(ROOT, 'role-matcher.mjs')).href);
+    const riotScan = new Set([extractJobId('https://www.riotgames.com/en/work-with-us/job/7873504?gh_jid=7873504')]);
+    const riotRow = new Set([extractJobId('https://www.riotgames.com/en/work-with-us/job/7873504')]);
+    const ok = !idSetsProvablyDistinct(riotScan, riotRow)
+      && idSetsProvablyDistinct(new Set(['wd:r21535']), new Set(['wd:r37811']))
+      && !idSetsProvablyDistinct(new Set(['wd:r21535']), new Set(['wd:r21535', 'id:1']))
+      && !idSetsProvablyDistinct(new Set(['id:827845510324']), new Set(['wd:jr2113671']))
+      && !idSetsProvablyDistinct(new Set(), new Set(['wd:r1']));
+    if (ok) pass('identity sets: only a same-namespace disagreement proves two reqs distinct');
+    else fail('idSetsProvablyDistinct semantics wrong (cross-namespace, same-namespace, overlap, empty)');
+  }
+
   // the facet suffix must still be stripped where it really is a facet
   if (extractJobId('https://zillow.wd5.myworkdayjobs.com/x/job/Remote-USA/Principal-MLE_P711740-2') === 'wd:p711740') {
     pass('extractJobId still strips a genuine Workday facet suffix (-2)');
@@ -3479,7 +3912,7 @@ try {
     const m = mergeFixture('career-ops-jobid-', {
       rows: ['| 10 | 2026-07-05 | Zillow | Senior Machine Learning Engineer | 3.0/5 | Discarded | ❌ | [10](../reports/010-zillow-senior.md) | existing distinct role |'],
       reports: {
-        '010-zillow-senior.md': '**URL:** https://zillow.wd5.myworkdayjobs.com/zillow_group_external/job/remote-usa/example-role-08_p747039',
+        '010-zillow-senior.md': '**URL:** https://zillow.wd5.myworkdayjobs.com/zillow_group_external/job/remote-usa/example-role-08_p739064',
         '011-zillow-principal.md': '**URL:** https://zillow.wd5.myworkdayjobs.com/en-US/Zillow_Group_External/job/Remote-USA/Example-Role-04_P711740-2',
       },
       // distinct posting (higher score) whose title fuzzy-matches the existing row
@@ -4310,11 +4743,17 @@ try {
   }
 
   const env = { ...process.env, PATH: `${fakeBin}${delimiter}${process.env.PATH}` };
-  const out = run(BASH, [toBashPath(join(batchDir, 'batch-runner.sh')), '--parallel', '1', '--max-retries', '3', '--rate-limit-sleep', '0'], {
-    cwd: tmp,
-    env,
-    stdio: ['pipe', 'pipe', 'pipe'],
-  }) || '';
+  // Not run(): it returns null on a non-zero exit or its 30 s timeout, and under load (a
+  // full scan running beside the suite, 2026-10-29) the runner finished its job correctly
+  // while the test saw "" and failed. Keep stdout from a failed exit too, and allow longer.
+  let out = '';
+  try {
+    out = execFileSync(BASH, [toBashPath(join(batchDir, 'batch-runner.sh')), '--parallel', '1', '--max-retries', '3', '--rate-limit-sleep', '0'], {
+      cwd: tmp, env, encoding: 'utf-8', timeout: 120000, stdio: ['pipe', 'pipe', 'pipe'],
+    });
+  } catch (e) {
+    out = String(e.stdout || '') + String(e.stderr || '');
+  }
   const state = readFileSync(join(batchDir, 'batch-state.tsv'), 'utf-8').trim().split('\n');
   const first = state[1]?.split('\t') || [];
 
@@ -5114,6 +5553,157 @@ try {
     fail('workday leaked _externalPath into the returned jobs');
   }
 
+  // Workday's RESULT cap: total says 100 while the facets say 175. One walk ends cleanly at
+  // the cap and read as the whole board (NVIDIA: 2000 of 2734). It must walk per facet value.
+  {
+    const sizes = [90, 70, 15], cap = 100;
+    const facets = [{ facetParameter: 'jobFamilyGroup',
+      values: sizes.map((n, i) => ({ id: `f${i}`, descriptor: `F${i}`, count: n })) }];
+    const pool = (i) => Array.from({ length: sizes[i] }, (_, k) => `/job/US-CA-Remote/F${i}_${k}`);
+    const capCtx = {
+      async fetchJson(_url, opts) {
+        const q = JSON.parse(opts.body);
+        const sel = q.appliedFacets?.jobFamilyGroup;
+        const all = sel ? pool(Number(sel[0].slice(1))) : sizes.flatMap((_, i) => pool(i)).slice(0, cap);
+        const page = all.slice(q.offset, q.offset + q.limit)
+          .map((p) => ({ title: 'T', externalPath: p, locationsText: 'US, CA, Remote' }));
+        return { total: sel ? all.length : cap, jobPostings: page, facets };
+      },
+    };
+    const got = await workday.fetch(entry, capCtx);
+    if (got.length === 175 && !got.truncated) {
+      pass('workday walks past the 2000-style result cap by facet partition');
+    } else {
+      fail(`workday capped board: ${got.length} postings, truncated=${got.truncated}; want 175 and none`);
+    }
+
+    // A served row with no externalPath was read, not lost (NVIDIA, five rows, 2026-10-23):
+    // it must not flag the board TRUNCATED. A piece that serves FEWER rows than its share
+    // still must.
+    const variant = (mutate) => ({
+      async fetchJson(url, opts) {
+        const r = await capCtx.fetchJson(url, opts);
+        return { ...r, jobPostings: mutate(JSON.parse(opts.body), r.jobPostings) };
+      },
+    });
+    const pathless = await workday.fetch(entry, variant((q, rows) =>
+      q.appliedFacets?.jobFamilyGroup?.[0] === 'f2' && q.offset === 0
+        ? rows.map((r, k) => (k < 3 ? { ...r, externalPath: undefined } : r)) : rows));
+    if (pathless.length === 172 && !pathless.truncated) {
+      pass('workday counts a served row with no externalPath as read, not missing');
+    } else {
+      fail(`pathless rows misread: ${pathless.length} postings, truncated=${pathless.truncated}; want 172 and none`);
+    }
+    // Pathless rows are transient on NVIDIA's side: a page re-read returns them whole.
+    let reread = 0;
+    const transient = await workday.fetch(entry, variant((q, rows) => {
+      if (q.appliedFacets?.jobFamilyGroup?.[0] !== 'f2' || q.offset !== 0) return rows;
+      return reread++ === 0 ? rows.map((r, k) => (k < 3 ? { ...r, externalPath: undefined } : r)) : rows;
+    }));
+    if (transient.length === 175 && !transient.truncated) {
+      pass('workday re-reads a page whose rows came back with no externalPath');
+    } else {
+      fail(`transient pathless rows not recovered: ${transient.length} postings; want 175`);
+    }
+    const short = await workday.fetch(entry, variant((q, rows) =>
+      q.appliedFacets?.jobFamilyGroup?.[0] === 'f2' && q.offset === 0 ? rows.slice(0, 12) : rows));
+    if (short.truncated) {
+      pass('workday still flags a facet piece that served fewer rows than the board claims');
+    } else {
+      fail(`a short piece passed as whole: ${short.length} postings`);
+    }
+  }
+
+  // One 429 mid-walk used to fail NVIDIA's whole board (2026-10-20): a single retry was
+  // not enough for a ~240-request walk. Throttling is retried with escalating waits; a
+  // real miss is not retried at all, and an unending throttle still surfaces.
+  {
+    const { fetchJsonBackoff } = await import(pathToFileURL(join(ROOT, 'providers/workday.mjs')).href);
+    const throttle = (n, status = 429) => {
+      let calls = 0;
+      return { get calls() { return calls; }, async fetchJson() {
+        calls++;
+        if (calls <= n) { const e = new Error(`HTTP ${status}`); e.status = status; throw e; }
+        return { ok: true };
+      } };
+    };
+    const twice = throttle(2);
+    const got = await fetchJsonBackoff(twice, 'u', {}, [1, 1, 1]).catch(() => null);
+    if (got?.ok && twice.calls === 3) pass('workday retries a throttle past the first backoff');
+    else fail(`workday gave up on a twice-throttled request (calls=${twice.calls})`);
+
+    const forever = throttle(99);
+    const threw = await fetchJsonBackoff(forever, 'u', {}, [1, 1]).then(() => false, (e) => e.status === 429);
+    if (threw && forever.calls === 3) pass('workday surfaces a throttle that outlasts every retry');
+    else fail(`workday swallowed an unending throttle (calls=${forever.calls})`);
+
+    const missing = throttle(1, 404);
+    await fetchJsonBackoff(missing, 'u', {}, [1, 1]).catch(() => {});
+    if (missing.calls === 1) pass('workday does not retry a real miss');
+    else fail(`workday retried a 404 (calls=${missing.calls})`);
+
+    const unavailable = throttle(1, 503);
+    const ok503 = await fetchJsonBackoff(unavailable, 'u', {}, [1]).catch(() => null);
+    if (ok503?.ok && unavailable.calls === 2) pass('workday retries a 503 like a throttle');
+    else fail(`workday did not retry a 503 (calls=${unavailable.calls})`);
+
+    // The per-request waits bound one request; the board budget bounds the whole walk.
+    const budget = { ms: 5 };
+    const capped = throttle(99);
+    await fetchJsonBackoff(capped, 'u', {}, [3, 3, 3, 3], budget).catch(() => {});
+    if (capped.calls === 2 && budget.ms === 2) pass('workday stops retrying once the board budget is spent');
+    else fail(`workday overspent its retry budget (calls=${capped.calls}, left=${budget.ms})`);
+  }
+
+  // A 200 with no jobPostings array (a WAF page, an error object) is UNREAD, not an
+  // empty board. Read as empty, it would retire every row on the tenant.
+  for (const [label, body] of [['an empty object', {}], ['an error object', { error: 'unread' }]]) {
+    let threw = false;
+    try {
+      await workday.fetch(entry, { fetchJson: async () => body });
+    } catch { threw = true; }
+    if (threw) pass(`workday refuses a list response that is ${label}`);
+    else fail(`workday read ${label} as an empty board`);
+  }
+
+  // The first page's `total` ends the walk, so a board whose size is a multiple of the
+  // page size is not asked for one page past its end.
+  {
+    let calls = 0;
+    const full = Array.from({ length: 20 }, (_v, i) => ({ title: `R${i}`, externalPath: `/job/X/R_JR${i}`, locationsText: 'US, CA, Remote' }));
+    const got = await workday.fetch(entry, { fetchJson: async () => { calls += 1; return { total: 20, jobPostings: full }; } });
+    if (calls === 1 && got.length === 20) pass('workday stops the walk at the first page\'s total');
+    else fail(`workday made ${calls} list call(s) for a 20-posting board (expected 1)`);
+  }
+
+  // A walk that hits its own page cap says so, instead of passing the cap off as the
+  // board size (NVIDIA's board is ~2000 postings, twice the old cap).
+  {
+    const full = Array.from({ length: 20 }, (_v, i) => ({ title: `R${i}`, externalPath: `/job/X/R_JR${i}`, locationsText: 'US, CA, Remote' }));
+    const warnings = [];
+    const origErr = console.error;
+    console.error = (m) => warnings.push(String(m));
+    let got = [];
+    try {
+      got = await workday.fetch(entry, { fetchJson: async () => ({ jobPostings: full }) });
+    } finally { console.error = origErr; }
+    if (warnings.some(w => /TRUNCATED/.test(w))) pass('workday reports a walk that hit its page cap as TRUNCATED');
+    else fail('workday hit its page cap silently');
+    // ...on the RESULT, which is what the scans read; stderr alone let a partial board
+    // pass for a whole one. Both scans must read it.
+    // Each reader must ACT on it, not merely mention it: scan.mjs lists the board under
+    // Errors, scan-ats-full prints it whatever --verbose says.
+    const readers = [['scan.mjs', /if \(jobs\.truncated\) \{\s*errors\.push\(/],
+                     ['scan-ats-full.mjs', /if \(jobs\.truncated\) console\.error\(/]]
+      .filter(([f, rx]) => !rx.test(readFileSync(join(ROOT, f), 'utf-8'))).map(([f]) => f);
+    if (/TRUNCATED/.test(got.truncated || '') && got.length > 0 && !readers.length) {
+      pass('a truncated Workday walk is flagged on its result and both scans read the flag');
+    } else {
+      fail(`truncation not carried to the scans: flag=${JSON.stringify(got.truncated)} ` +
+        `jobs=${got.length} unread by ${readers.join(', ') || 'none'}`);
+    }
+  }
+
   // End-to-end: the same primary location must produce opposite verdicts once
   // the siblings are known. This is the case that makes URL-slug guessing wrong.
   const { buildLocationDecider: makeDecider } = await import(pathToFileURL(join(ROOT, 'scan.mjs')).href);
@@ -5380,7 +5970,7 @@ const evalPacket = (over = {}) => JSON.stringify({
   location_verdict: 'pass', verification_depth: 'API',
   comp: { posted: '$220,000 - $260,000' },
   body: 'Fixture body.', gate: 'none', recommendation: 'Fixture recommendation.',
-  live: true, num: null, ...over,
+  arrangement: 'remote', live: true, num: null, ...over,
 }, null, 1);
 
 // One eval-write sandbox: a temp dir holding reports/ and batch/eval-queue/. `packet`
@@ -5738,6 +6328,192 @@ try {
   }
 } catch (e) {
   fail(`eval-write comp basis test crashed: ${e.message}`);
+}
+
+// ── THE PACKET'S INSTRUCTION NAMES WHAT EVAL-WRITE REQUIRES ─────
+// eval-prep told the evaluator to "fill every null", which included comp_total_est,
+// the one field that arms the comp gate, so obeying it meant guessing a total. The
+// instruction is now built from a list that must equal eval-write's REQUIRED, and
+// must exempt comp_total_est by name.
+console.log('\n🧪 Testing the eval-prep instruction matches eval-write REQUIRED...');
+try {
+  const ew = readFileSync(join(ROOT, 'eval-write.mjs'), 'utf-8');
+  const ep = readFileSync(join(ROOT, 'scripts', 'eval-prep.py'), 'utf-8');
+  const names = src => (src || '').match(/['"]([a-z_]+)['"]/g)?.map(x => x.slice(1, -1)) || [];
+  const req = names(ew.match(/const REQUIRED = \[([^\]]*)\]/)?.[1]);
+  const prepReq = names(ep.match(/^EVAL_WRITE_REQUIRED = \(([^)]*)\)/m)?.[1]);
+  const instr = ep.match(/^INSTRUCTIONS = \(([\s\S]*?)\n\)/m)?.[1] || '';
+  if (req.length && JSON.stringify(req) === JSON.stringify(prepReq)
+      && /"_instructions": INSTRUCTIONS,/.test(ep)
+      && /Leave comp_total_est null unless/.test(instr) && !/every null/i.test(instr)) {
+    pass(`eval-prep's instruction names eval-write's ${req.length} required fields and exempts comp_total_est`);
+  } else {
+    fail(`eval-prep instruction drifted: REQUIRED ${JSON.stringify(req)} vs eval-prep ${JSON.stringify(prepReq)}`);
+  }
+} catch (e) {
+  fail(`eval-prep instruction test crashed: ${e.message}`);
+}
+
+// ── A SCORED PACKET STATES ITS ARRANGEMENT ──────────────────────
+// A null arrangement was derived from the location, so "Cary, NC" scored as onsite for
+// an evaluator who meant unknown. Required now, and a value outside the four is refused
+// per packet rather than thrown mid-run.
+console.log('\n🧪 Testing eval-write requires a valid arrangement on a scored packet...');
+try {
+  const { dir: aTmp, packet, run: runA } = evalWriteFixture('career-ops-eval-write-arr-');
+  try {
+    const wrote = slug => readdirSync(join(aTmp, 'reports')).some(f => f.includes(`-${slug}-`));
+    const none = runA([packet('none.json', { arrangement: null, slug: 'arr-none',
+      url: 'https://example.invalid/fixture/job/71' }), '--date=2026-10-16']);
+    const typo = runA([packet('typo.json', { arrangement: 'remote2', slug: 'arr-typo',
+      url: 'https://example.invalid/fixture/job/72' }), '--date=2026-10-16']);
+    const unk = runA([packet('unk.json', { arrangement: 'unknown', slug: 'arr-unk',
+      url: 'https://example.invalid/fixture/job/73' }), '--date=2026-10-16']);
+    if (/unfilled: arrangement/.test(none.out) && !wrote('arr-none')
+        && /arrangement "remote2" is not/.test(typo.out) && !wrote('arr-typo')
+        && wrote('arr-unk')) {
+      pass('eval-write: a null or invalid arrangement is refused; "unknown" is written as a verdict');
+    } else {
+      fail(`arrangement gate: none=${wrote('arr-none')} typo=${wrote('arr-typo')} unknown=${wrote('arr-unk')} / ` +
+        `${none.out.trim().slice(0, 120)} / ${typo.out.trim().slice(0, 120)}`);
+    }
+  } finally { rmSync(aTmp, { recursive: true, force: true }); }
+} catch (e) {
+  fail(`eval-write arrangement test crashed: ${e.message}`);
+}
+
+// ── A GATE-CLOSED PACKET IS RECORDED, NEVER SCORED ──────────────
+// REQUIRED demanded all four dimensions, so a packet whose location gate failed
+// after prep could not be written at all. Four in one day (2026-10-15) were moved
+// into done/ by hand, the tracker got no row, and the next sweep re-surfaced each
+// one as new work. The record it needs is the one audit-scores.mjs already accepts:
+// `in_bounds: false`, the gate, every dimension null, no number anywhere, and a
+// SKIP row whose score cell is N/A rather than a zero nobody judged.
+console.log('\n🧪 Testing eval-write records a gate-closed packet without scoring it...');
+try {
+  const { SCORE_CELL } = await import(pathToFileURL(join(ROOT, 'tracker-rows.mjs')).href);
+  const { dir: gTmp, packet, run: runG } = evalWriteFixture('career-ops-eval-write-gate-');
+  try {
+    const UNSCORED = { match_w_cv: null, north_star: null, comp_score: null, cultural_signals: null,
+      red_flags_adj: 0, status: null, body: null, gate: null, recommendation: null };
+    const FAIL = { ...UNSCORED, location: 'Texas, USA - Remote', location_verdict: 'fail',
+      location_why: 'state-scoped remote, Texas only' };
+    const reportOf = (slug) => {
+      const f = readdirSync(join(gTmp, 'reports')).find(x => x.includes(`-${slug}-`));
+      return f ? readFileSync(join(gTmp, 'reports', f), 'utf-8') : null;
+    };
+    const tsvOf = (slug) => {
+      const d = join(gTmp, 'batch', 'tracker-additions');
+      const f = existsSync(d) ? readdirSync(d).find(x => x.includes(slug)) : null;
+      return f ? readFileSync(join(d, f), 'utf-8').trim().split('\t') : null;
+    };
+    const sentinels = () => readdirSync(join(gTmp, 'reports')).filter(x => x.endsWith('-RESERVED.md'));
+
+    const out = runG([packet('tx.json', { ...FAIL, slug: 'gate-tx',
+      url: 'https://example.invalid/acme/job/Texas/X_26WD134728' }), '--date=2026-10-15']);
+    const md = reportOf('gate-tx') || '';
+    const yaml = (md.split('```yaml')[1] || '');
+    if (md && /^in_bounds: false$/m.test(yaml)
+        && ['match_w_cv', 'north_star', 'comp', 'cultural_signals'].every(k =>
+          new RegExp(`^  ${k}: null$`, 'm').test(yaml))
+        && !/^(final|  global|  model_base):/m.test(yaml)
+        && /^gate: "state-scoped remote, Texas only"$/m.test(yaml)
+        && /^\*\*Score:\*\* N\/A/m.test(md)) {
+      pass('eval-write: a location-fail packet writes in_bounds:false, null dimensions, its gate, and no number');
+    } else {
+      fail(`gate-closed report has the wrong shape: ${out.out.trim().slice(0, 200)} / ${yaml.slice(0, 400)}`);
+    }
+
+    // Status BEFORE score in the TSV; merge-tracker swaps them. N/A is the tracker's
+    // own spelling for "no score", and a 0.0 there would read as a judgement of zero.
+    const row = tsvOf('gate-tx') || [];
+    if (row[4] === 'SKIP' && row[5] === 'N/A' && SCORE_CELL.test(row[5])
+        && /Texas only/.test(row[8] || '') && /\(26WD134728\)/.test(row[3] || '')) {
+      pass('eval-write: the gate-closed TSV is a SKIP row scored N/A with the gate in the note');
+    } else {
+      fail(`gate-closed TSV row is wrong: ${JSON.stringify(row)}`);
+    }
+
+    // The reader the shape exists for must actually accept it, asked of the tool and
+    // not of a copy of its rule.
+    let audit = { code: 0, out: '' };
+    try {
+      audit.out = execFileSync(NODE, [join(ROOT, 'audit-scores.mjs')],
+        { cwd: gTmp, encoding: 'utf-8', timeout: 30000 });
+    } catch (e) { audit = { code: e.status ?? 1, out: `${e.stdout || ''}${e.stderr || ''}` }; }
+    if (audit.code === 0 && /closed by a hard constraint before scoring: 1\b/.test(audit.out)
+        && /no parseable scores: 0\b/.test(audit.out)) {
+      pass('audit-scores reads the eval-write gate-closed report as closed, not as a missing score block');
+    } else {
+      fail(`audit-scores did not accept the gate-closed report (exit ${audit.code}): ${audit.out.trim().slice(0, 400)}`);
+    }
+
+    // A rerun is still one report per req.
+    const again = runG([packet('tx.json', { ...FAIL, slug: 'gate-tx',
+      url: 'https://example.invalid/acme/job/Texas/X_26WD134728' }), '--date=2026-10-15']);
+    if (/already written as/.test(again.out)
+        && readdirSync(join(gTmp, 'reports')).filter(x => x.includes('-gate-tx-')).length === 1) {
+      pass('eval-write: re-running a gate-closed packet does not write a second report');
+    } else {
+      fail(`a gate-closed rerun wrote again: ${again.out.trim().slice(0, 200)}`);
+    }
+
+    // Closed AND scored is refused: a location fail scored 4.69 once put a 4.7 on the
+    // tracker for a role the location policy rules out.
+    const scored = runG([packet('scored.json', { ...FAIL, slug: 'gate-scored',
+      url: 'https://example.invalid/acme/job/2', match_w_cv: 4.4, north_star: 4.6,
+      comp_score: 4.5, cultural_signals: 4.2, status: 'Evaluated', body: 'b', gate: 'g',
+      recommendation: 'r' }), '--date=2026-10-15']);
+    if (/never scored/.test(scored.out) && !reportOf('gate-scored') && !sentinels().length) {
+      pass('eval-write: a location-fail packet with filled dimensions is refused, not scored');
+    } else {
+      fail(`a gate-closed packet with dimensions was not refused: ${scored.out.trim().slice(0, 250)}`);
+    }
+
+    // The explicit form needs a reason: "no location returned" is not one.
+    const bare = runG([packet('bare.json', { ...UNSCORED, slug: 'gate-bare', in_bounds: false,
+      location_verdict: 'unknown', location_why: 'no location returned',
+      url: 'https://example.invalid/acme/job/3' }), '--date=2026-10-15']);
+    const said = runG([packet('said.json', { ...UNSCORED, slug: 'gate-said', in_bounds: false,
+      location_verdict: 'unknown', location_why: 'no location returned',
+      gate: 'Chatsworth onsite per the posting page; outside the commute ceiling',
+      url: 'https://example.invalid/acme/job/4' }), '--date=2026-10-15']);
+    const saidMd = reportOf('gate-said') || '';
+    if (/unfilled: gate/.test(bare.out) && !reportOf('gate-bare')
+        && /^gate: "Chatsworth onsite/m.test(saidMd) && /closed by a hard constraint/.test(saidMd)) {
+      pass('eval-write: explicit in_bounds:false needs a gate, and writes it when given');
+    } else {
+      fail(`explicit in_bounds:false handled wrongly: ${bare.out.trim().slice(0, 150)} / ` +
+           `${said.out.trim().slice(0, 150)}`);
+    }
+
+    // A role closed before scoring is a SKIP; any other status is a contradiction.
+    const evald = runG([packet('evald.json', { ...FAIL, slug: 'gate-evald', status: 'Evaluated',
+      url: 'https://example.invalid/acme/job/5' }), '--date=2026-10-15']);
+    if (/recorded as SKIP/.test(evald.out) && !reportOf('gate-evald')) {
+      pass('eval-write: a gate-closed packet with a non-SKIP status is refused');
+    } else {
+      fail(`a gate-closed packet kept status Evaluated: ${evald.out.trim().slice(0, 200)}`);
+    }
+
+    // parseScores keeps its MOST complete parse, one of them a loose prose scan, so
+    // "comp floor of $175K" in the body reads as comp=175 and the audit would fail
+    // the run. The writer asks the reader first, and refuses before claiming a number.
+    const prose = runG([packet('prose.json', { ...FAIL, slug: 'gate-prose',
+      body: 'The comp floor of $175K would have cleared.',
+      url: 'https://example.invalid/acme/job/6' }), '--date=2026-10-15']);
+    if (/audit-scores would read comp=175/.test(prose.out) && !reportOf('gate-prose')
+        && !sentinels().length) {
+      pass('eval-write: a body audit-scores would misread as a score is refused before a number is claimed');
+    } else {
+      fail(`a misreadable gate-closed body was not refused cleanly: ${prose.out.trim().slice(0, 250)} ` +
+           `(sentinels: ${sentinels().join(', ')})`);
+    }
+  } finally {
+    rmSync(gTmp, { recursive: true, force: true });
+  }
+} catch (e) {
+  fail(`eval-write gate-closed test crashed: ${e.message}`);
 }
 
 // ── SCORE-AUDIT PARSES BOTH location_final SEPARATORS ───────────
@@ -7267,6 +8043,21 @@ console.log('\nLocation gates agree (Node scanner vs Python evaluation)');
     'US Remote, must reside in one of 2 Texas counties',
     'Los Angeles \u0662 Texas', 'Ontario,\ufeffCA', 'Los Angeles, \u0131reland', 'Seattle; \ufeffHybrid',
     '\u4e2dRemote US', 'Remote, Texa\u017f',
+    // Autodesk's Eightfold spelling puts a sales region before the country (26WD134728).
+    // The grammar folds an Americas label away before a US marker; EMEA and APAC stay.
+    'AMER - United States - Texas - Remote', 'AMER - United States - California - Remote',
+    'AMER - United States - Texas - Remote | Texas, USA - Remote', 'AMER - United States - Texas',
+    'AMER - United States - California - Los Angeles', 'AMER - Canada - Remote', 'AMER - Remote',
+    'EMEA - United Kingdom - London - Remote', 'APAC - Australia - Sydney - Remote',
+    'Americas - Remote', 'NA - Remote', 'Remote (Americas)', 'LATAM - Remote', 'Remote, Flexible',
+    // EA writes a metro label over the city ("Los Angeles - Chatsworth"). One piece naming
+    // two places is a hierarchy, so a far place beside the commute word voids it; a far
+    // place named as a preference or an office does not.
+    'Los Angeles - San Diego, CA', 'Los Angeles (San Francisco preferred)',
+    'Los Angeles, CA - HQ in San Francisco', 'Santa Monica, CA (reporting to San Francisco)',
+    'Los Angeles, CA (Remote, Bay Area OK)', 'San Diego - Los Angeles, CA',
+    // A slash split an Americas label off its remote word, and the bare half passed.
+    'AMER / Remote', 'Remote / NA',
   ];
   // Agreement alone would pass two gates that are wrong together, so the cases each
   // review round found are also pinned to the right answer.
@@ -7343,6 +8134,23 @@ console.log('\nLocation gates agree (Node scanner vs Python evaluation)');
   });
   Object.assign(expected.tx, { 'TX Remote': 'pass', 'Remote (US) - Must reside in TX': 'pass',
     'Remote (US) - Must reside in CT': 'fail', 'Texas - we are fully remote': 'pass' });
+  Object.assign(expected.ca, {
+    'AMER - United States - Texas - Remote': 'fail', 'AMER - United States - California - Remote': 'pass',
+    'AMER - United States - Texas - Remote | Texas, USA - Remote': 'fail', 'AMER - United States - Texas': 'fail',
+    'AMER - United States - California - Los Angeles': 'pass', 'AMER - Canada - Remote': 'fail',
+    'AMER - Remote': 'unknown', 'EMEA - United Kingdom - London - Remote': 'fail',
+    'APAC - Australia - Sydney - Remote': 'fail', 'Americas - Remote': 'unknown', 'NA - Remote': 'unknown',
+    'Remote (Americas)': 'unknown', 'LATAM - Remote': 'fail', 'Remote, Flexible': 'unknown',
+    'Los Angeles - San Diego, CA': 'fail', 'Los Angeles (San Francisco preferred)': 'pass',
+    'Los Angeles, CA - HQ in San Francisco': 'pass',
+    'Santa Monica, CA (reporting to San Francisco)': 'pass',
+    'Los Angeles, CA (Remote, Bay Area OK)': 'pass', 'San Diego - Los Angeles, CA': 'fail',
+    'AMER / Remote': 'unknown', 'Remote / NA': 'unknown',
+  });
+  // A California home also passes the California form from a weak mention, so Texas is the
+  // home that proves the region fold: there the California form is a scope it cannot use.
+  Object.assign(expected.tx, { 'AMER - United States - California - Remote': 'fail',
+    'AMER - United States - Texas - Remote': 'pass' });
   Object.assign(expected.va, { 'US, VA, Arlington': 'pass', 'Arlington or Richmond, VA': 'pass',
     'District of Columbia - Washington': 'pass', 'Remote (US), except DC': 'pass' });
   expected.none = { 'Remote (US) - Must reside in CT': 'unknown', 'Remote - US (not in California office)': 'pass',
@@ -7508,6 +8316,55 @@ console.log('\nBoard builders (tier, lane, CV and buttons from the presets)');
     else fail(`board builders, presets: ${JSON.stringify(Object.values(b.byCo).map((r) => [r.co, r.tier, r.lane, r.cv]))} buttons=${b.buttons} commute=${b.commute}`);
   } catch (e) {
     fail(`board builder test crashed: ${e.message.slice(0, 400)}`);
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
+// ── THE ISREMOTE UPGRADE NEVER LIFTS AN AMERICAS REGION ─────────
+// eval-prep lets the ATS isRemote flag turn an `unknown` of kind 'unrecognised' into a
+// pass. "AMER - Remote" used to be that kind, so the flag passed a role that may sit in
+// Canada or Latin America, which is a false pass against a hard no-relocation constraint.
+// Both engines now give it the kind 'region', which the upgrade does not read. The table
+// above runs with the flag OFF and compares verdicts only, so it cannot see this: here both
+// engines' KIND must match, and the evaluation verdict is taken with the flag ON.
+console.log('\nisRemote upgrade spares Americas region labels (both engines)');
+{
+  const want = {
+    'AMER - Remote': ['region', 'unknown'], 'Americas - Remote': ['region', 'unknown'],
+    'NA - Remote': ['region', 'unknown'], 'Remote (Americas)': ['region', 'unknown'],
+    'LATAM - Remote': ['foreign', 'fail'],
+    // The upgrade itself must survive: a qualifier that names no region is still lifted.
+    'Remote, Flexible': ['unrecognised', 'pass'],
+  };
+  const cases = Object.keys(want);
+  const policyPath = join(ROOT, 'presets/locations/california-socal.json');
+  const tmp = mkdtempSync(join(tmpdir(), 'career-ops-region-'));
+  try {
+    const LC = await import(pathToFileURL(join(ROOT, 'location-core.mjs')).href);
+    const sig = LC.buildSignals(LC.locationFilterFromPolicy(LC.loadLocationPolicy(policyPath)));
+    const script = join(tmp, 'region.py');
+    writeFileSync(script, `import importlib.util, json, sys
+sys.path.insert(0, "scripts")
+import _location
+s = importlib.util.spec_from_file_location("ep", "scripts/eval-prep.py")
+ep = importlib.util.module_from_spec(s); s.loader.exec_module(ep)
+pol = _location.load(${JSON.stringify(policyPath)})
+print(json.dumps([[pol.decide(c)[2], ep.location_verdict(c, True, pol)[0]] for c in ${JSON.stringify(cases)}]))
+`);
+    const py = JSON.parse(execFileSync('python', [script], { cwd: ROOT, encoding: 'utf-8', timeout: 60000 }));
+    const bad = [];
+    cases.forEach((c, i) => {
+      const [kind, flagged] = want[c];
+      const nodeKind = LC.decideLocations(c, sig).kind;
+      if (nodeKind !== kind || py[i][0] !== kind || py[i][1] !== flagged) {
+        bad.push(`"${c}": want ${kind}/${flagged}, node kind ${nodeKind}, python kind ${py[i][0]}, flag-on verdict ${py[i][1]}`);
+      }
+    });
+    if (!bad.length) pass(`both engines give ${cases.length} region and control spellings the same kind, and the flag lifts only the unrecognised one`);
+    else fail(`the isRemote upgrade and the region kind disagree:\n      ${bad.join('\n      ')}`);
+  } catch (e) {
+    fail(`region-kind test crashed: ${(e.stderr || e.message).slice(0, 200)}`);
   } finally {
     rmSync(tmp, { recursive: true, force: true });
   }
