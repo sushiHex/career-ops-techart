@@ -2991,7 +2991,7 @@ try {
       return routes[key];
     },
   });
-  const twenty = Array.from({ length: 20 }, (_, i) => rec(String(500000000 + i), `Role ${i}`, [['Irvine, CA, USA', 'US']]));
+  const twenty = Array.from({ length: 20 }, (_, i) => rec(String(500000000 + i), `Role ${i}`, [['Sacramento, CA, USA', 'US']]));
   // Onsite places are the entry's to name (no default since 2026-10-29), so the fixture names one.
   const entry = { name: 'Google', careers_url: RESULTS, provider: 'google', google_pause_ms: 0,
     google_locations: ['Example City, CA, USA'] };
@@ -3021,7 +3021,7 @@ try {
   if (threw) pass('google.fetch throws when no search could be read, instead of reporting no jobs');
   else fail('google.fetch read an unreadable board as empty');
 
-  const capped = await walkSearch(serve({ L1: page(twenty, 45) }), { q: '', locations: ['Irvine, CA, USA'], remote: false }, { maxPages: 1, pauseMs: 0 });
+  const capped = await walkSearch(serve({ L1: page(twenty, 45) }), { q: '', locations: ['Sacramento, CA, USA'], remote: false }, { maxPages: 1, pauseMs: 0 });
   if (/^TRUNCATED at 1 pages: 20 of 45/.test(capped.truncated || '')) pass('a walk that hits its page bound says TRUNCATED');
   else fail(`page bound: truncated=${capped.truncated}`);
 } catch (e) {
