@@ -18,7 +18,7 @@
 // Google has tens of thousands of postings worldwide, so the provider runs SEARCHES rather
 // than walking the board: every query in `google_queries` against the OR of every place in
 // `google_locations`, plus (when `google_remote` is not false) the same query restricted
-// to US remote-eligible postings. Measured 2026-10-29: the SoCal locations together hold
+// to US remote-eligible postings. Measured 2026-10-29: three locations in one metro held
 // 127 postings (7 pages) and US remote 41 (3 pages), so the default empty query reads the
 // whole reachable board in about ten requests, and a narrower query list only removes rows
 // the scan's title filter would have judged anyway.
@@ -47,7 +47,9 @@ const PAUSE_MS = 400;
 const RETRY_DELAYS_MS = [2000, 6000];
 
 export const DEFAULT_QUERIES = [''];
-export const DEFAULT_LOCATIONS = ['Los Angeles, CA, USA', 'Irvine, CA, USA', 'Playa Vista, CA, USA'];
+// No onsite places by default: where a candidate can commute is the entry's to say
+// (portals.yml `google_locations`), so an entry without it searches US remote only.
+export const DEFAULT_LOCATIONS = [];
 // The remote pass is scoped to the US: unscoped, it returns Brazil, Canada and so on.
 const REMOTE_SCOPE = 'United States';
 

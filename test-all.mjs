@@ -2992,7 +2992,9 @@ try {
     },
   });
   const twenty = Array.from({ length: 20 }, (_, i) => rec(String(500000000 + i), `Role ${i}`, [['Irvine, CA, USA', 'US']]));
-  const entry = { name: 'Google', careers_url: RESULTS, provider: 'google', google_pause_ms: 0 };
+  // Onsite places are the entry's to name (no default since 2026-10-29), so the fixture names one.
+  const entry = { name: 'Google', careers_url: RESULTS, provider: 'google', google_pause_ms: 0,
+    google_locations: ['Example City, CA, USA'] };
   const jobs = await google.fetch(entry, serve({
     L1: page(twenty, 21, [['500000000', 'role-0']]),
     L2: page([rec('600880921', 'Last', [['Los Angeles, CA, USA', 'US']])], 21),
