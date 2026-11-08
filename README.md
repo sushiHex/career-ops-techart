@@ -21,20 +21,19 @@ suite that runs green on a fresh clone and is mutation-verified.
 
 ## By the numbers
 
-Measured on 2026-09-22. The first four rows compare this tree with `santifer/career-ops`
-`main` on that date; the test rows are reproducible from a clone (CI runs them); the
-commit and review counts come from the private development history this public tree was
-cut from, and are stated rather than reproducible here.
+Measured on 2026-11-08 against `main` of this repository. The size and test rows are
+reproducible from a clone (CI runs the tests); the commit and review counts come from the
+private development history this public tree was cut from, and are stated rather than
+reproducible here.
 
 | | |
 |---|---|
-| Files in this fork that do not exist upstream | **61** |
-| Fork-original code | **45 files, 18,150 non-blank lines** (Node and Python) |
-| Capabilities with no counterpart in upstream's source | **6** (see the comparison below) |
-| ATS families the requisition resolver recognises | **13**: Amazon, Apple, Ashby, Breezy, Eightfold (including Netflix), GitHub Careers, Greenhouse, iCIMS, Lever, SmartRecruiters, SuccessFactors, Workable, Workday. Twelve are read; amazon.jobs blocks automated clients, so it answers an explicit `unknown` rather than a guess |
-| Integration checks (`node test-all.mjs`) | **669 passed, 0 failed** on a fresh clone |
-| Tool self-test suites | **23**, all green, all run by CI, running against fixtures rather than your data |
-| Development since the fork point (2026-04-05) | **419 commits** (private history) |
+| Files in this tree | **221**, about **42,000 non-blank lines** of Node and Python |
+| ATS families the requisition resolver recognises | **17**: Amazon, Apple, Ashby, Atlassian, Breezy, Eightfold (including Netflix), Gem, GitHub Careers, Google, Greenhouse, iCIMS, Lever, Rippling, SmartRecruiters, SuccessFactors, Workable, Workday. Sixteen are read; amazon.jobs blocks automated clients, so it answers an explicit `unknown` rather than a guess |
+| Integration checks (`node test-all.mjs`) | **805 passed, 0 failed** on a fresh clone |
+| Scoring-model tests (`npm run model:test`) | **71 passed, 0 failed** |
+| Resolver self-test (`req-resolve.py --selftest`) | **28 routing and 585 behaviour cases**, all passing, run against fixtures rather than your data |
+| Development since the fork point (2026-04-05) | **529 commits** (private history) |
 | Independent-model review of the largest change | **17 rounds, 28 findings**, each fixed with a mutation-verified test (private history) |
 
 ### What the hardening found
@@ -66,14 +65,44 @@ assumed, and the six marked **new** have no counterpart there.
 
 | Capability | Upstream | This fork |
 |---|---|---|
-| **Scoring model** (new) | the evaluating model states a global score | `score-model.mjs`: one deterministic formula, `final = min(5, base × comp × pref × arrangement)`, 66 behavioural tests; `apply-model.mjs` is the only pass that recomputes tracker scores (dry run by default), and `score-audit.mjs --fix` can only restore a report's own stated final |
-| **Requisition resolver** (new) | none | `scripts/req-resolve.py`: a posting URL to live / closed / unknown across 13 ATS families, with location, pay and JD read from the ATS's API or the posting's embedded data |
+| **Scoring model** (new) | the evaluating model states a global score | `score-model.mjs`: one deterministic formula, `final = min(5, base × comp × pref × arrangement)`, 71 behavioural tests; `apply-model.mjs` is the only pass that recomputes tracker scores (dry run by default), and `score-audit.mjs --fix` can only restore a report's own stated final |
+| **Requisition resolver** (new) | none | `scripts/req-resolve.py`: a posting URL to live / closed / unknown across 17 ATS families, with location, pay and JD read from the ATS's API or the posting's embedded data |
 | **Provenance rule** (new) | none | a closure needs evidence the posting itself declared (such as a `gh_jid` in the URL); when both the board and the id were inferred, the board's own listing must also link back to the host the URL came from, or the row stays open |
 | **Tracking-URL refusal** (new) | none | wrapper URLs are refused, including scheme-less, query-borne and percent-encoded destinations, because a tracker's 404 says nothing about the posting |
 | **Board-level inbox liveness** (new) | per URL | each BOARD is read once (paged where the ATS pages), then the resolver settles the residue; an empty, unreadable or truncated board closes nothing |
 | **Evaluation packets** (new) | none | `eval-prep` → `eval-assist` → `eval-blockers`: mechanical fields filled, judgement left null for the agent, blockers named |
 | Page liveness | tri-state (active / expired / uncertain) | inherited from upstream and kept; the resolver applies the same rule to API reads |
 | Location gate | keyword tiers matched against the location string; secondary locations folded in | each location option classified on its own and combined, with the state-scoped remote spellings real boards use (`US, PA, Remote`, `Indiana - Remote`, `Remote Massachusetts`, ...) resolved to a state and checked against your configured home state |
+
+---
+
+## Added since the first release
+
+Every item below ships in this tree and is covered by `node test-all.mjs`.
+
+- **More boards, read as boards.** Google's careers results, Eightfold tenants (Netflix and
+  Microsoft) and Rippling are polled directly. Workday walks past the board's own result
+  cap by partitioning on a facet, and an optional `workday_facets` entry limits a very
+  large tenant to the families you want. A walk that hits its bound prints `TRUNCATED` and
+  closes nothing.
+- **Closing needs a clean read.** Gem and Rippling close a row only when the posting
+  answers 404 or 410 *and* the board's own non-empty listing omits it, because both answer
+  404 for a wrong board slug too. An empty board never closes anything.
+- **One tracker module.** `tracker-rows.mjs` reads and writes every tracker row by header
+  name, and every script that writes goes through the shared argument guard
+  (`cli-guard.mjs`), so a typo'd flag is an error instead of a silent default.
+- **Comp evidence is replayed the way it was written.** `apply-model`, `score-audit` and
+  `audit-scores` hand the model the same comp input `eval-write` used, so alternating them
+  no longer churns scores back and forth.
+- **A ruling can reach the reports it shaped.** `eval-write.mjs --rescore` rewrites an
+  existing report in place (the old copy is backed up) and updates the row that links to
+  it. `scripts/apply-eval-results.py` writes an evaluation workflow's judgement back into
+  packets, refusing to overwrite a filled one without `--force`.
+- **Triage folds repeats.** `pipeline-audit.mjs --rank` collapses one title posted across
+  verticals or languages into a single printed row and says how many it folded.
+- **Location grammar fixes.** A sales-region prefix no longer hides the state, a metro word
+  no longer rescues an out-of-ceiling city joined to it, and the Google provider names
+  onsite places only when your portals entry does.
 
 ---
 
@@ -142,9 +171,9 @@ running whatever you configure.
 On a fresh clone (these are what CI runs):
 
 ```bash
-node test-all.mjs           # 672 integration checks
-npm run model:test          # 68 scoring-model tests
-python scripts/req-resolve.py --selftest   # 20 routing + 353 behaviour cases
+node test-all.mjs           # 805 integration checks
+npm run model:test          # 71 scoring-model tests
+python scripts/req-resolve.py --selftest   # 28 routing + 585 behaviour cases
 ```
 
 plus the `--selftest` of each tool listed in `.github/workflows/test.yml`. The tool
