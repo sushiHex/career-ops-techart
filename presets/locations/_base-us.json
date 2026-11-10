@@ -194,7 +194,13 @@
     "Scotland",
     "Ireland",
     "Dublin",
+    "Armenia",
+    "Yerevan",
+    "Belfast",
+    "Londonderry",
+    "Nottingham",
     "Canada",
+    "Canadian",
     "Quebec",
     "British Columbia",
     "Toronto",
@@ -371,6 +377,10 @@
       [
         "(^|[|;\\u00b7\\u2022\\n]\\s*){AMER}\\s*[-\\u2013\\u2014,:]\\s*(?={US})",
         "$1"
+      ],
+      [
+        "\\s*,\\s*(?:multiple|various) locations\\b",
+        ""
       ],
       [
         "\\bwashington,?\\s*(?:d\\.?\\s*c\\.?|district of columbia)(?![a-z])",

@@ -7,8 +7,8 @@
  * They interact, so applying them piecemeal gives a different board than applying
  * them together — that is why they land in a single re-score.
  *
- *     base   = average(match_w_cv, north_star, comp, cultural_signals) + red_flags_adj
- *     final  = min(5, base * compFactor * prefFactor * arrFactor)
+ *     base   = weightedMean(match_w_cv, north_star, comp, cultural_signals) + red_flags_adj
+ *     final  = min(5, base * compFactor * prefFactor * arrFactor) * min(1, match_w_cv / FIT_NEUTRAL)
  *
  * 1. base — unchanged from the documented rubric, and still the whole score when
  *    no modifier applies. Recomputed from the four dimensions rather than trusted
@@ -42,6 +42,7 @@ import { readFileSync, existsSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import yaml from 'js-yaml';
+import { parseScores } from './score-parser.mjs';
 
 // --- the candidate, from config/profile.yml ----------------------------------
 //
@@ -120,7 +121,34 @@ export function loadRoleGate(path) {
   return pat ? new RegExp(pat, 'i') : null;
 }
 
+/**
+ * Dimension weights for the base, from `scoring_weights` in config/profile.yml. Absent
+ * means equal weights. Any weight that is missing, non-numeric or not positive is an
+ * error, because a silently dropped weight changes every score on the board.
+ */
+const WEIGHT_KEYS = ['match_w_cv', 'north_star', 'comp', 'cultural_signals'];
+export function loadScoreWeights(where = CONFIG_DIR) {
+  // A config directory, or a profile file itself (the tests hand it a scratch profile).
+  const raw = (/\.ya?ml$/i.test(where)
+    ? (existsSync(where) ? yaml.load(readFileSync(where, 'utf-8')) : null)
+    : readProfile(where))?.scoring_weights;
+  if (raw == null) return Object.fromEntries(WEIGHT_KEYS.map(k => [k, 0.25]));
+  if (typeof raw !== 'object' || Object.keys(raw).some(k => !WEIGHT_KEYS.includes(k)) ||
+      WEIGHT_KEYS.some(k => !Number.isFinite(raw[k]) || raw[k] <= 0)) {
+    throw new Error('scoring_weights must contain four positive numeric dimension weights');
+  }
+  const total = WEIGHT_KEYS.reduce((sum, k) => sum + raw[k], 0);
+  return Object.fromEntries(WEIGHT_KEYS.map(k => [k, raw[k] / total]));
+}
+
+// All writers and audits use this base calculation. Preferences belong in config.
+export function computeBase(s, weights = loadScoreWeights()) {
+  if (WEIGHT_KEYS.some(k => !Number.isFinite(s[k]))) return null;
+  return WEIGHT_KEYS.reduce((sum, k) => sum + s[k] * weights[k], 0) + (s.red_flags_adj ?? 0);
+}
+
 export const MODEL = {
+  FIT_NEUTRAL: 3.5, // Plausible stretch or better: no additional fit penalty.
   // $K TOTAL comp, from config/profile.yml `compensation.minimum`. null = no floor
   // configured, and then no comp gate: an absent number is not a zero.
   COMP_FLOOR: CANDIDATE.compFloorK,
@@ -441,7 +469,9 @@ export function reportModelText(text) {
   // replay that the writer never armed (Codex, 2026-10-29).
   const compLine = est !== null ? est
     : (posted && posted !== 'not published' && basis === 'total') ? posted : '';
-  return `comp_total_est: "${compLine}"\nlocation: "${locRaw.split(sep)[0].trim()}"\n`;
+  const match = parseScores(text)?.match_w_cv;
+  const fitLine = match == null ? '' : `match_w_cv: ${match}\n`;
+  return `${fitLine}comp_total_est: "${compLine}"\nlocation: "${locRaw.split(sep)[0].trim()}"\n`;
 }
 
 /**
@@ -484,7 +514,7 @@ export function arrFactor(arr, o = MODEL) {
 
 /**
  * Apply every modifier to a base score.
- * @param base  average(4 dims) + red_flags_adj, already computed
+ * @param base  configured weighted mean(4 dims) + red_flags_adj, already computed
  * @param ctx   {text, company, role, prefs, arrangement}
  *
  * ctx.arrangement, when given, is TRUSTED over re-deriving it from ctx.text. That makes
@@ -514,10 +544,17 @@ export function applyModel(base, ctx, o = MODEL) {
   const { factor: pf, pref, damped } = prefFactor(ctx.company || '', ctx.role || '', ctx.prefs || [], o);
   const arr = normaliseArrangement(ctx.arrangement) ?? arrangement(locationText(ctx.text || ''));
   const af = arrFactor(arr, o);
-  const final = Math.min(5, base * cf * pf * af);
+  const match = ctx.match ?? parseScores(ctx.text || '')?.match_w_cv;
+  if (match != null && (!Number.isFinite(match) || match < 0 || match > 5)) {
+    throw new Error('Skills fit must be a finite number from 0 to 5');
+  }
+  const uncappedFinal = Math.min(5, base * cf * pf * af);
+  const fitFactor = match == null ? 1 : Math.min(1, match / o.FIT_NEUTRAL);
+  const final = uncappedFinal * fitFactor;
   return {
     base, final: Math.round(final * 100) / 100,
     compFactor: cf, prefFactor: pf, arrFactor: af,
+    skillsFit: match ?? null, fitFactor, uncappedFinal, fitLimited: final < uncappedFinal,
     band, pref, damped, arrangement: arr, compStatus: cv.status,
   };
 }

@@ -95,6 +95,30 @@ WD_LOCALE_ONLY = re.compile(rf"^{WD_LOCALE}$", re.I)
 WD_POSTING_URL = re.compile(
     rf"https://([\w-]+)\.(wd\d+)\.myworkdayjobs\.com/(?:(?i:{WD_LOCALE})/)?([^/]+)/(job/.+)$")
 
+# Workday's OTHER public host for the same posting, which LinkedIn apply buttons use:
+# `https://wd1.myworkdaysite.com/en-US/recruiting/<tenant>/<site>/job/...`. Nothing here
+# recognised it, so such a posting came back untitled with company "wd1".
+# It is the same tenant, site and job path, and the CXS endpoint answers on the
+# myworkdayjobs host, so it is rewritten to that form rather than given its own adapter.
+WD_SITE_URL = re.compile(
+    rf"^https?://(wd\d+)\.myworkdaysite\.com/(?:(?i:{WD_LOCALE})/)?recruiting/([\w-]+)/([^/?#]+)/(job/[^?#]+)",
+    re.I)
+
+
+def canonical_workday_url(url):
+    """A myworkdaysite.com posting url in the myworkdayjobs.com form; anything else as is.
+
+    A WRAPPER is left exactly as it is: the rewrite drops the query, and a query carrying
+    another posting's address is the evidence wraps_another_url() reads (Codex, 2026-10-30).
+    The tenant's underscore is a hyphen in the HOSTNAME (`osv_a10networks` is host
+    `osv-a10networks`); cxs_base() puts the underscore back in the CXS path."""
+    s = str(url or "").strip()
+    m = WD_SITE_URL.match(s)
+    if not m or wraps_another_url(s):
+        return url
+    wd, tenant, site, path = m.groups()
+    return f"https://{tenant.replace('_', '-')}.{wd.lower()}.myworkdayjobs.com/{site}/{path}"
+
 # Workday requisition ids the SHARED pattern does not cover, because they carry no prefix:
 # Disney's are bare numbers (`..._10414222`, sometimes with a `-1` facet suffix). A bare
 # number is ambiguous anywhere else, which is why WD_REQ_ID refuses it; it is unambiguous
@@ -215,7 +239,7 @@ ATS_HOST = re.compile(
     r"breezy\.hr|workable\.com|successfactors|jobvite|eightfold|gem\.com|avature|"
     r"icims\.com|taleo\.net|github\.careers|jobs\.netflix\.net|jobs\.apple\.com|"
     # Rippling by its ATS host only: rippling.com itself is an employer's own domain.
-    r"amazon\.jobs|ats\.rippling\.com", re.I)
+    r"amazon\.jobs|ats\.rippling\.com|oraclecloud\.com", re.I)
 # The same vendors as they appear INSIDE A PATH, which is where a redirect puts its
 # destination when it drops the scheme. Deliberately NOT ATS_HOST, and the difference is
 # the point: that pattern answers "is this parsed HOSTNAME a vendor's" and is loose on
@@ -230,7 +254,7 @@ ATS_IN_PATH = re.compile(
     r"|myworkdayjobs\.com|smartrecruiters\.com|breezy\.hr|workable\.com"
     r"|successfactors\.com|jobvite\.com|eightfold\.ai|avature\.net|icims\.com"
     r"|taleo\.net|github\.careers|amazon\.jobs|apple\.com|netflix\.net"
-    r"|ats\.rippling\.com|jobs\.gem\.com)[/?#]", re.I)
+    r"|ats\.rippling\.com|jobs\.gem\.com|oraclecloud\.com)[/?#]", re.I)
 # Every spelling of a Greenhouse board URL that portals.yml actually carries: the
 # zero-token api: line, the job-boards/boards careers_url, and the embed snippet.
 GH_SLUG = re.compile(
@@ -383,10 +407,14 @@ def portals_index():
         # `re` reads the escape itself, so the class still matches the character.
         base = re.split(r"[(\[|/]|\s[-\u2014\u2013]\s", label)[0]
         keys = {name_key(base)} - {""}
+        hosts = set()
         # Identity comes from the DECLARED urls only, not from any link in the notes: a
         # levels.fyi or news link in a note would otherwise make that host this company.
         for u in re.findall(r"^\s*(?:careers_url|api|url):\s*(\S+)", block, re.M):
             keys |= host_keys(u)
+            h = (urllib.parse.urlsplit(u.strip("\"'")).hostname or "").lower()
+            if h and host_keys(u):
+                hosts.add(h)
         loose = set(keys)
         first = name_key(base.split()[0]) if base.split() else ""
         if len(first) > 2:
@@ -395,6 +423,9 @@ def portals_index():
         wd = WD_TENANT_URL.search(block)
         entries.append(dict(
             label=label, base=base.strip(), keys=keys, loose=loose, slugs=slugs,
+            # The exact company-owned hostnames the entry declares (an ATS host is never
+            # one, by host_keys()), so a posting on that very host can be named.
+            hosts=hosts,
             # Every ATS board slug the entry declares, lowercased, so a caller holding a
             # slug (eval-prep naming a packet's employer) can find the entry's label.
             boards={m.lower() for m in slugs + BOARD_SLUG.findall(block)},
@@ -883,6 +914,12 @@ _PAY_LABEL = re.compile(r"\b(?:salary|salaries|pay|base|compensation|wages?|OTE|
 _RANGE_SEP = re.compile(r"\d\s*(?:USD\s*)?(?:-|to|–|\u2014)\s*\$?\s*\d", re.I)
 
 
+# A code that opens the NEXT label ("... $210,000 CAD Salary Range: C$225,000") belongs to
+# what follows, not to this figure, so a label word after the code cancels the rule.
+_FOREIGN_AFTER = re.compile(r"^\s*\(?(?:CAD|GBP|EUR|AUD|NZD|SGD|INR|JPY|CHF|MXN|BRL|HKD|SEK|NOK|DKK|PLN|ILS)\b"
+                            r"(?!\s*(?:salary|pay|base|range|compensation|band|:))", re.I)
+
+
 def pay_hits(txt):
     """[(figure, labelled)] for every pay figure in free text, in order.
 
@@ -901,6 +938,11 @@ def pay_hits(txt):
         # purpose noun is dropped, because a missing band is safer than a wrong one.
         labelled = bool(_PAY_LABEL.search(before))
         if _PURPOSE_BEFORE.search(before):
+            continue
+        # A currency CODE after the figure says what mask_foreign()'s prefix rule cannot:
+        # One employer writes "$250,000 - $280,000 CAD", which read as a USD band and was
+        # flagged clears-target on a Canadian req worth about US$180K-$205K (2026-11-09).
+        if _FOREIGN_AFTER.search(s[m.end():m.end() + 30]):
             continue
         # What follows a figure is its purpose for a lone figure or an UNLABELLED range
         # ("We offer $30,000 - $50,000 signing bonus", round 3). A labelled range is a band
@@ -1359,6 +1401,31 @@ def confirmed_absence(ats, st, board_url, ident, pid, **extra):
     if got.get("live") is False:
         got["note"] = f"posting endpoint answered HTTP {st} and the id is " + got["note"]
     return got
+
+
+ORACLE_HCM_URL = re.compile(
+    OUTER_HOST + r"([\w-]+\.fa\.[\w-]+\.oraclecloud\.com)/hcmUI/CandidateExperience/[\w-]+/"
+    r"(?:sites/[\w-]+/)?(?:job|requisitions/preview)/(\d+)(?:[/?#]|$)", re.I)
+
+
+def oracle_hcm_record(it, **extra):
+    """One Oracle Recruiting Cloud requisition as a resolver result.
+
+    Every location field is folded in (primary, secondary, work and other work locations),
+    the same secondary-location rule every adapter keeps. A posted end date in the past
+    reads not-live; otherwise a record the external feed serves is live."""
+    locs = [it.get("PrimaryLocation") or ""]
+    for key in ("secondaryLocations", "workLocation", "otherWorkLocations"):
+        for x in it.get(key) or []:
+            if isinstance(x, dict):
+                locs.append(x.get("Name") or x.get("LocationName") or x.get("TownOrCity") or "")
+    locs = list(dict.fromkeys(l.strip() for l in locs if l and l.strip()))
+    jd = clean(" ".join(it.get(k) or "" for k in ("ExternalDescriptionStr", "ExternalResponsibilitiesStr",
+                                                     "ExternalQualificationsStr")))
+    end = str(it.get("ExternalPostedEndDate") or "")[:10]
+    live = not (end and end < datetime.date.today().isoformat())
+    return dict(ats="oracle-hcm", live=live, title=it.get("Title"), location=" | ".join(locs),
+                pay=pays(jd), jd=jd, remote_txt=says_remote(*locs, jd), **extra)
 
 
 def rippling_pay(ranges, locs):
@@ -1879,6 +1946,14 @@ def last_resort(url):
         return dict(ats="unsupported", live=False, status=st,
                     note=f"no API for this host; the posting URL itself answers HTTP {st}, "
                          f"which is the server stating the posting is gone")
+    # The page's JobPosting can still DESCRIBE the req (title, places, band, body) so it
+    # can be judged. Liveness stays unknown: see jsonld_describe().
+    described = jsonld_describe(body, url) if st == 200 else None
+    if described:
+        return dict(ats="jsonld", live=None, status=st, **described,
+                    note="no API for this host; title, location, pay and body read from the "
+                         "page's own schema.org JobPosting, which describes the posting but "
+                         "cannot show it is still open, so liveness is unknown")
     return dict(ats="unsupported", live=None, status=st,
                 note=f"no API for this host; the posting URL answers HTTP {st}, which is "
                      f"not evidence either way (a client-rendered careers shell serves "
@@ -1984,6 +2059,148 @@ def ld_identity(j, url):
     return None
 
 
+def _ld_matched(postings, url):
+    """The JobPosting records that may speak for `url`: those whose identity matches it, or
+    the page's single record when it carries no identity at all. Shared by the closing
+    reader and the describing one, so the two can never disagree about which record is
+    this posting."""
+    matched = [j for j in postings if ld_identity(j, url) is True]
+    if not matched and len(postings) == 1 and ld_identity(postings[0], url) is None:
+        matched = postings
+    return matched
+
+
+def _ld_places(j):
+    """A JobPosting's places as location options, remote stated where the record says so."""
+    out = []
+    locs = j.get("jobLocation") or []
+    for loc in (locs if isinstance(locs, list) else [locs]):
+        a = loc.get("address") if isinstance(loc, dict) else None
+        if isinstance(a, dict):
+            country = a.get("addressCountry")
+            country = country.get("name") if isinstance(country, dict) else country
+            parts = [a.get("addressLocality"), a.get("addressRegion"), country]
+            place = ", ".join(str(p).strip() for p in parts if isinstance(p, str) and p.strip())
+            if place:
+                out.append(place)
+    remote = str(j.get("jobLocationType") or "").upper() == "TELECOMMUTE"
+    if remote:
+        reqs = j.get("applicantLocationRequirements") or []
+        names = [(r.get("name") if isinstance(r, dict) else r) for r in
+                 (reqs if isinstance(reqs, list) else [reqs])]
+        names = [str(n).strip() for n in names if n and str(n).strip()]
+        if names:
+            # The applicant restriction IS where a remote hire may live. An office address
+            # beside it is where the company sits, not an alternative eligible place, so it
+            # must not be offered as one: an LA office with applicants restricted to Germany
+            # would otherwise pass a California gate (Codex, PR 5 round 5).
+            return [f"{n} - Remote" for n in names], remote
+        out.append("Remote")
+    return out, remote
+
+
+def _ld_pay(j):
+    """The record's baseSalary as one posted figure, or [].
+
+    Read as schema.org defines it (Codex, 2026-10-30): a currency other than USD is not a
+    dollar band, a MONTH, WEEK or DAY unit is not annual, and a single `value` is a figure.
+    A missing unit is read as annual only when the figure is annual-sized, since a bare
+    40 is an hourly rate and a bare 40,000 a monthly one nowhere near as often."""
+    s = j.get("baseSalary")
+    if not isinstance(s, dict):
+        return []
+    cur = str(s.get("currency") or "").strip().upper()
+    if cur and cur != "USD":
+        return []
+    v = s.get("value")
+    if isinstance(v, (int, float, str)):
+        v = {"value": v}
+    if not isinstance(v, dict):
+        return []
+    lo, hi = v.get("minValue"), v.get("maxValue")
+    if lo in (None, "") and hi in (None, ""):
+        lo = v.get("value")
+    raw_unit = str(v.get("unitText") or s.get("unitText") or "").strip().upper()
+    try:
+        lo = float(lo) if lo not in (None, "") else None
+        hi = float(hi) if hi not in (None, "") else None
+    except (TypeError, ValueError):
+        return []
+    if lo is None and hi is None:
+        return []
+    if raw_unit in ("MONTH", "WEEK", "DAY"):
+        return []
+    unit = raw_unit or ("YEAR" if max(x for x in (lo, hi) if x is not None) >= 30_000 else "")
+    if unit not in ("YEAR", "HOUR"):
+        return []
+    fmt = lambda x: f"${x:,.2f}" if unit == "HOUR" else f"${x:,.0f}"
+    band = " - ".join(fmt(x) for x in (lo, hi) if x is not None)
+    return [band + (" per hour" if unit == "HOUR" else "")]
+
+
+def jsonld_describe(page_html, url=None):
+    """What the page's own schema.org JobPosting says about THIS posting, or None.
+
+    DESCRIBES, NEVER CERTIFIES. Phenom, Next.js and custom careers sites embed a full JobPosting while
+    the resolver had no adapter for them, so their packets came out untitled with no body,
+    no place and no band, and the req could not be judged at all. The record is enough to
+    judge one. It is NOT enough to call the posting open: a stale block left on a page after
+    the req closed is the failure jsonld_expired() is written against, so the caller keeps
+    `live` unknown and this returns no liveness of its own.
+
+    Only a record that may speak for the url counts (the same identity rule as the closing
+    reader), and two matched records with different titles describe nothing.
+    """
+    postings = jsonld_postings(page_html)
+    matched = _ld_matched(postings, url)
+    # DESCRIBING ONLY: a page's lone record whose IDENTIFIER is spelled differently from the
+    # url (`R-100002` on `.../ACMEUSR100002EXTERNALENUS/...`, or a uuid on a
+    # slug url) still describes it when every word of its title is in the url's path. Never
+    # when the record states a url or @id of its own: that is positive evidence it is a
+    # DIFFERENT posting, and a title match must not override it (Codex, 2026-10-30). The
+    # closing reader never takes this, since a wrong match there retires a live row.
+    lone = postings[0] if len(postings) == 1 else None
+    if not matched and lone is not None and not any(
+            isinstance(lone.get(k), str) and lone.get(k).strip() for k in ("url", "@id")):
+        words = set(re.findall(r"[a-z0-9]+", str(lone.get("title") or "").lower()))
+        path = set(re.findall(r"[a-z0-9]+", urllib.parse.urlsplit(url or "").path.lower()))
+        if words and words <= path:
+            matched = postings
+    # Records that agree on the title can still disagree on the place or the pay, and those
+    # drive gates; taking the first made the verdict depend on DOM order (Codex). Matched
+    # records must agree on all three or the page describes nothing.
+    if not matched or len({(str(j.get("title") or "").strip(), tuple(_ld_places(j)[0]),
+                            tuple(_ld_pay(j))) for j in matched}) != 1:
+        return None
+    j = matched[0]
+    title = str(j.get("title") or "").strip()
+    if not title:
+        return None
+    places, remote = _ld_places(j)
+    jd = clean(str(j.get("description") or ""))
+    org = j.get("hiringOrganization")
+    company = org.get("name") if isinstance(org, dict) else (org if isinstance(org, str) else None)
+    company = company.strip() if isinstance(company, str) and company.strip() else None
+    # The stated employer is often the corporate PARENT, not the hiring studio: a studio's
+    # posting states its parent company's name, the
+    # Workday legal-entity trap again. It names the packet only when the url's own host
+    # names it too (careers.acme.com for Acme); otherwise a person does.
+    if company and not any(name_key(company) in k for k in host_keys(url or "")):
+        company = None
+    # A structured salary wins only as a RANGE. A baseSalary can carry the low end
+    # alone while the body states "$186,500.00 - 252,300.00 USD Annual", and
+    # the lone figure became a zero-width band at the bottom of the real one.
+    ld_pay = _ld_pay(j)
+    pay = ld_pay if any(" - " in f for f in ld_pay) else (pays(jd) or ld_pay)
+    # baseSalary is BASE by definition. Without saying so, a silent hourly band read as
+    # total in comp_verdict and armed the floor gate (Codex, 2026-10-30).
+    summary = f"Base salary: {pay[0]}" if pay and pay == ld_pay else None
+    return dict(title=title, location=" | ".join(places), jd=jd,
+                pay=pay, comp_summary=summary,
+                company=company,
+                remote_txt=remote or says_remote(*places))
+
+
 def jsonld_expired(page_html, url=None, today=None):
     """The expired JobPosting on a page, or None. PURE: the caller supplies the body.
 
@@ -2011,9 +2228,7 @@ def jsonld_expired(page_html, url=None, today=None):
     # only when it is the page's single JobPosting, because then there is nothing it could
     # be confused with. Anything else is an ambiguous page, and an ambiguous page settles
     # nothing. Without this a "related roles" rail could retire a live row.
-    matched = [j for j in postings if ld_identity(j, url) is True]
-    if not matched and len(postings) == 1 and ld_identity(postings[0], url) is None:
-        matched = postings
+    matched = _ld_matched(postings, url)
     now = today or datetime.date.today().isoformat()
     dated = []
     for j in matched:
@@ -2437,7 +2652,7 @@ def wraps_another_url(url):
 
 
 def resolve(url):
-    u = url.strip()
+    u = canonical_workday_url(url.strip())
     # A wrapper is refused outright, not unwrapped. Cutting the query is not enough
     # because the embedded url can sit in the PATH, and every adapter below searches for
     # a host and path shape wherever it appears. Which of the two postings the row is
@@ -2611,6 +2826,28 @@ def resolve(url):
             return rippling_record(d, slug, status=st)
         return confirmed_absence("rippling", st, f"{RIPPLING_API}/{slug}/jobs",
                                  lambda j: str(j.get("uuid") or "").lower(), uuid, org=slug)
+
+    # Oracle Recruiting Cloud (Fusion HCM Candidate Experience). The page is a client-side
+    # app; the public recruitingCEJobRequisitionDetails resource serves the same record by
+    # requisition id, no site number needed (reqs on this host otherwise arrive untitled).
+    # An EMPTY result closes nothing: no board listing is read to confirm an absence, and a
+    # requisition can drop out of the external feed for reasons other than closing.
+    m = ORACLE_HCM_URL.search(ou)
+    if m:
+        host, rid = m.group(1).lower(), m.group(2)
+        st, body = fetch(f"https://{host}/hcmRestApi/resources/latest/recruitingCEJobRequisitionDetails"
+                         f"?expand=all&onlyData=true&finder=ById;Id=%22{rid}%22")
+        d = jload(body, need=("items",)) if st == 200 and body else UNREADABLE
+        if d is UNREADABLE:
+            return unreadable("oracle-hcm", st, "the requisition-details response")
+        items = [i for i in d.get("items") or [] if isinstance(i, dict)]
+        if not items:
+            return dict(ats="oracle-hcm", live=None, status=st,
+                        note="the external requisition feed returned nothing for this id; "
+                             "that is not shown to be a closure, so liveness is unknown")
+        if str(items[0].get("Id")) != rid:
+            return unreadable("oracle-hcm", st, "a record for a different requisition id")
+        return oracle_hcm_record(items[0], status=st)
 
     # Gem. REST for the posting (liveness, title, JD, offices), GraphQL for the band only;
     # see GEM_GQL. A GraphQL failure costs the band and the remote flags, never the verdict.
@@ -3135,6 +3372,8 @@ ROUTE_CASES = [
     ("https://ats.rippling.com/en-US/cerby/jobs/a2acbe6f-e43e-c9c2-1aef-4c03864e893f", "rippling"),
     ("https://jobs.gem.com/nominal/am9icG9zdDp7LtWwyt-ZLX3N-M7SHGRV", "gem"),
     ("https://jobs.gem.com/nominal/37c9854b-f1ea-4da6-a3f5-51e64923ae08", "gem"),
+    ("https://acme.fa.us2.oraclecloud.com/hcmUI/CandidateExperience/en/job/900001/", "oracle-hcm"),
+    ("https://acme.fa.em3.oraclecloud.com/hcmUI/CandidateExperience/en/sites/CX_1/job/2045", "oracle-hcm"),
 ]
 
 # A miniature Ashby detail page. The real one is 52KB; what matters is the shape:
@@ -3577,6 +3816,11 @@ def behaviour_cases():
     check(got == ["$160,000 - $210,000"], f"a C$ band must not read as US dollars: {got}")
     check(pays("CA$138,000 - CA$189,000 or A$150,000") == [],
           "CA$ and A$ figures are not US dollars")
+    # A trailing currency CODE is the other spelling (seen 2026-11-09).
+    got = pays("The base salary range for this role is $250,000 - $280,000 CAD, plus equity.")
+    check(got == [], f"a band followed by CAD is not US dollars: {got}")
+    got = pays("Salary: $180,000 - $200,000 USD. In the UK the range is £120,000 - £140,000 GBP.")
+    check(got == ["$180,000 - $200,000"], f"a USD band keeps beside a GBP one: {got}")
     # A Canadian headline band with US bands only in the per-location tiers (Cohere).
     def _tier(title, lo, hi, cur):
         return {"title": title, "tierSummary": f"Base Salary {cur} {lo}-{hi}", "components": [
@@ -4412,8 +4656,83 @@ def behaviour_cases():
                  "identifier": {"@type": "PropertyValue", "value": "8534252"},
                  "validThrough": "2099-01-01T00:00:00+00:00"}
     NEIGHBOUR = {"@type": "JobPosting", "title": "Somebody Else's Expired Job",
-                 "identifier": {"@type": "PropertyValue", "value": "1111111"},
+                 "identifier": {"@type": "PropertyValue", "value": "1982939"},
                  "validThrough": "2026-06-29T20:08:18+00:00"}
+
+    # ── jsonld_describe: the page's record DESCRIBES the posting, never certifies it ──
+    FULL = dict(REQUESTED, description="<p>Build agent eval harnesses.</p>",
+                hiringOrganization={"@type": "Organization", "name": "Acme"},
+                jobLocation=[{"@type": "Place", "address": {"addressLocality": "Denver",
+                              "addressRegion": "CO", "addressCountry": "US"}}],
+                jobLocationType="TELECOMMUTE",
+                applicantLocationRequirements=[{"@type": "Country", "name": "United States"}],
+                baseSalary={"@type": "MonetaryAmount", "currency": "USD",
+                            "value": {"@type": "QuantitativeValue", "minValue": 210000,
+                                      "maxValue": 260000, "unitText": "YEAR"}})
+    _de = jsonld_describe(ld(dict(FULL, jobLocation=[{"@type": "Place", "address": {
+        "addressLocality": "Los Angeles", "addressRegion": "CA", "addressCountry": "US"}}],
+        applicantLocationRequirements=[{"@type": "Country", "name": "Germany"}])),
+        "https://careers.acme.com/job/applied-research/8534252")
+    check(_de and _de["location"] == "Germany - Remote",
+          f"an office address must not stand in for a remote applicant restriction: {_de and _de['location']}")
+    _parent = jsonld_describe(ld(dict(FULL, hiringOrganization={"name": "Globex Pictures"})),
+                              "https://join.globexcareers.com/global/en/job/8534252")
+    check(_parent and _parent["company"] is None,
+          f"a stated employer the url's host does not name is not the company: {_parent}")
+    d = jsonld_describe(ld(NEIGHBOUR, FULL), "https://careers.acme.com/job/applied-research/8534252")
+    check(d and d["title"] == "The Requested One" and d["company"] == "Acme"
+          and d["location"] == "United States - Remote"
+          and d["pay"] == ["$210,000 - $260,000"] and "eval harnesses" in d["jd"]
+          and "live" not in d,
+          f"jsonld_describe must read the requested record whole and carry no liveness: {d}")
+    check(jsonld_describe(ld(NEIGHBOUR), BI_URL) is None,
+          "a page whose only record is ANOTHER posting describes nothing")
+    _low = dict(FULL, description="<p>Pay: $186,500.00 - 252,300.00 USD Annual</p>",
+                baseSalary={"value": {"minValue": 186500, "unitText": "YEAR"}})
+    check((jsonld_describe(ld(_low), BI_URL) or {}).get("pay") == ["$186,500.00 - 252,300.00"],
+          "a lone structured salary must yield to the body's full band")
+    # A lone record that names ANOTHER url is a different posting, title match or not.
+    check(jsonld_describe(ld(dict(FULL, identifier=None, title="AI Engineer",
+                                  url="https://careers.example.com/jobs/222/ai-engineer")),
+                          "https://careers.example.com/jobs/111/ai-engineer") is None,
+          "a record stating a different url must not be read by its title")
+    # Matched records that disagree on the PLACE describe nothing, in either order.
+    # Onsite records: a remote applicant restriction would replace the office as the place.
+    _la = dict(FULL, jobLocationType=None,
+               jobLocation=[{"address": {"addressLocality": "Los Angeles", "addressRegion": "CA"}}])
+    _be = dict(FULL, jobLocationType=None,
+               jobLocation=[{"address": {"addressLocality": "Berlin", "addressCountry": "DE"}}])
+    check(jsonld_describe(ld(_la, _be), BI_URL) is None and jsonld_describe(ld(_be, _la), BI_URL) is None,
+          "matched records that disagree on location describe nothing")
+    # baseSalary semantics: foreign currency, monthly units and single values.
+    for _sal, _want in (({"currency": "EUR", "value": {"minValue": 200000, "maxValue": 250000, "unitText": "YEAR"}}, []),
+                        ({"currency": "USD", "value": {"minValue": 30000, "maxValue": 40000, "unitText": "MONTH"}}, []),
+                        ({"currency": "USD", "value": {"value": 210000, "unitText": "YEAR"}}, ["$210,000"]),
+                        ({"currency": "USD", "value": {"minValue": 60, "maxValue": 80, "unitText": "HOUR"}},
+                         ["$60.00 - $80.00 per hour"])):
+        check(_ld_pay({"baseSalary": _sal}) == _want, f"_ld_pay({_sal}) = {_ld_pay({'baseSalary': _sal})}, want {_want}")
+    _hr = jsonld_describe(ld(dict(FULL, description="<p>Build things.</p>",
+                                  baseSalary={"currency": "USD", "value": {"minValue": 60, "maxValue": 80,
+                                                                          "unitText": "HOUR"}})), BI_URL)
+    check(_hr and (_hr.get("comp_summary") or "").startswith("Base salary:"),
+          f"a structured salary must say it is BASE: {_hr and _hr.get('comp_summary')}")
+    _MC = "https://careers.example.com/us/en/job/ACMEUSR100002EXT/Senior-Principal-AI-Engineer-Platform"
+    _mc = dict(FULL, title="Senior Principal AI Engineer- Platform",
+               identifier={"@type": "PropertyValue", "value": "R-100002"})
+    check((jsonld_describe(ld(_mc), _MC) or {}).get("title") == _mc["title"],
+          "a lone record whose title words are all in the url path describes it")
+    check(jsonld_describe(ld(dict(_mc, title="Staff Data Engineer")), _MC) is None,
+          "a lone record with a foreign identifier AND a title not in the path describes nothing")
+    check(jsonld_expired(ld(dict(_mc, validThrough="2026-01-01")), _MC, today="2026-09-21") is None,
+          "the title-in-path match must never reach the CLOSING reader")
+    check(jsonld_describe(ld(dict(REQUESTED, identifier=None, title="A"),
+                             dict(REQUESTED, identifier=None, title="B")), BI_URL) is None,
+          "two anonymous records with different titles describe nothing")
+    _ld_page = ld(FULL)
+    with mock.patch.object(sys.modules[__name__], "fetch", lambda *a, **k: (200, _ld_page)):
+        r = last_resort(BI_URL)
+    check(r.get("ats") == "jsonld" and r.get("live") is None and r.get("title") == "The Requested One",
+          f"last_resort must describe from the JobPosting and keep liveness unknown: {r}")
     r = jsonld_expired(ld(NEIGHBOUR, REQUESTED), BI_URL, today="2026-09-21")
     check(r is None,
           f"an expired NEIGHBOUR must not close the requested posting: {r}")
@@ -4558,6 +4877,22 @@ def behaviour_cases():
         _m = WD_POSTING_URL.match(_url)
         check((_m.group(3) if _m else None) == _site,
               f"Workday url parse read site {(_m.group(3) if _m else None)!r} from {_url}, want {_site!r}")
+    # Workday's myworkdaysite.com host is the same posting; it is rewritten to the
+    # myworkdayjobs form, locale dropped, and every other url passes through untouched.
+    check(canonical_workday_url("https://wd1.myworkdaysite.com/en-US/recruiting/acme/acmesite/job/"
+                                "Los-Angeles-California/X_R1234567-1")
+          == "https://acme.wd1.myworkdayjobs.com/acmesite/job/Los-Angeles-California/X_R1234567-1",
+          "a myworkdaysite.com url must canonicalise to its myworkdayjobs.com form")
+    check(canonical_workday_url("https://wd5.myworkdaysite.com/recruiting/acme/Ext/job/X/Y_R12345?src=li")
+          == "https://acme.wd5.myworkdayjobs.com/Ext/job/X/Y_R12345",
+          "a myworkdaysite.com url without a locale must canonicalise too")
+    for _u in ("https://acme.wd1.myworkdayjobs.com/Acmes/job/X/Y_R12345",
+               "https://tracker.example/r/wd1.myworkdaysite.com/recruiting/acme/S/job/X/Y_R1",
+               "https://wd1.myworkdaysite.com/recruiting/acme/S/job/X/Y_R1?next=https%3A%2F%2Fjobs.lever.co%2Fz%2Fx"):
+        check(canonical_workday_url(_u) == _u, f"canonical_workday_url must leave {_u} alone")
+    check(canonical_workday_url("https://wd503.myworkdaysite.com/recruiting/osv_a10networks/A10/job/X/Y_R1")
+          == "https://osv-a10networks.wd503.myworkdayjobs.com/A10/job/X/Y_R1",
+          "an underscore tenant must be a hyphen in the canonical hostname")
     # The CXS path takes the tenant's real name, whose underscores the hostname writes as
     # hyphens; the host keeps its hyphens.
     check(cxs_base("osv-a10networks", "wd503", "A10CareerSite")
@@ -5495,6 +5830,29 @@ def behaviour_cases():
         with mock.patch.object(sys.modules[__name__], "fetch", fake_fetch), \
              mock.patch.object(sys.modules[__name__], "post", fake_post):
             return resolve(url)
+
+    # ── Oracle Recruiting Cloud (2026-11-02) ──
+    O_URL = "https://acme.fa.us2.oraclecloud.com/hcmUI/CandidateExperience/en/job/900001/"
+    O_API = ("https://acme.fa.us2.oraclecloud.com/hcmRestApi/resources/latest/"
+             "recruitingCEJobRequisitionDetails?expand=all&onlyData=true&finder=ById;Id=%22900001%22")
+    _o = lambda **kw: json.dumps({"items": [{
+        "Id": "900001", "Title": "Principal AI/LLM Agent Architect", "PrimaryLocation": "United States",
+        "secondaryLocations": [{"Name": "California, United States"}],
+        "ExternalDescriptionStr": "<p>Remote. Build agents.</p>",
+        "ExternalQualificationsStr": "<p>US: Hiring Range in USD from: $96,800 to $251,600 per annum</p>",
+        "ExternalPostedEndDate": None, **kw}]})
+    r = with_net({O_API: (200, _o())}, O_URL)
+    check(r.get("ats") == "oracle-hcm" and r.get("live") is True
+          and r.get("title") == "Principal AI/LLM Agent Architect"
+          and "California, United States" in (r.get("location") or "")
+          and r.get("pay") == ["$96,800 to $251,600"],
+          f"oracle-hcm: a served record reads live with title, every location and the band: {r}")
+    r = with_net({O_API: (200, json.dumps({"items": []}))}, O_URL)
+    check(r.get("live") is None, f"oracle-hcm: an empty feed closes nothing: {r.get('live')}")
+    r = with_net({O_API: (200, _o(Id="999"))}, O_URL)
+    check(r.get("live") is None, f"oracle-hcm: another requisition's record is not this one: {r.get('live')}")
+    r = with_net({O_API: (200, _o(ExternalPostedEndDate="2001-01-01T00:00:00+00:00"))}, O_URL)
+    check(r.get("live") is False, f"oracle-hcm: a past posted end date is not live: {r.get('live')}")
 
     RU = "a2acbe6f-e43e-c9c2-1aef-4c03864e893f"
     R_URL = f"https://ats.rippling.com/cerby/jobs/{RU}"

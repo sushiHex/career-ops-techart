@@ -1,0 +1,18 @@
+{
+  "why": "Copy to config/sweep-gates.json and edit. Read by scripts/_sweepkit.py for body-sweep, hn-hiring and remote-boards. A body read rescues a title with no lane VOCABULARY, never a title with no technical ROLE, so tech_role gates every posting first. not_tech refuses physical-engineering and IT-operations titles. lane_a_title is a title-only rescue for craft titles whose bodies carry little lane vocabulary; keep it narrow. annual_max_floor: a posted annual MAXIMUM below this is dropped; a missing salary never drops a row.",
+  "tech_role": "engineer|developer|architect|scientist|researcher|technologist|technical (artist|director|animator)|technical art|tech art|\\bTD\\b|\\bFDE\\b|member of (the )?technical staff|\\bMTS\\b|programmer|rigger|consultant|\\bevals?\\b|evaluation",
+  "not_tech": "\\b(electrical|mechanical|hardware|manufacturing|civil|structural|network|IT|facilities|field service|security operations)\\s+(engineer|engineering)\\b",
+  "lane_a_title": "technical art|tech art|technical animator|creative technolog|rigging|\\brigger\\b|character (td|technical)|technical director",
+  "annual_max_floor": 150000,
+  "remote_queries": [
+    "ai engineer",
+    "applied ai",
+    "agentic",
+    "llm evaluation",
+    "forward deployed engineer",
+    "solutions architect ai",
+    "machine learning engineer",
+    "technical artist",
+    "simulation engineer"
+  ]
+}

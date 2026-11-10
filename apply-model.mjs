@@ -6,8 +6,8 @@
  * multiply, so applying them one at a time gives a different board than applying
  * them together; this is the single place that composes them.
  *
- *   base  = average(match_w_cv, north_star, comp, cultural_signals) + red_flags_adj
- *   final = min(5, base * compFactor * prefFactor * arrFactor)
+ *   base  = weightedMean(match_w_cv, north_star, comp, cultural_signals) + red_flags_adj
+ *   final = min(5, base * compFactor * prefFactor * arrFactor) * min(1, match_w_cv / FIT_NEUTRAL)
  *
  * See score-model.mjs for what each factor is and why.
  *
@@ -22,6 +22,7 @@
  */
 import { readFileSync, writeFileSync, existsSync, copyFileSync } from 'fs';
 import { join } from 'path';
+import { createHash } from 'node:crypto';
 import { columnsOf, reportFileOf, setCell, trackerRows } from './tracker-rows.mjs';
 import { guardArgs } from './cli-guard.mjs';
 
@@ -100,7 +101,7 @@ for (const row of trackerRows(lines, colmap)) {
     // reportModelText(). Only a legacy hand-written report is read whole.
     r = applyModel(base, {
       text: reportModelText(text) ?? text, company: row.company, role: row.role, prefs,
-      arrangement: persistedArr,
+      arrangement: persistedArr, match: s.match_w_cv,
     });
   } catch (e) {
     invalid.push(`#${num} ${p}: ${e.message}`);
@@ -114,7 +115,7 @@ for (const row of trackerRows(lines, colmap)) {
     from: Number.isFinite(shown) ? shown : null, base: r.base, to: r.final,
     cf: r.compFactor, pf: r.prefFactor, af: r.arrFactor,
     pref: r.pref, damped: r.damped, arr: r.arrangement, path: p, dead,
-    compStatus: r.compStatus,
+    compStatus: r.compStatus, fitFactor: r.fitFactor, skillsFit: r.skillsFit,
   };
   // Annotation covers every scored row, not just the ones whose tracker cell
   // moves. Keying it off `changes` left reports stale the moment the tracker
@@ -211,6 +212,13 @@ if (invalid.length) {
 
 copyFileSync(TRACKER, TRACKER + '.bak');
 writeFileSync(TRACKER, out.join('\n'), 'utf-8');
+function writeModelScores() {
+  writeFileSync(join('data', 'model-scores.json'), JSON.stringify(Object.fromEntries(
+    scored.map(x => [x.path.replace(/\\/g, '/'), {...x,
+      reportHash: createHash('sha256').update(readFileSync(x.path)).digest('hex')}])
+  ), null, 2) + '\n', 'utf-8');
+}
+writeModelScores();
 console.log(`  wrote ${TRACKER} (backup at ${TRACKER}.bak)`);
 
 if (!REPORTS) process.exit(0);
@@ -232,7 +240,7 @@ for (const x of scored) {
   if (prior) refreshed++; else touched++;
 
   // drop any previous model_* lines so they cannot accumulate
-  text = text.replace(/^[ \t]*(global_premodel|model_base|model_comp_factor|model_pref_factor|model_arrangement):[^\n]*\n/gm, '');
+  text = text.replace(/^[ \t]*(global_premodel|model_base|model_comp_factor|model_pref_factor|model_arrangement|model_fit_cap|model_fit_factor):[^\n]*\n/gm, '');
   const block = [
     `${m[1]}global: ${x.to.toFixed(2)}`,
     `${m[1]}global_premodel: ${premodel}   # pre-model, ${TODAY}`,
@@ -240,6 +248,7 @@ for (const x of scored) {
     `${m[1]}model_comp_factor: ${x.cf.toFixed(3)}`,
     `${m[1]}model_pref_factor: ${x.pf.toFixed(3)}`,
     `${m[1]}model_arrangement: ${x.arr}`,
+    `${m[1]}model_fit_factor: ${x.fitFactor.toFixed(3)}`,
   ].join('\n');
   text = text.replace(m[0], block);
   // The stated `final:` and the header move with `global`. score-audit treats `final`
@@ -247,6 +256,11 @@ for (const x of scored) {
   // `score-audit --fix` then undid this very pass, churning rows (Codex, 2026-10-29).
   text = text.replace(/^final:\s*[\d.]+/m, `final: ${x.to.toFixed(2)}`)
     .replace(/^\*\*Score:\*\*\s*[\d.]+\/5/m, `**Score:** ${x.to.toFixed(1)}/5`);
+  text = text.replace(/^(\|\s*\*{0,2}final\*{0,2}\s*\|\s*)\*{0,2}[\d.]+\*{0,2}(\s*\|)/gim,
+    (_, left, right) => `${left}${x.to.toFixed(2)}${right}`);
+  text = text.replace(/^(\|\s*base\s*\|\s*)[\d.]+(\s*\|)/gim,
+    (_, left, right) => `${left}${x.base.toFixed(2)}${right}`);
   writeFileSync(x.path, text, 'utf-8');
 }
 console.log(`  reports annotated: ${touched} new, ${refreshed} refreshed`);
+writeModelScores();

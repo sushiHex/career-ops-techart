@@ -1821,7 +1821,7 @@ try {
     writeFileSync(join(dir, 'reports', '4.md'), '**URL:** https://beta.example/careers\n');
     // Disjoint but NOT comparable: a Greenhouse id and a company-hosted id can be one posting.
     writeFileSync(join(dir, 'reports', '5.md'), '**URL:** https://job-boards.greenhouse.io/gamma/jobs/1234567\n');
-    writeFileSync(join(dir, 'reports', '6.md'), '**URL:** https://gamma.example/careers/jobs/7654321\n');
+    writeFileSync(join(dir, 'reports', '6.md'), '**URL:** https://gamma.example/careers/jobs/7594373\n');
     writeFileSync(join(dir, 'applications.md'), [
       '| # | Date | Company | Role | Score | Status | PDF | Report | Notes |',
       '|---|------|---------|------|-------|--------|-----|--------|-------|',
@@ -3028,6 +3028,125 @@ try {
   fail(`google provider tests crashed: ${e.message}`);
 }
 
+// ── PROVIDERS — Amazon (amazon.jobs search.json) ────────────────────
+
+console.log('\nProvider — amazon (amazon.jobs search endpoint)');
+
+try {
+  const mod = await import(pathToFileURL(join(ROOT, 'providers/amazon.mjs')).href);
+  const amazon = mod.default;
+  const { locationOptions, walkSearch, searchUrl } = mod;
+
+  if (amazon.id === 'amazon' && amazon.detect({ name: 'A', careers_url: 'https://www.amazon.jobs' })
+      && !amazon.detect({ name: 'A', careers_url: 'https://tracker.example/r/www.amazon.jobs/' })) {
+    pass('amazon.detect() claims amazon.jobs, anchored at the host');
+  } else {
+    fail('amazon.detect() routing is wrong');
+  }
+
+  // Live shape (2026-11-04): `locations` is an array of JSON STRINGS; the primary is
+  // `normalized_location` and names one place only.
+  const loc = (name, type = 'ONSITE') => JSON.stringify({ normalizedLocation: name, type });
+  const job = (id, title, locs) => ({
+    id_icims: id, title, job_path: `/en/jobs/${id}/x`, normalized_location: locs[0],
+    locations: locs.map((n) => loc(n)), description: `<p>About ${title}</p>`,
+  });
+
+  // The CreativeFlux case: New York primary, Culver City listed as a second location.
+  const multi = locationOptions(job('15510531', 'Senior MLE, CreativeFlux', ['New York, New York, USA', 'Culver City, California, USA']));
+  if (multi.includes('Culver City, California, USA') && multi.includes('New York, New York, USA')) {
+    pass('locationOptions keeps every location of a posting, not only the primary');
+  } else {
+    fail(`locationOptions returned ${JSON.stringify(multi)}`);
+  }
+  const remote = locationOptions({ locations: [loc('Virtual Location - USA', 'REMOTE')] });
+  if (remote.includes('Virtual Location - USA - Remote')) pass('a remote or virtual location is marked " - Remote" for the gate');
+  else fail(`remote location returned ${JSON.stringify(remote)}`);
+  if (JSON.stringify(locationOptions({ normalized_location: 'Irvine, California, USA', locations: ['not json'] })) === JSON.stringify(['Irvine, California, USA'])) {
+    pass('a record with no parseable locations falls back to its primary');
+  } else {
+    fail('unparseable locations lost the primary');
+  }
+
+  // A fake fetchJson serving pages by offset.
+  const serve = (pages) => ({
+    fetchJson: async (url) => {
+      const off = Number(new URL(url).searchParams.get('offset'));
+      if (!(off in pages)) throw Object.assign(new Error('HTTP 500'), { status: 500 });
+      return pages[off];
+    },
+  });
+  const hundred = Array.from({ length: 100 }, (_, i) => job(String(1000 + i), `Role ${i}`, ['Culver City, California, USA']));
+  const entry = { name: 'Amazon', careers_url: 'https://www.amazon.jobs', provider: 'amazon', amazon_pause_ms: 0,
+    amazon_locations: ['Culver City, California, USA'] };
+
+  const searchParams = new URL(searchUrl({ q: 'AI & media', location: entry.amazon_locations[0] }, 100)).searchParams;
+  if (searchParams.get('normalized_location[]') === entry.amazon_locations[0]
+      && searchParams.get('base_query') === 'AI & media'
+      && Number(searchParams.get('result_limit')) === 100
+      && searchParams.get('offset') === '100' && !searchParams.has('loc_query')) {
+    pass('Amazon search URL preserves the working location filter and the 100-row page limit');
+  } else fail('Amazon search URL lost its effective location filter or page limit');
+
+  const two = await amazon.fetch(entry, serve({ 0: { hits: 101, jobs: hundred }, 100: { hits: 101, jobs: [job('2000', 'Last', ['Culver City, California, USA'])] } }));
+  if (two.length === 101 && !two.truncated && two[0].url === 'https://www.amazon.jobs/en/jobs/1000/x') {
+    pass('amazon.fetch pages by offset to the hit count and builds the posting URL from job_path');
+  } else {
+    fail(`amazon.fetch returned ${two.length} jobs, truncated=${two.truncated}`);
+  }
+
+  const capped = await amazon.fetch(entry, serve({ 0: { hits: 10000, jobs: hundred } }));
+  if (/engine cap/.test(capped.truncated || '')) pass('hits at the 10000 cap means the location filter did not apply, and says TRUNCATED');
+  else fail(`10000-cap case: truncated=${capped.truncated}`);
+
+  const short = await amazon.fetch(entry, serve({ 0: { hits: 150, jobs: hundred }, 100: { hits: 150, jobs: [] } }));
+  if (short.length === 100 && /served 100 of 150/.test(short.truncated || '')) pass('a server that runs out of rows before its count marks the result truncated');
+  else fail(`short walk: ${short.length} rows, truncated=${short.truncated}`);
+
+  let threw = false;
+  try { await amazon.fetch(entry, serve({ 0: { error: 'blocked' } })); } catch { threw = true; }
+  if (threw) pass('a response with no jobs array throws, instead of reading as no postings');
+  else fail('amazon.fetch read an unreadable response as empty');
+
+  threw = false;
+  try { await amazon.fetch({ ...entry, amazon_locations: [] }, serve({})); } catch { threw = true; }
+  if (threw) pass('an entry that names no locations throws rather than searching nothing');
+  else fail('an entry with no locations searched nothing silently');
+
+  const walked = await walkSearch(serve({ 0: { hits: 150, jobs: hundred } }), { q: '', location: 'Culver City, California, USA' }, { maxPages: 1, pauseMs: 0 });
+  if (/^TRUNCATED at 1 pages: 100 of 150/.test(walked.truncated || '')) pass('a walk that hits its page bound says TRUNCATED');
+  else fail(`page bound: truncated=${walked.truncated}`);
+
+  const repeated = await walkSearch(serve({ 0: { hits: 200, jobs: hundred }, 100: { hits: 200, jobs: hundred } }),
+    { q: '', location: entry.amazon_locations[0] }, { pauseMs: 0 });
+  if (repeated.records.length === 100 && /repeated earlier rows/.test(repeated.truncated || '')) {
+    pass('Amazon repeated pages retain unique rows and report an incomplete walk');
+  } else fail('Amazon repeated-page guard did not preserve truncation');
+
+  const latched = await walkSearch(serve({ 0: { hits: 102, jobs: hundred },
+    100: { hits: 0, jobs: [job('3000', 'Penultimate', ['Irvine, California, USA'])] },
+    200: { hits: 0, jobs: [job('3001', 'Final', ['Irvine, California, USA'])] } }),
+    { q: '', location: entry.amazon_locations[0] }, { pauseMs: 0 });
+  if (latched.hits === 102 && latched.records.length === 102 && !latched.truncated) {
+    pass('Amazon latches the first page hit count when later pages report zero');
+  } else fail(`Amazon first-page count drifted: ${latched.records.length}/${latched.hits}`);
+
+  const limitedCalls = [];
+  const limited = await amazon.fetch({ ...entry, amazon_locations: [...entry.amazon_locations, 'Irvine, California, USA'] }, {
+    fetchJson: async (url) => {
+      limitedCalls.push(url);
+      if (limitedCalls.length === 1) return { hits: 150, jobs: hundred };
+      throw Object.assign(new Error('HTTP 429'), { status: 429 });
+    },
+  });
+  if (limitedCalls.length === 2 && limited.length === 100
+      && /page 2 failed/.test(limited.truncated || '') && /1 search\(es\) not run/.test(limited.truncated || '')) {
+    pass('Amazon stops remaining city searches after a later page is rate limited and retains read rows');
+  } else fail(`Amazon continued after a page-2 429: ${limitedCalls.length} calls, ${limited.truncated}`);
+} catch (e) {
+  fail(`amazon provider tests crashed: ${e.message}`);
+}
+
 // ── PROVIDERS — GitHub (github.careers) ─────────────────────────────
 
 console.log('\nProvider — github (github.careers)');
@@ -3079,6 +3198,33 @@ try {
     pass('parseGithubJobs folds location_type into the location string');
   } else {
     fail(`parseGithubJobs dropped location_type: ${JSON.stringify(rows[0]?.location)}`);
+  }
+
+  // A BARE workplace word is not a place. As an option of its own, "ANY" read as an
+  // unrecognised location and outweighed the Germany rejects (2026-10-30); a bare
+  // "Remote" option would accept any country. Remote folds into each place instead.
+  const bare = parseGithubJobs({ jobs: [
+    { data: { title: 'A', req_id: '1', full_location: 'Germany', location_name: 'Germany Remote', location_type: 'ANY' } },
+    { data: { title: 'B', req_id: '2', full_location: 'Germany', location_type: 'Remote' } },
+    { data: { title: 'C', req_id: '3', full_location: 'United States', location_type: 'Remote' } },
+    { data: { title: 'D', req_id: '4', full_location: 'San Francisco, CA, United States | Berlin, Germany', location_type: 'Remote' } },
+    { data: { title: 'E', req_id: '5', full_location: 'US, NY, Remote', country: 'US', location_type: 'Remote' } },
+  ] }, 'GitHub');
+  if (bare[3]?.location === 'San Francisco, CA, United States - Remote | Berlin, Germany - Remote'
+      && bare[4]?.location === 'US, NY, Remote') {
+    pass('parseGithubJobs folds Remote per option and never mints one from the country field');
+  } else fail(`parseGithubJobs per-option fold: ${JSON.stringify([bare[3]?.location, bare[4]?.location])}`);
+  if (bare[0]?.location === 'Germany | Germany Remote') pass('parseGithubJobs drops a bare ANY workplace type');
+  else fail(`parseGithubJobs bare ANY: ${JSON.stringify(bare[0]?.location)}`);
+  if (bare[1]?.location === 'Germany - Remote' && bare[2]?.location === 'United States - Remote') {
+    pass('parseGithubJobs folds a bare Remote into each place');
+  } else fail(`parseGithubJobs bare Remote: ${JSON.stringify([bare[1]?.location, bare[2]?.location])}`);
+  {
+    const { decideLocations, buildSignals, locationFilterFromPolicy, loadLocationPolicy } = await import('./location-core.mjs');
+    const sig = buildSignals(locationFilterFromPolicy(loadLocationPolicy(join(ROOT, 'presets', 'locations', 'california-socal.json'))));
+    const v = bare.map((r) => decideLocations(r.location, sig).verdict);
+    if (v[0] === 'reject' && v[1] === 'reject' && v[2] === 'accept' && v[3] !== 'reject' && v[4] === 'reject') pass('GitHub workplace types reach the gate as the place they qualify');
+    else fail(`GitHub workplace-type verdicts: ${JSON.stringify(v)}`);
   }
 
   if (rows[0] && rows[0].url === 'https://careers-githubinc.icims.com/jobs/5501/login') {
@@ -3994,7 +4140,7 @@ try {
   // was found by its raw text as read at start, which the first write had replaced, so
   // the second update was logged and silently dropped.
   {
-    const url = '**URL:** https://boards.greenhouse.io/acme/jobs/7654321';
+    const url = '**URL:** https://boards.greenhouse.io/acme/jobs/7594373';
     const m = mergeFixture('career-ops-twice-', {
       rows: ['| 50 | 2026-07-05 | Acme | Data Engineer, Search | 3.2/5 | Evaluated | ❌ | [50](../reports/050-acme.md) | original |'],
       reports: { '050-acme.md': url, '051-acme.md': url, '052-acme.md': url },
@@ -6600,6 +6746,49 @@ try {
   fail(`score-audit separator test crashed: ${e.message}`);
 }
 
+// ── SCORE-PARSER READS A CRLF REPORT'S YAML BLOCK ───────────────
+// 307 of 1389 reports on disk were CRLF on 2026-11-08. The shared YAML block pattern
+// demanded a bare `\n`, so on every one of them the block never matched, the markdown
+// table tied it on four dimensions with no `global`, and audit-scores reported 37
+// post-baseline reports as having "no machine-readable score block" while each carried
+// a complete one. Asserted as a relation: the CRLF and LF spellings of one report must
+// parse to the same record, and that record must come from the YAML block with its global.
+console.log('\n🧪 Testing score-parser reads a CRLF report the same as an LF one...');
+try {
+  const { parseScores: ps } = await import(pathToFileURL(join(ROOT, 'score-parser.mjs')).href);
+  const lf = '## Verdict\n\n| | |\n|---|---|\n| match_w_cv | 3.6 |\n| north_star | 4.3 |\n' +
+    '| comp | 4.8 |\n| cultural_signals | 4.6 |\n\n## Machine Summary\n\n```yaml\n' +
+    'scores:\n  match_w_cv: 3.6\n  north_star: 4.3\n  comp: 4.8\n  cultural_signals: 4.6\n' +
+    '  red_flags_adj: 0\n  global: 4.71\n  global_premodel: 4.20   # pre-model, 2026-07-27\n' +
+    '  model_base: 4.36\nfinal: 4.71\n```\n';
+  const crlf = lf.replace(/\n/g, '\r\n');
+  const a = ps(lf), b = ps(crlf);
+  if (a && a.form === 'yaml' && a.global === 4.71) {
+    pass('score-parser takes the YAML block, with its global, over a table that lacks one');
+  } else {
+    fail(`score-parser did not prefer the YAML block on LF: ${JSON.stringify(a)}`);
+  }
+  if (b && b.form === 'yaml' && JSON.stringify(a) === JSON.stringify(b)) {
+    pass('score-parser reads the CRLF spelling of the same report to the same record');
+  } else {
+    fail(`score-parser read the CRLF report differently: ${JSON.stringify(b)}`);
+  }
+  // The tie-break on its own: no YAML block at all, a table with four dimensions and no
+  // global, and a loose key/value run that carries the global. The table is extracted
+  // first, so under a dimensions-only completeness it won on the stable sort and the
+  // audit had no stated global to compare. A candidate with the global must outrank it.
+  const tieOnly = '| match_w_cv | 3.6 |\n| north_star | 4.3 |\n| comp | 4.8 |\n| cultural_signals | 4.6 |\n\n' +
+    'match_w_cv: 3.6\nnorth_star: 4.3\ncomp: 4.8\ncultural_signals: 4.6\nred_flags_adj: 0\nglobal: 4.71\n';
+  const c = ps(tieOnly);
+  if (c && c.global === 4.71) {
+    pass('score-parser prefers a parse that carries the global over one that lacks it');
+  } else {
+    fail(`score-parser kept a parse without the global: ${JSON.stringify(c)}`);
+  }
+} catch (e) {
+  fail(`score-parser CRLF test crashed: ${e.message}`);
+}
+
 // ── SCORE-AUDIT MUST NOT RE-ARM A GATE THE WRITER WITHHELD ──────
 // This replay rebuilt `comp_total_est` out of comp_posted, which relabels any
 // posted band as total compensation: the same mislabelling eval-write carried.
@@ -8050,6 +8239,9 @@ console.log('\nLocation gates agree (Node scanner vs Python evaluation)');
     'AMER - United States - California - Los Angeles', 'AMER - Canada - Remote', 'AMER - Remote',
     'EMEA - United Kingdom - London - Remote', 'APAC - Australia - Sydney - Remote',
     'Americas - Remote', 'NA - Remote', 'Remote (Americas)', 'LATAM - Remote', 'Remote, Flexible',
+    // An Eightfold filler: "Multiple Locations" after a country hid it.
+    'United Kingdom, Multiple Locations, Multiple Locations',
+    'United States, Multiple Locations, Multiple Locations | Remote, United States', 'Multiple Locations',
     // EA writes a metro label over the city ("Los Angeles - Chatsworth"). One piece naming
     // two places is a hierarchy, so a far place beside the commute word voids it; a far
     // place named as a preference or an office does not.
@@ -8135,6 +8327,9 @@ console.log('\nLocation gates agree (Node scanner vs Python evaluation)');
   Object.assign(expected.tx, { 'TX Remote': 'pass', 'Remote (US) - Must reside in TX': 'pass',
     'Remote (US) - Must reside in CT': 'fail', 'Texas - we are fully remote': 'pass' });
   Object.assign(expected.ca, {
+    'United Kingdom, Multiple Locations, Multiple Locations': 'fail',
+    'United States, Multiple Locations, Multiple Locations | Remote, United States': 'pass',
+    'Multiple Locations': 'unknown',
     'AMER - United States - Texas - Remote': 'fail', 'AMER - United States - California - Remote': 'pass',
     'AMER - United States - Texas - Remote | Texas, USA - Remote': 'fail', 'AMER - United States - Texas': 'fail',
     'AMER - United States - California - Los Angeles': 'pass', 'AMER - Canada - Remote': 'fail',

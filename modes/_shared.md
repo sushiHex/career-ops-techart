@@ -36,21 +36,20 @@ The evaluation uses 6 blocks (A-F) with a global score of 1-5:
 | Comp | Salary vs market (5=top quartile, 1=well below) |
 | Cultural signals | Company culture, growth, stability, remote policy |
 | Red flags | Blockers, warnings (negative adjustments) |
-| **Base** | `average(match_w_cv, north_star, comp, cultural_signals) + red_flags_adj` |
-| **Global** | `min(5, base × compFactor × prefFactor × arrFactor)` |
+| **Base** | `weightedMean(match_w_cv, north_star, comp, cultural_signals) + red_flags_adj` |
+| **Global** | `min(5, base × compFactor × prefFactor × arrFactor) × fitFactor` |
 
 ### Modifiers (adopted 2026-07-27)
 
 Five models tuned separately over one session, wired in together because they
 multiply: applying them piecemeal gives a different board than applying them at
 once. `score-model.mjs` is the single implementation; `node apply-model.mjs`
-re-scores the tracker and reports from it. **Every factor is 1.0 by default** —
-the base score is still the whole score for a role with no posted comp, no
-company preference and no hybrid requirement.
+re-scores the tracker and reports from it. Dimension weights come from `scoring_weights` in config/profile.yml; absent configuration defaults to equal weights. Fit is a gradual adjustment, not a hard ceiling or a probability estimate. A skills fit of 3.5 or better adds no fit penalty.
 
 | Factor | Rule | Why |
 |--------|------|-----|
 | `compFactor` | Fires **only on evidence about TOTAL comp**. A stated total below the floor (`compensation.minimum` in `config/profile.yml`) is gated by `(achievable/floor)^1.5`. A base-only figure below the floor is **unverified, not penalised**; a base figure *above* the floor clears (base is a lower bound). No figure means no penalty. | The floor is total comp, so only total-comp evidence may gate. Base says nothing about total — bonus and equity range from +10% at a studio to +100% at big tech. An earlier version multiplied the floor by a fixed 0.85 to compare base against it; that was a guess, and it wrongly gated an NVIDIA req whose RSUs clear the floor outright. Underpaying roles are still caught by the comp **dimension**, scored by a human who read the whole posting. |
+| `fitFactor` | `min(1, match_w_cv / 3.5)`, applied after the existing composite is capped at 5 | Keeps weak-fit roles from being rescued by pay or preference, while preserving plausible stretches. No hard skills ceiling, no bonus for perfect stack overlap. |
 | `prefFactor` | `1 + (preference × 0.08)`, preference 0.0-1.0 in 0.1 steps from `company_preference:` in `config/profile.yml` | How much the user wants to work somewhere, which no dimension measures. |
 | role-type gate | Titles matching `_role_gate` in `config/lane-vocab.json` keep 25% of company preference (none, if no gate is configured) | A company multiplier cannot tell an AI/ML engineering req from a DevRel req at the same employer. Ungated, 6 of 10 promotions were titles the user de-prioritises. |
 | `arrFactor` | Hybrid × 0.971; remote, onsite and unclassified × 1.0 | Remote outranks hybrid. Expressed as damping hybrid rather than boosting remote: remote is 96 of 142 rows, so boosting it would lift two thirds of the board and just lower the effective cutoff. Onsite stays at 1.0 because arrangement is a proxy for commute, and a short onsite commute beats a long hybrid one. |
@@ -67,13 +66,51 @@ best-places multiplier on top would score the same evidence twice — the same
 double-count the red-flags rule below exists to prevent. If culture should weigh
 more, raise it *inside* `cultural_signals`.
 
-**NO DOUBLE-COUNTING (hard rule).** `red_flags_adj` may ONLY capture information not already reflected in one of the four positive dimensions above. A skill/credential/seniority gap belongs in Match con CV — it suppresses that score once. A comp-uncertainty concern belongs in Comp. A culture/travel/instability concern belongs in Cultural signals. Do NOT restate the same gap as the "biggest red flag" and subtract for it again — that penalizes one fact twice and silently drags every candidate's global score down by up to a full point. `red_flags_adj` is reserved for things the other four dimensions structurally can't capture: posting-pattern risk (compliance-only listing, evergreen/pipeline req, likely pre-identified candidate), legitimacy concerns, or a genuinely separate risk with no home in the four scored dimensions. If, after scoring Match/North Star/Comp/Cultural honestly, you can't think of a red flag that ISN'T just a restatement of one of those four, `red_flags_adj` should be 0 or close to it — that is the expected, common case, not a sign you're being too lenient. (Root-caused 2026-07-20 after a run of "0 new 4.0+ gems" full searches turned out to be partly this bug, not pure market saturation — see project memory.)
+**NO DOUBLE-COUNTING (hard rule).** `red_flags_adj` may ONLY capture information not already reflected in one of the four positive dimensions above. A skill/credential/seniority gap belongs in Match con CV. The model then applies its standard fit factor mechanically; do not add a separate discretionary gap penalty. A comp-uncertainty concern belongs in Comp. A culture/travel/instability concern belongs in Cultural signals. Do NOT restate the same gap as the "biggest red flag" and subtract for it again — that penalizes one fact twice and silently drags every candidate's global score down by up to a full point. `red_flags_adj` is reserved for things the other four dimensions structurally can't capture: posting-pattern risk (compliance-only listing, evergreen/pipeline req, likely pre-identified candidate), legitimacy concerns, or a genuinely separate risk with no home in the four scored dimensions. If, after scoring Match/North Star/Comp/Cultural honestly, you can't think of a red flag that ISN'T just a restatement of one of those four, `red_flags_adj` should be 0 or close to it — that is the expected, common case, not a sign you're being too lenient. (Root-caused 2026-07-20 after a run of "0 new 4.0+ gems" full searches turned out to be partly this bug, not pure market saturation — see project memory.)
+
+### Skills-fit assessment
+
+Score the ability to solve the role's central problems, not title similarity or keyword coverage. Read the full JD and current candidate evidence. For each important responsibility, distinguish:
+
+- Direct evidence: work already delivered, with scope and outcomes.
+- Transferable evidence: related work and the specific capability that transfers; identify what remains unproven.
+- Complementary strengths: an unusual combination that addresses a stated team need. Credit it within skills fit, not as a separate bonus.
+- Essential gaps: explicit required capability or seniority scope that lacks evidence.
+- Optional specialization and ramp-up: examples, preferred tools, equivalent experience and "not every tool required" language are not automatic blockers.
+
+Do not infer low fit from an unconventional career title, or enterprise-scale expertise from a personal prototype. Keep uncertainty distinct from evidence of inability. Interview invitations are evidence of employer interest and a reason to revisit assumptions; they do not automatically change dimensions. Reviewers must challenge both unsupported optimism and unsupported pessimism. Candidate-specific examples and priorities live in `modes/_profile.md` and `cv.md`.
+
+Use the current model, not historical report totals, for calibration. Evaluators return evidence-backed dimensions; only `score-model.mjs` computes final scores. Do not lower a dimension to force a desired cutoff, add a second gap penalty, or invent hiring probabilities.
+
+### Judgment calibration
+
+Use these anchors for the input ratings, not the final score. Start at the nearest anchor; use tenths only when a specific fact justifies the difference. Do not count matching keywords or average a checklist of tools.
+
+| Rating | Skills fit | Career alignment | Cultural signals |
+|---|---|---|---|
+| 3.0 | Useful adjacent experience, but several central capabilities or the required ownership scope are unproven | Adjacent work with a limited path toward the candidate's stated goals | Mixed or insufficient evidence; neutral, not a finding of poor culture |
+| 3.5 | Credible transfer to the central work, with a substantial essential gap | Meaningful relevant work, with substantial duties outside the target direction | Positive team/work-practice signals, with limited corroboration or a material trade-off |
+| 4.0 | Most central work is supported at relevant scope; remaining gaps are bounded and explainable | The main work directly advances a target direction | Corroborated evidence of supportive practices and a workable environment |
+| 4.5 | Strong evidence across central responsibilities and ownership scope; mostly ordinary ramp-up | Core target work plus a concrete, desired growth opportunity | Strong, current evidence across team practices, sustainability and stability |
+| 5.0 | Exceptional demonstrated coverage, including the hardest responsibilities; no material essential gap | Exceptionally close to the stated ideal in both work and trajectory | Exceptional, well-corroborated evidence; rare, not an employer-reputation default |
+
+Below 3.0 means progressively less support: 2.0 has little overlap with the central work; 1.0 is fundamentally mismatched. Interpolate rather than inventing extra categories. Transferable evidence can support a high rating when it demonstrates the same capability and scope. Company preference belongs in its configured factor, not an additional discretionary bonus.
+
+**Compensation:** use the shared compensation guidance and `scripts/eval-assist.py` suggestion as a starting point, with current targets from the user profile. State the pay basis and why any override is warranted. No reliable band means 3.0 with low confidence, not assumed high pay. Separate published base, supported total and speculative equity; a display-only estimate is not new compensation evidence.
+
+**One compact evidence check:** in the existing evaluation body, identify the role's three to five central responsibilities. For each, give the requirement's importance (essential or preferred), the strongest direct or transferable proof, and what remains unproven at the required scope. Then give each dimension an anchor, a short reason and confidence (high, medium or low). Confidence is a label, not another multiplier. Missing evidence means unproven, not incapable; employer marketing alone cannot establish exceptional culture.
+
+**Stable reference cases:** agent/evaluation experience does not establish sole ownership of cloud infrastructure; studio pipeline experience can directly satisfy a studio agent-tooling role; a Principal title is neither a bonus to fit nor a disqualifier, but required organization-wide ownership needs evidence. These distinctions calibrate judgment without assigning every superficially similar job the same score.
+
+**Re-review rule:** change a rating only for new evidence, a specific missed or misread requirement, double-counting, or a demonstrable mismatch with these anchors. Record that reason and the old/new input. Rephrasing the same evidence is not a reason to move it. Similar roles with the same requirements should receive similar ratings; explain material differences. Never tune inputs to reach an application cutoff. Historical reports are evidence sources, not rating authorities.
+
+**Application outcomes are not score inputs.** A rejection changes status, not fit, other dimensions or red flags. Do not deduct for prior rejections, predicted rejection, application count or imagined loss of recruiter goodwill. Record verified reapplication restrictions as process notes. Specific employer feedback may supply new evidence about a requirement; an unexplained rejection does not.
 
 **Score interpretation:**
-- 4.5+ → Strong match, recommend applying immediately
-- 4.0-4.4 → Good match, worth applying
-- 3.5-3.9 → Decent but not ideal, apply only if specific reason
-- Below 3.5 → Recommend against applying (see Ethical Use in AGENTS.md)
+- 4.5+: high overall priority, subject to the actual requirements and gates; not proof of perfect skills fit.
+- 4.0-4.4: worth considering with a credible evidence-based case.
+- 3.5-3.9: selective stretch; explain the specific reason to pursue.
+- Below 3.5: generally recommend against a new application; record exceptions and keep existing interview progress visible.
 
 ## Posting Legitimacy (Block G)
 

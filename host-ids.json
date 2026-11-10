@@ -37,6 +37,13 @@
   ],
   "rules": [
     {
+      "ns": "gem",
+      "per_employer": true,
+      "re": "^(?:https?://)?jobs\\.gem\\.com/[^/?#]+/([A-Za-z0-9_-]{16,})(?:/|$)",
+      "example": "https://jobs.gem.com/example/am9icG9zdDpExample00001",
+      "key": "gem:am9icg9zddpexample00001"
+    },
+    {
       "ns": "apple",
       "re": "^(?:https?://)?jobs\\.apple\\.com/[^?#]*?/details/(\\d{6,})",
       "example": "https://jobs.apple.com/en-us/details/201190336-0001/example-role",

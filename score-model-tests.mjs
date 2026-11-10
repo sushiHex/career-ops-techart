@@ -23,6 +23,8 @@ process.on('exit', () => rmSync(TMP, { recursive: true, force: true }));
 process.env.CAREER_OPS_CONFIG_DIR = join(TMP, 'noconfig');
 mkdirSync(process.env.CAREER_OPS_CONFIG_DIR);
 const M = await import(new URL('./score-model.mjs', import.meta.url).href);
+// After the config override above: a static import would load the model first.
+const { computeGlobal } = await import(new URL('./score-parser.mjs', import.meta.url).href);
 const { compBand, arrangement, locationText, MODEL,
         normaliseArrangement, persistedArrangement, reportModelText } = M;
 
@@ -291,6 +293,11 @@ t('loadPrefs: tier comments and blank lines do not truncate the block', () => {
     ? true : `parsed ${prefs.length} entries, Beta -> ${M.preference('Beta', prefs)}`;
 });
 
+t('loadPrefs: Windows blank lines preserve later preference tiers', () => {
+  const prefs = prefsFrom('company_preference:\r\n  Alpha: 1.0\r\n\r\n  Beta: 0.5\r\n\r\nnext_key: x\r\n');
+  return prefs.length === 2 && M.preference('Beta', prefs) === 0.5;
+});
+
 t('loadPrefs: a following top-level key is not swallowed into the block', () => {
   const prefs = prefsFrom('company_preference:\n  Alpha: 1.0\n\nauto_pdf_score_threshold: 4.0\n');
   return prefs.length === 1 ? true : `parsed ${prefs.length} entries, expected 1`;
@@ -548,6 +555,64 @@ t('config: a profile that is not valid YAML is an error, not a silently partial 
 
 // -------------------------------------------------------------------- report
 
+t('fit adjustment: weak fit cannot be rescued by maximum pay and preference', () => {
+  const r = applyModel(4.1, {match:2.3,company:'Acme',role:'Engineer',prefs:PREFS});
+  return eq(r.final,2.91);
+});
+t('fit adjustment: plausible stretch and strong fit retain the prior composite', () => {
+  const ctx={company:'Acme',role:'Engineer',prefs:PREFS};
+  for(const match of [3.5,4,4.6,5])if(applyModel(4.1,{...ctx,match}).final!==applyModel(4.1,ctx).final)return 'penalized '+match;
+  return true;
+});
+t('fit adjustment: moderate gap is discounted without a hard ceiling', () => {
+  const r=applyModel(4.5,{match:3.1});
+  return eq(r.final,3.99);
+});
+t('fit adjustment: never raises a lower composite', () => applyModel(2,{match:3}).final<=2);
+t('fit adjustment: invalid explicit skills are rejected', () => {
+  for(const match of [-1,6,NaN,'3']){try{applyModel(4,{match});return 'accepted '+match;}catch{}}
+  return true;
+});
+t('fit adjustment: report parser and explicit input agree', () => {
+  const text='scores:\n  match_w_cv: 2.3\n  north_star: 4.5\n  comp: 5\n  cultural_signals: 4.6\n';
+  return eq(applyModel(4.1,{text}).final,applyModel(4.1,{match:2.3}).final);
+});
+t('fit adjustment: monotonic and neutral at threshold, zero at zero fit', () => {
+  let prior=-1;
+  for(let i=0;i<=50;i++){
+    const match=i/10,r=applyModel(5,{match,company:'Acme',role:'Engineer',prefs:PREFS});
+    if(r.final<prior||r.final>5||Math.abs(r.final-Math.round(5*Math.min(1,match/3.5)*100)/100)>0.001)return 'bad score at '+match;
+    prior=r.final;
+  }
+  return true;
+});
+
+t('weighted base: normalized config and compensation sensitivity', () => {
+  const dir=mkdtempSync(join(tmpdir(),'score-weights-'));
+  try {
+    const path=join(dir,'profile.yml');
+    writeFileSync(path,'scoring_weights:\n  match_w_cv: 7\n  north_star: 7\n  comp: 9\n  cultural_signals: 7\n');
+    const w=M.loadScoreWeights(path), s={match_w_cv:3,north_star:3,comp:3,cultural_signals:3,red_flags_adj:-0.1};
+    return Math.abs(M.computeBase(s,w)-2.9)<1e-9 &&
+      Math.abs(M.computeBase({...s,comp:4},w)-3.2)<1e-9 &&
+      Math.abs(M.computeBase({...s,match_w_cv:4},w)-(2.9+7/30))<1e-9;
+  } finally { rmSync(dir,{recursive:true,force:true}); }
+});
+t('weighted base: missing config defaults equally and absent evidence stays null', () => {
+  const w=M.loadScoreWeights(join(tmpdir(),'missing-score-profile.yml'));
+  return Object.values(w).every(v=>v===0.25) && M.computeBase({match_w_cv:4},w)===null;
+});
+t('weighted base: invalid config refuses to silently score', () => {
+  const dir=mkdtempSync(join(tmpdir(),'score-invalid-'));
+  try {
+    const path=join(dir,'profile.yml');writeFileSync(path,'scoring_weights:\n  comp: 0.3\n');
+    try { M.loadScoreWeights(path); return false; } catch { return true; }
+  } finally { rmSync(dir,{recursive:true,force:true}); }
+});
+t('weighted base: parser and evaluation model share one calculation', () => {
+  const s={match_w_cv:3.6,north_star:4.3,comp:4.8,cultural_signals:3.5};
+  return eq(computeGlobal(s), M.computeBase(s));
+});
 console.log(`score-model tests: ${pass} passed, ${fails.length} failed`);
 if (fails.length) {
   console.log('');

@@ -62,13 +62,29 @@ export function parseGithubJobs(json, companyName, seen = new Set()) {
     if (seen.has(key)) continue;
     seen.add(key);
 
-    const bits = [j.full_location, j.location_name, j.country]
+    let bits = [j.full_location, j.location_name, j.country]
       .filter((x) => typeof x === 'string' && x.trim());
     // location_type carries "Remote"/"Hybrid" and is NOT part of full_location, so a
     // remote-eligible role looks purely like its country string without it. This is the
     // same secondary-location class that has bitten every other adapter here.
-    if (typeof j.location_type === 'string' && j.location_type.trim()) {
-      bits.push(j.location_type.trim());
+    //
+    // But it is a QUALIFIER of the place, not a place. A scoped value ("US Remote") is a
+    // place and stays an option. A bare workplace word is not: as an option of its own,
+    // "ANY" read as an unrecognised location and one unknown option outweighed the two
+    // Germany rejects, so a Germany-only posting reached the inbox (2026-10-30). A bare
+    // "Remote" would be worse, accepting any country. So a bare Remote is folded INTO
+    // each place, and any other bare word (ANY, Hybrid, Onsite) adds nothing.
+    const type = typeof j.location_type === 'string' ? j.location_type.trim() : '';
+    const BARE = /^(?:any|remote|hybrid|on-?site|in[- ]office|flexible)$/i;
+    if (type && !BARE.test(type)) bits.push(type);
+    else if (/^remote$/i.test(type)) {
+      // Per OPTION, not per field: a field can hold "San Francisco, CA, United States |
+      // Berlin, Germany", and suffixing the field qualified Berlin alone (Codex). The
+      // country field is dropped when a place is present, because "US" beside
+      // "US, NY, Remote" minted an UNRESTRICTED "US - Remote" option (Codex).
+      const places = [j.full_location, j.location_name].filter((x) => typeof x === 'string' && x.trim());
+      const opts = (places.length ? places : bits).flatMap((b) => b.split('|')).map((s) => s.trim()).filter(Boolean);
+      bits = opts.length ? opts.map((b) => (/remote/i.test(b) ? b : `${b} - Remote`)) : ['Remote'];
     }
 
     out.push({

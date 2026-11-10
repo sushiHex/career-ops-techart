@@ -760,7 +760,7 @@ def main():
         print(json.dumps({
             "found": [dict(company=c, provider=p, slug=s, live=n) for c, p, s, n in found],
             "check": [dict(company=c, provider=p, slug=s, live=n) for c, p, s, n in check],
-            "empty": [dict(company=c, provider=p, slug=s) for c, p, s, _n in empty],
+            "empty": [dict(company=c, provider=p, slug=s) for c, p, s in empty],
             "none": none_, "unchecked": unchecked,
             **({"urls": url_rows} if url_rows else {})}, indent=1))
         return 0

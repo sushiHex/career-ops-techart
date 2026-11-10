@@ -35,7 +35,7 @@ Table with:
 
 ## Block B — Match with CV
 
-Read `cv.md`. Create a table with each JD requirement mapped to exact lines in the CV.
+Read `cv.md` and the Skills-fit assessment and Judgment calibration in `modes/_shared.md`. Use their rating anchors and compact evidence check in the existing evaluation body, including a short reason and confidence for each dimension. Map central responsibilities to cited candidate evidence. Classify requirements as essential, preferred or illustrative; label evidence as direct, transferable or missing. Explain valuable combinations of experience where they solve a stated team problem. Score capability and scope rather than title/keyword overlap. Do not treat a list of example tools as a requirement to know every tool. On re-review, follow the shared change rule rather than freely re-rating unchanged evidence.
 
 **Adapted to the archetype:** lead with what `## Your Adaptive Framing` in `modes/_profile.md` says to emphasize for the detected archetype, and apply its `## Portfolio Evidence` rule where one exists.
 

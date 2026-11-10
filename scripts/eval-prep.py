@@ -169,8 +169,13 @@ REQ_START = re.compile(r"(what we need to see|qualifications|requirements|what y
 # Amazon writes the currency once, after the range ("154,200.00 - 208,600.00 USD"): the
 # third form reads the low end by looking ahead to that USD, and cents are allowed before
 # USD, or the band req-resolve now extracts became no figures at all (Codex, 2026-10-29).
+# The fourth form is the HIGH end of a range written with one dollar sign and no USD,
+# "$186,500.00 - 252,300.00": req-resolve's PAY reads it as one band
+# and this read only its low end, so the band became a zero-width one at its bottom. It
+# must follow a digit, so it only ever continues a figure already read.
 MONEY = re.compile(r"\$\s?([\d,]{5,})(?:\.\d\d)?|([\d,]{6,})(?:\.\d\d)?\s*USD"
-                   r"|([\d,]{6,})(?:\.\d\d)?(?=\s*(?:-|to|–|\u2014)\s*[\d,]{6,}(?:\.\d\d)?\s*USD)")
+                   r"|([\d,]{6,})(?:\.\d\d)?(?=\s*(?:-|to|–|\u2014)\s*[\d,]{6,}(?:\.\d\d)?\s*USD)"
+                   r"|(?<=\d)\s*(?:-|to|–|\u2014)\s*([\d,]{6,})(?:\.\d\d)?(?![\d,])")
 # Words that contradict reading a silent hourly rate as the whole package: a bonus, equity,
 # or the rate called BASE. Only consulted for an hourly figure; see comp_verdict().
 EXTRA_COMP = re.compile(r"\b(bonus(es)?|equity|stock|RSUs?|commission|base (pay|salary|rate|compensation))\b", re.I)
@@ -272,6 +277,8 @@ ORG_NAMES = {
     "2kgames": "2K Games", "cddprojektred": "CD Projekt Red", "wetafx": "Weta FX",
     "ilm": "ILM", "dneg": "DNEG", "mpc": "MPC", "scanlinevfx": "Scanline VFX",
     "anthropic": "Anthropic", "xai": "xAI", "ssi": "SSI", "aws": "AWS",
+    # www.google.com/about/careers: a host the declared-careers-host rule cannot name.
+    "google": "Google",
     "eyelinestudios": "Eyeline Studios", "lumalabs-ai": "Luma AI",
     # explore.jobs.netflix.net hints "netflix", and the tracker's own "Netflix" is read as a
     # possible seed of the capitalised guess, so every Netflix packet came out unnamed.
@@ -362,7 +369,7 @@ def tracker_spelling(name):
     return max(near, key=seen.get) if near else name
 
 
-def portal_employer(slug=None, workday=None):
+def portal_employer(slug=None, workday=None, url=None):
     """The employer portals.yml records for a board slug or a Workday (tenant, site), or None.
 
     portals.yml already says who each board belongs to; its label base is the name, spelled
@@ -371,8 +378,20 @@ def portal_employer(slug=None, workday=None):
     by the site), and neither is a capitalised slug ("Shieldai"). So a hand-kept slug table
     is needed only for boards nobody recorded. Two entries naming different employers for
     one board return None rather than a guess.
+
+    `url` names the employer whose entry declares that exact company-owned HOST
+    (a careers host declared by one employer's entry names that employer, where its
+    packets would otherwise come out unnamed). Exact, not a key overlap: overlapping keys
+    named one studio's posting after a sibling division of the same parent. The index records no ATS host.
     """
-    if slug:
+    if url:
+        h = (rr.urllib.parse.urlsplit(url).hostname or "").lower()
+        # Only a CAREERS host is one employer's own: a bare marketplace domain (an
+        # aggregator's) hosts everyone's postings however few entries declare it.
+        if not re.search(r"(^|[.-])careers?[.-]", h):
+            return None
+        names = {e["base"] for e in rr.portals_index() if h and h in e.get("hosts", ())}
+    elif slug:
         names = {e["base"] for e in rr.portals_index() if slug.lower() in e["boards"]}
     else:
         tenant, site = workday
@@ -438,6 +457,12 @@ def company_from(r):
         # difference keeps the ATS spelling, which is how "HeyGen" stops being "Heygen".
         known = tracker_spelling(stated)
         return stated if rr.name_key(known) == rr.name_key(stated) else known
+    # The declared-host lookup comes AFTER a stated name, never before it: a portals.yml
+    # entry for an aggregator (Wellfound) declares the host every employer on it shares,
+    # and ahead of the stated name it overrode "Actual Employer" with "Wellfound" (Codex).
+    named = portal_employer(url=r.get("url") or "")
+    if named:
+        return named
     if not org:
         return None
     guess = " ".join(w.capitalize() for w in re.split(r"[-_]+", org) if w)
@@ -498,8 +523,8 @@ def comp_verdict(pays, jd="", summary="", targets=None):
     ctx = ". ".join(t for t in (rr.k_band(jd), rr.k_band(rr.us_dollars(summary))) if t)
     vals, hourly = [], False
     for p in pays or []:
-        for a, b, c in MONEY.findall(rr.mask_foreign(p)):
-            tok = a or b or c
+        for groups in MONEY.findall(rr.mask_foreign(p)):
+            tok = next((g for g in groups if g), None)
             if tok:
                 vals.append(int(tok.replace(",", "")))
     vals = [v for v in vals if 30_000 <= v <= 3_000_000]
@@ -702,7 +727,7 @@ _TRACKING_KEY = re.compile(r"^(utm_|trk|ref$|source$|src$|gh_src$|lever-|iis$|ii
 _NESTED_TRACKING = re.compile(r"\?(?:utm_\w+|gh_src|src|source|ref|trk\w*)=", re.I)
 # Only these ATSs serve an application FORM at the posting path plus a suffix; on any
 # other host the segment may be part of the posting's own slug.
-_APPLY_SUFFIX_HOSTS = re.compile(r"(^|\.)(myworkdayjobs\.com|lever\.co|ashbyhq\.com)$", re.I)
+_APPLY_SUFFIX_HOSTS = re.compile(r"(^|\.)(myworkdayjobs\.com|myworkdaysite\.com|lever\.co|ashbyhq\.com)$", re.I)
 
 
 def _expand(url):
@@ -739,7 +764,18 @@ def clean_apply(url, expand=_expand):
     path = s.path
     if _APPLY_SUFFIX_HOSTS.search(s.netloc):
         path = re.sub(r"/(apply|application)/?$", "", path)
-    return urlunsplit((s.scheme, s.netloc, path, urlencode(q), ""))
+    # A Phenom careers site's button links its APPLY FORM, `/<locale>/apply?jobSeqNo=X`,
+    # which carries no posting; the posting page is `/<locale>/job/X` (read as an empty page).
+    # Only on Phenom's own evidence: its jobSeqNo ends EXTERNAL<language><country>
+    # (ACMEUS100001EXTERNALENGLOBAL, ACMEUSR100002EXTERNALENUS). Another form using a
+    # jobSeqNo parameter would get an invented /job/ endpoint whose 404 could close the row.
+    seq = dict(q).get("jobSeqNo")
+    if seq and re.search(r"EXTERNAL[A-Z]{4,}$", seq) and re.search(r"/apply/?$", path):
+        path = re.sub(r"/apply/?$", f"/job/{seq}", path)
+        q = [(k, v) for k, v in q if k != "jobSeqNo"]
+    # Workday's myworkdaysite.com host is stored in its myworkdayjobs form, so the packet
+    # and report carry the address every other tool keys a Workday posting on.
+    return rr.canonical_workday_url(urlunsplit((s.scheme, s.netloc, path, urlencode(q), "")))
 
 
 def linkedin_employer(tab_title):
@@ -777,6 +813,9 @@ def from_linkedin(path, expand=_expand):
 
 
 def prep(url, r=None):
+    # Every entry, not only LinkedIn's clean_apply: a myworkdaysite.com url given on the
+    # command line resolved but kept "wd1" as its employer hint and packet url (2026-10-30).
+    url = rr.canonical_workday_url(url)
     r = rr.resolve(url) if r is None else r
     lv, lw = location_verdict(r.get("location"), r.get("remote_txt"))
     title = r.get("title") or ""
@@ -1927,6 +1966,15 @@ def linkedin_cases():
         (clean_apply("https://x.wd5.myworkdayjobs.com/ext/job/NYC/Eng_JR-015305-1/apply")
          == "https://x.wd5.myworkdayjobs.com/ext/job/NYC/Eng_JR-015305-1",
          "an /apply form link becomes the posting link"),
+        (clean_apply("https://join.example.com/global/en/apply?jobSeqNo=ABC123EXTERNALENGLOBAL")
+         == "https://join.example.com/global/en/job/ABC123EXTERNALENGLOBAL",
+         "a Phenom apply form becomes its /job/<jobSeqNo> posting page"),
+        (clean_apply("https://forms.example.com/apply?jobSeqNo=4471")
+         == "https://forms.example.com/apply?jobSeqNo=4471",
+         "a jobSeqNo without Phenom's shape is left alone"),
+        (clean_apply("https://wd1.myworkdaysite.com/en-US/recruiting/acme/acmesite/job/LA/X_R1-1/apply")
+         == "https://acme.wd1.myworkdayjobs.com/acmesite/job/LA/X_R1-1",
+         "a myworkdaysite apply link becomes the canonical myworkdayjobs posting"),
         (clean_apply("https://grnh.se/pfiou3ft1us", fake)
          == "https://job-boards.greenhouse.io/podium81/jobs/123456",
          "a grnh.se short link is expanded and its tracking dropped"),
@@ -2177,7 +2225,7 @@ def reresolve_cases():
           and "Offers Equity" in (p.get("comp_summary") or ""),
           f"a no-JD refetch must still refresh pay and summary: {p and p.get('comp')}")
     with mock.patch.object(rr, "resolve", lambda *a, **k: SUMMARY), pinned_floor():
-        p = prep("https://careers.example.com/job/7654321/x")
+        p = prep("https://careers.example.com/job/7594373/x")
     check(p["comp"].get("floor_gate") is False and "Offers Equity" in (p.get("comp_summary") or ""),
           f"prep must read the ATS summary for the basis: {p['comp']}")
     # A stored figure the body still states, and that the reader now rejects, is retracted
@@ -2255,7 +2303,39 @@ def queue_cases():
     enumerator that filters correctly proves nothing about a reader that bypasses it.
     """
     with tempfile.TemporaryDirectory(prefix="evalprep-strays-") as d:
-        return _queue_cases_in(d)
+        return _queue_cases_in(d) + _closure_cases()
+
+
+def closure_for_judged(prior, fresh):
+    """The judged packet updated with a CONFIRMED closure, or None when there is none.
+
+    Only `live: false` counts; a fetch that read nothing (`live: None`) is silence, and
+    silence never closes a row. Every judgement field is kept as it was."""
+    if fresh.get("live") is not False or prior.get("live") is False:
+        return None
+    out = dict(prior)
+    out["live"] = False
+    out["resolver_note"] = fresh.get("resolver_note") or prior.get("resolver_note")
+    return out
+
+
+def _closure_cases():
+    bad = 0
+    judged = {"url": "u", "title": "T", "live": True, "match_w_cv": 4.0, "resolver_note": "old"}
+    got = closure_for_judged(judged, {"live": False, "resolver_note": "gone"})
+    if not got or got["live"] is not False or got["match_w_cv"] != 4.0 or got["resolver_note"] != "gone":
+        bad += 1
+        print(f"FAIL  a confirmed closure must reach a judged packet, judgement intact: {got}")
+    if closure_for_judged(judged, {"live": None}) is not None:
+        bad += 1
+        print("FAIL  an unread fetch (live None) must not close a judged packet")
+    if closure_for_judged(judged, {"live": True}) is not None:
+        bad += 1
+        print("FAIL  a live fetch must leave a judged packet alone")
+    if closure_for_judged(dict(judged, live=False), {"live": False}) is not None:
+        bad += 1
+        print("FAIL  an already-closed judged packet needs no rewrite")
+    return bad
 
 
 def _queue_cases_in(d):
@@ -2330,6 +2410,14 @@ def comp_cases():
     v = comp_verdict(["154,200.00 - 208,600.00 USD"], "", "", targets=NO_FLOOR)
     check((v.get("low"), v.get("high")) == (154_200, 208_600),
           f"a range with one trailing USD is a band: {v.get('low')}-{v.get('high')}")
+    # One dollar sign, no USD: the high end is still the high end.
+    for band in ("$186,500.00 - 252,300.00", "$186,500 - 252,300", "$186,500 to 252,300"):
+        v = comp_verdict([band], "", "")
+        check((v.get("low"), v.get("high")) == (186_500, 252_300),
+              f"{band!r} must read as a band: {v.get('low')}-{v.get('high')}")
+    v = comp_verdict(["$186,500 - $252,300", "184,000 USD - 287,500 USD"], "", "")
+    check((v.get("low"), v.get("high")) == (184_000, 287_500),
+          f"the existing forms must still read: {v.get('low')}-{v.get('high')}")
     # ── The floor and target come from config/profile.yml, not from this file ──
     # They used to be literals in a System Layer script beside the
     # User Layer file that owns them. Asserting the REAL numbers alone would pass with a
@@ -2639,6 +2727,26 @@ def naming_cases():
             got = company_from({"url": "https://careers.example.com/global/en/job/R095439/x",
                                 "org": org, "front_end": True, "ats": "workday"})
             check(got == want, f"front-end employer for {org!r}: {got!r}, want {want!r}")
+    # A company-owned host an entry DECLARES names that employer (Microsoft's Eightfold
+    # host, 2026-10-30); a sibling host on the same domain does not.
+    fake_hosts = [dict(label="Microsoft (notes)", base="Microsoft", boards=set(), workday=None,
+                       hosts={"apply.careers.microsoft.com"})]
+    with tempfile.TemporaryDirectory(prefix="evalprep-host-") as _empty, \
+            mock.patch.object(rr, "portals_index", lambda: fake_hosts), \
+            mock.patch.object(sys.modules[__name__], "ROOT", _empty):
+        for url, want in (("https://apply.careers.microsoft.com/careers/job/1382455456314341", "Microsoft"),
+                          ("https://jobs.careers.microsoft.com/global/en/job/123", None)):
+            got = company_from({"url": url})
+            check(got == want, f"declared-host employer for {url[8:50]}: {got!r}, want {want!r}")
+        check(company_from({"url": "https://apply.careers.microsoft.com/careers/job/1", "company": "Other Co"})
+              == "Other Co", "a stated employer outranks the declared-host lookup")
+    fake_agg = [dict(label="Wellfound (aggregator)", base="Wellfound", boards=set(), workday=None,
+                     hosts={"wellfound.com"})]
+    with tempfile.TemporaryDirectory(prefix="evalprep-agg-") as _empty, \
+            mock.patch.object(rr, "portals_index", lambda: fake_agg), \
+            mock.patch.object(sys.modules[__name__], "ROOT", _empty):
+        check(company_from({"url": "https://wellfound.com/jobs/123456"}) is None,
+              "an aggregator's marketplace host never names the employer")
     # The tracker's spelling wins only on a whole key or at a WORD boundary. Asserted
     # against a fake tracker so the cases cannot drift with the real one.
     with tempfile.TemporaryDirectory(prefix="evalprep-spell-") as _d:
@@ -2776,8 +2884,41 @@ if __name__ == "__main__":
         print(__doc__); sys.exit(1)
     os.makedirs(OUT_DIR, exist_ok=True)
     disp = []
+    # The packet already queued for each req, by the url's id. A re-prep writes to THAT
+    # file: the name carries the title slug, so a req first read untitled and now titled
+    # was written to a second file beside the first. And a re-prep
+    # that reads NOTHING never replaces one that read a title: a bot challenge (an
+    # HTTP 202) blanked three packets a minute after they resolved. Refreshing a queued
+    # packet is --reresolve's job, which already keeps what a failed fetch cannot replace.
+    # Keyed on the whole url, never on packet_id: two Workday tenants both write R12345 and
+    # the digest fallback collides too, so an id key let one employer's re-prep delete or
+    # shadow another's packet (Codex, 2026-10-30).
+    queued = {(q.get("url") or "").strip(): (f, q) for f, q in queue_packets()}
     for u, rec, employer in jobs:
         p = prep(u, rec)
+        prior_path, prior = queued.get((p.get("url") or "").strip(), (None, None))
+        # A fetch that read nothing keeps the queued description, but a CLOSURE is news,
+        # not nothing: `live: false` with no title is the resolver saying the posting went.
+        if prior is not None and prior.get("title") and not p.get("title") and p.get("live") is not False:
+            print(f"KEPT  {prior['title'][:50]}: this fetch read nothing, the queued packet stands\n"
+                  f"      -> batch/eval-queue/{os.path.basename(prior_path)}")
+            continue
+        if prior is not None and prior.get("match_w_cv") is not None:
+            # The judgement stands, but a confirmed closure is news it must learn: left
+            # `live: true`, eval-write's liveness gate would publish a closed posting.
+            closed = closure_for_judged(prior, p)
+            if closed is not None:
+                write_packet(prior_path, closed)
+                disp.append({"url": u, "disposition": "closed"})
+                print(f"CLOSED {(prior.get('title') or u)[:50]}: judged packet kept, marked live: false")
+            else:
+                print(f"KEPT  {(prior.get('title') or u)[:50]}: already judged, not re-prepped")
+            continue
+        def supersede(name):
+            # Only AFTER the new packet is written under `name`, so a path that writes
+            # nothing (a closed posting) leaves the queued one exactly as it was.
+            if prior_path and os.path.basename(prior_path) != name and os.path.exists(prior_path):
+                os.remove(prior_path)
         # The listing's own employer name fills a packet the ATS left unnamed; it never
         # overrides a name the ATS stated. It goes through the tracker's spelling, so the
         # company-scoped id guards see one employer, and it says where it came from: a
@@ -2796,18 +2937,31 @@ if __name__ == "__main__":
         # unknown, not low, and unknown still needs a human read.
         gated = hard_gate(p)
         if gated:
-            disp.append({"url": u, "disposition": gated})
+            # A gate read off a page's own JobPosting, with liveness unknown, is a
+            # description and not a settlement: it keeps a gate-closed packet for a person
+            # to confirm but records no disposition, which would retire the inbox row for
+            # good on the strength of a record nobody verified (Codex, 2026-10-30).
+            if not (p.get("ats") == "jsonld" and p.get("live") is None):
+                disp.append({"url": u, "disposition": gated})
             kept = gated_packet(p)
             if kept is None:
+                # A closed posting writes no packet of its own, so a queued one for the same
+                # url must learn it, or it stays `live: true` beside its own disposition.
+                if prior is not None and prior.get("live") is not False and p.get("live") is False:
+                    prior["live"] = False
+                    prior["resolver_note"] = p.get("resolver_note") or prior.get("resolver_note")
+                    write_packet(prior_path, prior)
                 print(f"SKIP ({gated})  {(p['title'] or u)[:56]}")
                 continue
             name = packet_name(kept)
             write_packet(os.path.join(OUT_DIR, name), kept)
+            supersede(name)
             print(f"GATED ({gated})  {(p['title'] or u)[:56]}\n"
                   f"      -> batch/eval-queue/{name}  (eval-write records it as an unscored SKIP row)")
             continue
         name = packet_name(p)
         write_packet(os.path.join(OUT_DIR, name), p)
+        supersede(name)
         c = p["comp"]
         money = c["posted"] or "no band"
         gates = ("clears target" if c["clears_target"] else

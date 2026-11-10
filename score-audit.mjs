@@ -25,7 +25,7 @@
 import { columnsOf, setCell, trackerRows } from './tracker-rows.mjs';
 import { readFileSync, writeFileSync, readdirSync, existsSync } from 'fs';
 import { join } from 'path';
-import { applyModel, loadPrefs, persistedArrangement, reportModelText } from './score-model.mjs';
+import { applyModel, computeBase, loadPrefs, persistedArrangement, reportModelText } from './score-model.mjs';
 import { guardArgs } from './cli-guard.mjs';
 
 const CUTOVER = '2026-07-27';   // the day score-model.mjs became the only rubric
@@ -121,7 +121,9 @@ for (const f of readdirSync('reports').sort()) {
   const replayText = reportModelText(t);
   if (field(t, 'model_base') !== null && replayText !== null
       && ![mcv, ns, cp, cu].some(v => v === null || Number.isNaN(v))) {
-    const base = (mcv + ns + cp + cu) / 4 + (n('red_flags_adj') || 0);
+    // The configured weighted base, exactly as eval-write and apply-model compute it.
+    const base = computeBase({ match_w_cv: mcv, north_star: ns, comp: cp, cultural_signals: cu,
+                               red_flags_adj: n('red_flags_adj') || 0 });
     // location_final is "<location> <sep> <why>" and comp_posted may read "not
     // published", but the model was handed the bare location and an empty string.
     // The replay's input is reportModelText() in score-model.mjs, shared with
@@ -131,6 +133,7 @@ for (const f of readdirSync('reports').sort()) {
     // disagreed on every eval-write report whose prose named a pay range.
     model = applyModel(Math.round(base * 1000) / 1000, {
       text: replayText,
+      match: mcv,
       company: field(t, 'company'), role: field(t, 'role'), prefs,
       arrangement: persistedArrangement(t),
     }).final;
