@@ -137,7 +137,9 @@ def history(company, tracked):
 @functools.lru_cache(None)
 def _gates():
     # The candidate's own file wins; a fresh clone falls back to the shipped example.
-    path = os.path.join(ROOT, "config", "sweep-gates.json")
+    # CAREER_OPS_CONFIG_DIR selects another configuration, as it does for every other gate.
+    cfg = os.environ.get("CAREER_OPS_CONFIG_DIR") or os.path.join(ROOT, "config")
+    path = os.path.join(cfg, "sweep-gates.json")
     if not os.path.exists(path):
         path = os.path.join(ROOT, "config", "sweep-gates.example.json")
     with open(path, encoding="utf-8") as fh:

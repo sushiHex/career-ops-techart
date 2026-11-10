@@ -25,7 +25,7 @@ the location claim survives contact with the posting.
   python scripts/check-remote.py <url> --json
   python scripts/check-remote.py --selftest
 """
-import argparse, importlib.util, json, os, re, sys
+import argparse, functools, importlib.util, json, os, re, sys
 
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -57,15 +57,9 @@ CONTRADICTIONS = [
     (r"\bthis (?:is|role is|position is|job is) (?:an?\s*)?hybrid\b", 5,
      "declares the role hybrid outright"),
     (r"\brelocat(?:e|ion) (?:is\s*)?(?:required|expected)\b", 5, "requires relocation"),
-    # Two residency scopes a "United States - Remote" chip hid and both caught only by an
-    # evaluator reading the body: "requires candidates to be based in the EST or CST time
-    # zones", and "a remote position available in the state listed on this job" over a
-    # one-state location. A time-zone list naming Pacific is no scope
-    # against a Pacific-time resident, so the lookahead lets it through.
-    (r"\b(?:requires?|must|need to|required to)\s+(?:candidates?\s+|applicants?\s+|you\s+)?(?:to\s+)?"
-     r"be\s+(?:based|located|residing)\s+in\s+(?:the\s+)?(?![^.]{0,40}\b(?:pacific|pst|pt)\b)"
-     r"(?:[\w/]+\s+(?:or|and|/)\s+)*[\w/]+\s+time\s*-?zones?", 5,
-     "requires residence in named time zones"),
+    # A residency scope a "United States - Remote" chip hid: "a remote position available in
+    # the state listed on this job" over a one-state location. The time-zone form of the
+    # same scope depends on where the candidate lives, so tz_rule() builds it per policy.
     (r"\bremote position available (?:only )?in the (?:state|states|location|locations|country) listed\b", 5,
      "is remote only from the state listed"),
     (r"\bhybrid\b", 3, "describes the role as hybrid"),
@@ -91,16 +85,51 @@ INNOCENT = re.compile(
     r"(?:customer|client|partner|field)\s+(?:site|onsite)", re.I)
 
 
-def analyse(loc, jd, remote_flag):
+ZONE_STATES = {
+    "pacific": "CA WA OR NV", "mountain": "AZ CO ID MT NM UT WY",
+    "central": "AL AR IL IA KS LA MN MS MO NE ND OK SD TN TX WI",
+    "eastern": "CT DE FL GA IN KY ME MD MA MI NH NJ NY NC OH PA RI SC VT VA WV DC",
+    "alaska": "AK", "hawaii": "HI",
+}
+ZONE_WORDS = {"pacific": "pacific|pst|pdt|pt", "mountain": "mountain|mst|mdt|mt",
+              "central": "central|cst|cdt|ct", "eastern": "eastern|est|edt|et",
+              "alaska": "alaska|akst|akdt", "hawaii": "hawaii|hst"}
+_UNSET = object()
+
+
+@functools.lru_cache(None)
+def policy_zone():
+    """The candidate's time zone from the location policy's home_state, or None."""
+    try:
+        import _location
+        code = _location.load().home_code
+    except Exception:
+        return None
+    return next((z for z, s in ZONE_STATES.items() if code and code in s.split()), None)
+
+
+def tz_rule(zone):
+    """A residency rule naming time zones contradicts remote unless it names the candidate's
+    own zone. With no home zone known, every such rule is flagged for a human to read."""
+    keep = rf"(?![^.]{{0,40}}\b(?:{ZONE_WORDS[zone]})\b)" if zone in ZONE_WORDS else ""
+    return (r"\b(?:requires?|must|need to|required to)\s+(?:candidates?\s+|applicants?\s+|you\s+)?(?:to\s+)?"
+            r"be\s+(?:based|located|residing)\s+in\s+(?:the\s+)?" + keep +
+            r"(?:[\w/]+\s+(?:or|and|/)\s+)*[\w/]+\s+time\s*-?zones?", 5,
+            "requires residence in named time zones")
+
+
+def analyse(loc, jd, remote_flag, home_zone=_UNSET):
     """(verdict, score, reasons). verdict in consistent / CONTRADICTED / unclear / not-claimed."""
     loc = loc or ""
     jd = jd or ""
     claims = bool(CLAIMS_REMOTE.search(loc)) or bool(remote_flag)
     if not claims:
         return "not-claimed", 0, ["the posting does not claim to be remote"]
+    if home_zone is _UNSET:
+        home_zone = policy_zone()
     body = INNOCENT.sub(" ", jd)
     hits, score = [], 0
-    for pat, w, why in CONTRADICTIONS:
+    for pat, w, why in CONTRADICTIONS + [tz_rule(home_zone)]:
         m = re.search(pat, body, re.I)
         if m:
             score += w
@@ -114,7 +143,8 @@ def analyse(loc, jd, remote_flag):
 
 
 CASES = [
-    # (location, jd, remote_flag, expected verdict, why this case exists)
+    # (location, jd, remote_flag, expected verdict, why this case exists[, home zone])
+    # Cases without a sixth field run as a Pacific-time candidate.
     ("Los Angeles, CA", "We take a default together approach and expect our team members "
      "to work in an office 4+ days per week.", False, "not-claimed",
      "Snap: no remote claim at all, so there is nothing to contradict"),
@@ -149,6 +179,15 @@ CASES = [
     ("United States - Remote", "This role requires candidates to be based in the Pacific or "
      "Mountain time zones.", True, "consistent",
      "a time-zone list that names Pacific does not exclude a Pacific-time resident"),
+    ("United States - Remote", "This role requires candidates to be based in the EST or CST "
+     "time zones.", True, "consistent",
+     "the same EST/CST rule does not exclude an Eastern-time resident", "eastern"),
+    ("United States - Remote", "This role requires candidates to be based in the Pacific or "
+     "Mountain time zones.", True, "CONTRADICTED",
+     "a Pacific/Mountain rule does exclude an Eastern-time resident", "eastern"),
+    ("United States - Remote", "This role requires candidates to be based in the Pacific or "
+     "Mountain time zones.", True, "CONTRADICTED",
+     "with no home state configured, any time-zone residency rule needs a human look", None),
     ("Utah | Remote", "This is a remote position available in the state listed on this job.",
      True, "CONTRADICTED", "remote only from the one state the posting lists"),
     ("Remote (EMEA/East Coast)", "", True, "consistent",
@@ -159,8 +198,10 @@ CASES = [
 
 def selftest():
     bad = 0
-    for loc, jd, flag, want, why in CASES:
-        got, score, _ = analyse(loc, jd, flag)
+    for case in CASES:
+        loc, jd, flag, want, why = case[:5]
+        zone = case[5] if len(case) > 5 else "pacific"
+        got, score, _ = analyse(loc, jd, flag, home_zone=zone)
         if got != want:
             bad += 1
             print(f"FAIL  loc={loc!r}\n      got {got} (score {score}), expected {want}\n      {why}")

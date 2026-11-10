@@ -40,6 +40,9 @@ PYCACHE_SKIP = {"node_modules", "site-src", ".git"}
 BATCH_KEEP = {
     "README.md", "batch-runner.sh", "batch-prompt.md",
     "logs", "eval-queue", "rescore-backup", "tracker-additions", "linkedin-sweep",
+    # batch-runner.sh's own input, state and control files: moving them breaks a resume.
+    "batch-input.tsv", "batch-state.tsv", ".batch-state.lock", "batch-runner.paused",
+    "batch-runner.pid",
 }
 NEVER_TOUCH = {"reports", "data", "output", "interview-prep", "research", "site-src", "node_modules", ".git"}
 
