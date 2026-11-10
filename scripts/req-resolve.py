@@ -2089,7 +2089,13 @@ def _ld_places(j):
         names = [(r.get("name") if isinstance(r, dict) else r) for r in
                  (reqs if isinstance(reqs, list) else [reqs])]
         names = [str(n).strip() for n in names if n and str(n).strip()]
-        out += [f"{n} - Remote" for n in names] or ["Remote"]
+        if names:
+            # The applicant restriction IS where a remote hire may live. An office address
+            # beside it is where the company sits, not an alternative eligible place, so it
+            # must not be offered as one: an LA office with applicants restricted to Germany
+            # would otherwise pass a California gate (Codex, PR 5 round 5).
+            return [f"{n} - Remote" for n in names], remote
+        out.append("Remote")
     return out, remote
 
 
@@ -4663,13 +4669,19 @@ def behaviour_cases():
                 baseSalary={"@type": "MonetaryAmount", "currency": "USD",
                             "value": {"@type": "QuantitativeValue", "minValue": 210000,
                                       "maxValue": 260000, "unitText": "YEAR"}})
+    _de = jsonld_describe(ld(dict(FULL, jobLocation=[{"@type": "Place", "address": {
+        "addressLocality": "Los Angeles", "addressRegion": "CA", "addressCountry": "US"}}],
+        applicantLocationRequirements=[{"@type": "Country", "name": "Germany"}])),
+        "https://careers.acme.com/job/applied-research/8534252")
+    check(_de and _de["location"] == "Germany - Remote",
+          f"an office address must not stand in for a remote applicant restriction: {_de and _de['location']}")
     _parent = jsonld_describe(ld(dict(FULL, hiringOrganization={"name": "Globex Pictures"})),
                               "https://join.globexcareers.com/global/en/job/8534252")
     check(_parent and _parent["company"] is None,
           f"a stated employer the url's host does not name is not the company: {_parent}")
     d = jsonld_describe(ld(NEIGHBOUR, FULL), "https://careers.acme.com/job/applied-research/8534252")
     check(d and d["title"] == "The Requested One" and d["company"] == "Acme"
-          and d["location"] == "Denver, CO, US | United States - Remote"
+          and d["location"] == "United States - Remote"
           and d["pay"] == ["$210,000 - $260,000"] and "eval harnesses" in d["jd"]
           and "live" not in d,
           f"jsonld_describe must read the requested record whole and carry no liveness: {d}")
@@ -4685,8 +4697,11 @@ def behaviour_cases():
                           "https://careers.example.com/jobs/111/ai-engineer") is None,
           "a record stating a different url must not be read by its title")
     # Matched records that disagree on the PLACE describe nothing, in either order.
-    _la = dict(FULL, jobLocation=[{"address": {"addressLocality": "Los Angeles", "addressRegion": "CA"}}])
-    _be = dict(FULL, jobLocation=[{"address": {"addressLocality": "Berlin", "addressCountry": "DE"}}])
+    # Onsite records: a remote applicant restriction would replace the office as the place.
+    _la = dict(FULL, jobLocationType=None,
+               jobLocation=[{"address": {"addressLocality": "Los Angeles", "addressRegion": "CA"}}])
+    _be = dict(FULL, jobLocationType=None,
+               jobLocation=[{"address": {"addressLocality": "Berlin", "addressCountry": "DE"}}])
     check(jsonld_describe(ld(_la, _be), BI_URL) is None and jsonld_describe(ld(_be, _la), BI_URL) is None,
           "matched records that disagree on location describe nothing")
     # baseSalary semantics: foreign currency, monthly units and single values.

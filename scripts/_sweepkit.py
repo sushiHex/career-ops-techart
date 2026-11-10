@@ -150,7 +150,13 @@ def _gates():
 
 
 def tech_role(title):
+    """Is this a role worth reading the body of? A title matching one of the candidate's
+    OWN positive title signals always is, whatever the role family, so a configured target
+    such as "Product Manager" is never dropped by the shipped engineering gate; anything
+    else must look technical."""
     g, t = _gates(), title or ""
+    if any(w > 0 and re.search(p, t, re.I) for p, w in _lane.LANE_UP):
+        return True
     return bool(g["tech"].search(t)) and not g["not_tech"].search(t)
 
 
