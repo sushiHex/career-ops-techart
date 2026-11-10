@@ -229,7 +229,7 @@ def sweep(min_score=8, want_unknown=False, workers=16, extra=None, only_extra=Fa
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("--min", type=int, default=8, help="lane_score floor (title plus body)")
+    ap.add_argument("--min", type=int, default=None, help="default: 8, lowered to what the configured vocabulary can reach; lane_score floor (title plus body)")
     ap.add_argument("--unknown", action="store_true", help="also print rows whose place needs a person")
     ap.add_argument("--show-seen", action="store_true", help="print rows earlier runs already printed")
     ap.add_argument("--no-record", action="store_true", help="do not write data/sweep-seen.tsv")
@@ -239,6 +239,8 @@ def main(argv=None):
     ap.add_argument("--only-extra", action="store_true", help="read only the --extra boards")
     ap.add_argument("--selftest", action="store_true")
     a = ap.parse_args(argv)
+    if a.min is None:
+        a.min = kit.lane_floor(8)
     if a.selftest:
         return _selftest()
     if a.only_extra and not a.extra:
@@ -367,6 +369,10 @@ def _selftest():
     tw = tracker_titles([{"#": "901", "company": "Globex.io", "role": "Agentic Intelligence - Canada"}])
     check("twin key", tw.get((company_key("Globex"), stem("Agentic Intelligence - Remote, US"))), "901")
 
+    # The default floor never exceeds what the vocabulary can reach (Codex, PR 5 round 3).
+    check("floor: title-only +4 vocabulary", kit.floor_for(8, [("x", 4)], []), 4)
+    check("floor: title plus body keeps the tuned value", kit.floor_for(8, [("x", 4)], [("y", 3)]), 8)
+    check("floor: penalties only", kit.floor_for(8, [("x", -3)], []), 0)
     print("body-sweep selftest:", "OK" if not bad else f"{bad} FAILED")
     return 1 if bad else 0
 

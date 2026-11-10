@@ -86,7 +86,7 @@ def non_us_remote(header):
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--threads", type=int, default=1)
-    ap.add_argument("--min", type=int, default=5, help="lane_score floor over header and post")
+    ap.add_argument("--min", type=int, default=None, help="default: 5, lowered to what the configured vocabulary can reach; lane_score floor over header and post")
     ap.add_argument("--unknown", action="store_true", help="also print posts whose place needs a person")
     ap.add_argument("--show-seen", action="store_true")
     ap.add_argument("--no-record", action="store_true")
@@ -95,6 +95,8 @@ def main(argv=None):
                                          "for `body-sweep.py --extra`")
     ap.add_argument("--selftest", action="store_true")
     a = ap.parse_args(argv)
+    if a.min is None:
+        a.min = kit.lane_floor(5)
     if a.selftest:
         return _selftest()
 

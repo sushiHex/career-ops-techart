@@ -118,13 +118,15 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--q", action="append", help="a Himalayas query (repeatable); default: remote_queries in config/sweep-gates.json")
     ap.add_argument("--pages", type=int, default=2, help="Himalayas pages of 20 per query")
-    ap.add_argument("--min", type=int, default=8, help="lane_score floor over title and body")
+    ap.add_argument("--min", type=int, default=None, help="default: 8, lowered to what the configured vocabulary can reach; lane_score floor over title and body")
     ap.add_argument("--all", action="store_true", help="also print rows at companies portals.yml polls")
     ap.add_argument("--show-seen", action="store_true")
     ap.add_argument("--no-record", action="store_true")
     ap.add_argument("--companies-out", help="write the unpolled employers here, one per line, for find-ats.py")
     ap.add_argument("--selftest", action="store_true")
     a = ap.parse_args(argv)
+    if a.min is None:
+        a.min = kit.lane_floor(8)
     if a.selftest:
         return _selftest()
 

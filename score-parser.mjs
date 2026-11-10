@@ -13,12 +13,14 @@ const ALIASES = {
 const FIELDS = Object.keys(ALIASES);
 export const DIMS = ['match_w_cv', 'north_star', 'comp', 'cultural_signals'];
 
-// A candidate that also carries `global` outranks one with the same dimensions and none:
-// the audit compares the stated global with the recomputed one, so a parse without it is
-// a parse the audit cannot use. Before this, a CRLF report's YAML block failed to match
-// (see below), the markdown table tied on four dimensions, was pushed first, and won.
+// Dimensions decide first: a parse missing a dimension cannot compute a base at all, so
+// three dimensions plus `global` must never outrank four without it. Among parses with
+// the SAME dimension count, one that also carries `global` wins, since the audit compares
+// the stated global with the recomputed one. Before that tie-break, a CRLF report's YAML
+// block failed to match (see below), the markdown table tied on four dimensions, was
+// pushed first, and won.
 const completeness = (c) =>
-  DIMS.filter((k) => c && c[k] !== null && c[k] !== undefined).length
+  2 * DIMS.filter((k) => c && c[k] !== null && c[k] !== undefined).length
   + (c && c.global !== null && c.global !== undefined ? 1 : 0);
 
 /**

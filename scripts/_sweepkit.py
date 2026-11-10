@@ -161,6 +161,21 @@ def lane_keeps(title, body, floor):
     return sc, sc >= floor or bool(_gates()["lane_a"].search(title or "") and _lane.lane_score(title) >= 3)
 
 
+def floor_for(preferred, title_up, body_up):
+    """A sweep's default lane floor: its tuned value, lowered to what the configured
+    vocabulary can actually reach. A role matching the strongest single title signal, plus
+    the body cap when body signals exist, must be able to clear it, or a vocabulary with
+    only +4 title words and no body words (the general preset) discards every match."""
+    tops = [w for _, w in title_up if w > 0]
+    reach = (max(tops) if tops else 0) + (8 if any(w > 0 for _, w in body_up) else 0)
+    return min(preferred, reach)
+
+
+def lane_floor(preferred):
+    """floor_for() over the configured vocabulary; an explicit --min always wins."""
+    return floor_for(preferred, _lane.LANE_UP, _lane.BODY_UP)
+
+
 def max_floor():
     return _gates()["max_floor"]
 
