@@ -40,6 +40,14 @@ _spec = importlib.util.spec_from_file_location(
     "evalprep", os.path.join(ROOT, "scripts", "eval-prep.py"))
 _prep = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_prep)
+# check-remote reads the body against the remote claim. It was a separate command nobody
+# ran during a sweep, so a body saying "based in the EST or CST time zones" or "remote ...
+# in the state listed" reached evaluation as remote-US twice on 2026-11-02. Its verdict is
+# put in front of the evaluator here; it decides nothing on its own.
+_cspec = importlib.util.spec_from_file_location(
+    "checkremote", os.path.join(ROOT, "scripts", "check-remote.py"))
+_cr = importlib.util.module_from_spec(_cspec)
+_cspec.loader.exec_module(_cr)
 
 
 def comp_score(achievable):
@@ -91,6 +99,17 @@ ANTI = [(n, re.compile(p, re.I), w) for n, p, w in _ASSIST.get("anti", [])]
 
 
 def annotate(p):
+    p['fit_review_guidance'] = (
+        'Use modes/_shared.md Skills-fit assessment and Judgment calibration with current candidate evidence. '
+        'Use its anchors and compact evidence check, with a reason and confidence for each dimension. '
+        'Re-review changes require new evidence or a specific interpretation/calibration error, not rephrasing. '
+        'Assess central responsibilities through direct and transferable evidence, including useful combinations. '
+        'Separate essential gaps from preferred/example tools and realistic ramp-up. '
+        'Lane keywords and detected gates are prompts for review, not skills scores. '
+        'Challenge under-scoring and over-scoring; no title-only penalties, X-factor bonus or hiring probabilities. '
+        'Return dimensions; score-model.mjs applies the gradual fit adjustment. '
+        'Interview interest warrants reviewing assumptions, not an automatic numeric bonus.'
+    )
     # Full body when the packet carries it. Gates appear anywhere in a posting, so
     # scanning only the requirements excerpt under-reports them badly.
     jd = p.get("jd_full") or p.get("requirements_excerpt") or ""
@@ -98,6 +117,10 @@ def annotate(p):
     p["suggested_comp_score"] = comp_score(c.get("achievable"))
     hit = [(n, dispose) for n, r, dispose in GATES if r.search(jd)]
     p["detected_gates"] = [n for n, _ in hit]
+    verdict, _, why = _cr.analyse(p.get("location") or "", p.get("jd_full") or "", p.get("remote_txt"))
+    p["remote_check"] = {"verdict": verdict, "why": why[:3]}
+    if verdict == "CONTRADICTED":
+        p["detected_gates"].append("remote contradicted by body")
     # Weight by how OFTEN a signal appears, not merely whether it does. A posting
     # that says "agentic" once in six thousand characters is not an agentic role,
     # and presence-scoring ranked a Salesforce and RevOps integration job top of the

@@ -28,7 +28,7 @@
 import { readFileSync, writeFileSync, readdirSync, mkdirSync, unlinkSync, existsSync, copyFileSync } from 'fs';
 import { basename, join } from 'path';
 import { trackerPath, columnsOf, trackerRows, setCell, reportFileOf, normalizeStatus } from './tracker-rows.mjs';
-import { applyModel, loadPrefs, normaliseArrangement } from './score-model.mjs';
+import { applyModel, loadPrefs, normaliseArrangement, computeBase } from './score-model.mjs';
 import { parseScores } from './audit-scores.mjs';
 import { reqLabel } from './req-id-core.mjs';
 import { extractJobId, companyKey } from './role-matcher.mjs';
@@ -163,12 +163,30 @@ const q = s => String(s).replace(/\s+/g, ' ').replace(/"/g, "'").trim();
  */
 function provenance(p, DATE) {
   const state = p.live === true ? 'LIVE (verified)' : p.live === false ? 'CLOSED' : 'liveness unknown';
+  if (p.ats === 'browser') {
+    const on = p.captured_on || DATE;
+    return {
+      legit: `${state} - employer posting read on the rendered page, ${on}`,
+      verif: `${on}, rendered employer page. Depth: ${p.verification_depth}.`,
+      verified: `${on} rendered employer page`,
+    };
+  }
   if (p.ats === 'linkedin') {
     const on = p.captured_on || 'date not recorded';
     return {
       legit: `${state} - read from the LinkedIn listing in the browser (no ATS behind it), ${on}`,
       verif: `${on}, LinkedIn page capture. Depth: ${p.verification_depth}.`,
       verified: `${on} LinkedIn page capture`,
+    };
+  }
+  if (p.ats === 'jsonld') {
+    // Described from the page's own schema.org JobPosting, not read from any API, and
+    // liveness confirmed (if at all) separately by a rendered-page check (Codex, 2026-10-30).
+    const how = p.live === true ? 'liveness confirmed on the rendered page' : 'liveness not confirmed';
+    return {
+      legit: `${state} - posting described from the page's schema.org JobPosting (no API for this host), ${how}, ${DATE}`,
+      verif: `${DATE}, page JSON-LD (HTML), ${how}. Depth: ${p.verification_depth}.`,
+      verified: `${DATE} page JSON-LD`,
     };
   }
   return {
@@ -466,8 +484,7 @@ function sameCompany(path, p) {
 /** The report and the tracker TSV for a scored packet. Scores come from score-model.mjs. */
 function renderScored(p, N, file) {
   const pv = provenance(p, DATE);
-  const base = (p.match_w_cv + p.north_star + p.comp_score + p.cultural_signals) / 4
-    + (p.red_flags_adj || 0);
+  const base = computeBase({ ...p, comp: p.comp_score });
   // The only comp figure the model is allowed to GATE on, and nothing else.
   //
   // This line read `comp_total_est: "${p.comp.posted}"` for ANY posted range,
@@ -517,7 +534,7 @@ function renderScored(p, N, file) {
   // office address and so overstated every onsite role it could not parse.
   const m = applyModel(Math.round(base * 1000) / 1000, {
     text: `${compText}\nlocation: "${p.location || ''}"\n`,
-    company: p.company, role: p.title, prefs, arrangement: p.arrangement,
+    company: p.company, role: p.title, prefs, arrangement: p.arrangement, match: p.match_w_cv,
   });
 
   const md = `# ${N} - ${p.company} - ${p.title}
@@ -576,6 +593,7 @@ scores:
   red_flags_adj: ${p.red_flags_adj || 0}
   global: ${m.base.toFixed(2)}
   model_base: ${m.base.toFixed(2)}
+  model_fit_factor: ${m.fitFactor.toFixed(3)}
 final: ${m.final.toFixed(2)}
 location_verdict: ${p.location_verdict}
 arrangement: ${m.arrangement}

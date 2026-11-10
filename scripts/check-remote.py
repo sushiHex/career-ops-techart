@@ -57,6 +57,17 @@ CONTRADICTIONS = [
     (r"\bthis (?:is|role is|position is|job is) (?:an?\s*)?hybrid\b", 5,
      "declares the role hybrid outright"),
     (r"\brelocat(?:e|ion) (?:is\s*)?(?:required|expected)\b", 5, "requires relocation"),
+    # Two residency scopes a "United States - Remote" chip hid and both caught only by an
+    # evaluator reading the body: "requires candidates to be based in the EST or CST time
+    # zones", and "a remote position available in the state listed on this job" over a
+    # one-state location. A time-zone list naming Pacific is no scope
+    # against a Pacific-time resident, so the lookahead lets it through.
+    (r"\b(?:requires?|must|need to|required to)\s+(?:candidates?\s+|applicants?\s+|you\s+)?(?:to\s+)?"
+     r"be\s+(?:based|located|residing)\s+in\s+(?:the\s+)?(?![^.]{0,40}\b(?:pacific|pst|pt)\b)"
+     r"(?:[\w/]+\s+(?:or|and|/)\s+)*[\w/]+\s+time\s*-?zones?", 5,
+     "requires residence in named time zones"),
+    (r"\bremote position available (?:only )?in the (?:state|states|location|locations|country) listed\b", 5,
+     "is remote only from the state listed"),
     (r"\bhybrid\b", 3, "describes the role as hybrid"),
     (r"\bon[- ]?site\b", 2, "uses onsite language"),
     (r"\bcommut(?:e|able|ing)\b", 2, "refers to commuting"),
@@ -132,6 +143,14 @@ CASES = [
      "policy: Currently, we expect all staff to be in one of our offices at least 25% of "
      "the time.", True, "unclear",
      "a real hybrid policy on a remote-friendly req MUST still surface"),
+    ("United States - Remote", "This role requires candidates to be based in the EST or CST "
+     "time zones.", True, "CONTRADICTED",
+     "a time-zone residency rule behind a US-remote chip"),
+    ("United States - Remote", "This role requires candidates to be based in the Pacific or "
+     "Mountain time zones.", True, "consistent",
+     "a time-zone list that names Pacific does not exclude a Pacific-time resident"),
+    ("Utah | Remote", "This is a remote position available in the state listed on this job.",
+     True, "CONTRADICTED", "remote only from the one state the posting lists"),
     ("Remote (EMEA/East Coast)", "", True, "consistent",
      "a geography outside the candidate's reach does not make the body contradict "
      "remote; that is the location gate's job, not this tool's"),

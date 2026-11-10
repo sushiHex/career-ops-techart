@@ -135,7 +135,9 @@ for fn, (url, r) in zip(files, verdicts):
     # were finally given.
     if r.get("live") is False:
         closed.append(fn); continue
-    if r.get("ats") == "unsupported":
+    # "jsonld" is a page DESCRIBED from its own JobPosting with liveness unknown: the same
+    # "cannot check liveness" as an unsupported host, not a URL that fails to resolve.
+    if r.get("ats") in ("unsupported", "jsonld"):
         unsupported.append(fn); continue
     if r.get("stale_ats"):
         unsupported.append(fn); continue

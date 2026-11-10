@@ -58,6 +58,14 @@ compensation:
   minimum: "$120K"               # Walk-away number
   location_flexibility: "Remote preferred, 1 week/month on-site possible"
 
+# Optional: how much each scoring dimension counts toward the base score. Any positive
+# numbers; they are normalised to sum to 1. Omit the block for equal weights.
+# scoring_weights:
+#   match_w_cv: 1
+#   north_star: 1
+#   comp: 1
+#   cultural_signals: 1
+
 location:
   country: "United States"
   city: "San Francisco"

@@ -131,6 +131,7 @@ for (const f of readdirSync('reports').sort()) {
     // disagreed on every eval-write report whose prose named a pay range.
     model = applyModel(Math.round(base * 1000) / 1000, {
       text: replayText,
+      match: mcv,
       company: field(t, 'company'), role: field(t, 'role'), prefs,
       arrangement: persistedArrangement(t),
     }).final;
