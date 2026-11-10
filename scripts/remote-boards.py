@@ -23,8 +23,8 @@ sys.path.insert(0, HERE)
 import _sweepkit as kit  # noqa: E402
 from _sweepkit import company_key as norm_co, html_text as _text  # noqa: E402
 
-QUERIES = ["ai engineer", "applied ai", "agentic", "llm evaluation", "forward deployed engineer",
-           "solutions architect ai", "machine learning engineer", "technical artist", "simulation engineer"]
+# The default search terms are the candidate's, so they live in config/sweep-gates.json
+# (`remote_queries`); --q overrides them for one run.
 
 
 def _get(url):
@@ -116,7 +116,7 @@ def portal_companies():
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("--q", action="append", help="a Himalayas query (repeatable); default: the lane set")
+    ap.add_argument("--q", action="append", help="a Himalayas query (repeatable); default: remote_queries in config/sweep-gates.json")
     ap.add_argument("--pages", type=int, default=2, help="Himalayas pages of 20 per query")
     ap.add_argument("--min", type=int, default=8, help="lane_score floor over title and body")
     ap.add_argument("--all", action="store_true", help="also print rows at companies portals.yml polls")
@@ -128,7 +128,10 @@ def main(argv=None):
     if a.selftest:
         return _selftest()
 
-    queries = a.q or QUERIES
+    queries = a.q or kit.remote_queries()
+    if not queries:
+        print("no queries: set remote_queries in config/sweep-gates.json or pass --q")
+        return 2
     with cf.ThreadPoolExecutor(len(queries) + 1) as ex:   # latency-bound: every query at once
         hj = ex.submit(jobicy)
         hima = list(ex.map(lambda q: himalayas(q, a.pages), queries))

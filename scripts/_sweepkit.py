@@ -145,7 +145,8 @@ def _gates():
     with open(path, encoding="utf-8") as fh:
         g = json.load(fh)
     return {"tech": re.compile(g["tech_role"], re.I), "not_tech": re.compile(g["not_tech"], re.I),
-            "lane_a": re.compile(g["lane_a_title"], re.I), "max_floor": int(g["annual_max_floor"])}
+            "lane_a": re.compile(g["lane_a_title"], re.I), "max_floor": int(g["annual_max_floor"]),
+            "remote_queries": list(g.get("remote_queries") or [])}
 
 
 def tech_role(title):
@@ -162,3 +163,8 @@ def lane_keeps(title, body, floor):
 
 def max_floor():
     return _gates()["max_floor"]
+
+
+def remote_queries():
+    """The remote-board search terms, from the candidate's sweep-gates config."""
+    return _gates()["remote_queries"]

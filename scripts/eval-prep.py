@@ -2303,7 +2303,39 @@ def queue_cases():
     enumerator that filters correctly proves nothing about a reader that bypasses it.
     """
     with tempfile.TemporaryDirectory(prefix="evalprep-strays-") as d:
-        return _queue_cases_in(d)
+        return _queue_cases_in(d) + _closure_cases()
+
+
+def closure_for_judged(prior, fresh):
+    """The judged packet updated with a CONFIRMED closure, or None when there is none.
+
+    Only `live: false` counts; a fetch that read nothing (`live: None`) is silence, and
+    silence never closes a row. Every judgement field is kept as it was."""
+    if fresh.get("live") is not False or prior.get("live") is False:
+        return None
+    out = dict(prior)
+    out["live"] = False
+    out["resolver_note"] = fresh.get("resolver_note") or prior.get("resolver_note")
+    return out
+
+
+def _closure_cases():
+    bad = 0
+    judged = {"url": "u", "title": "T", "live": True, "match_w_cv": 4.0, "resolver_note": "old"}
+    got = closure_for_judged(judged, {"live": False, "resolver_note": "gone"})
+    if not got or got["live"] is not False or got["match_w_cv"] != 4.0 or got["resolver_note"] != "gone":
+        bad += 1
+        print(f"FAIL  a confirmed closure must reach a judged packet, judgement intact: {got}")
+    if closure_for_judged(judged, {"live": None}) is not None:
+        bad += 1
+        print("FAIL  an unread fetch (live None) must not close a judged packet")
+    if closure_for_judged(judged, {"live": True}) is not None:
+        bad += 1
+        print("FAIL  a live fetch must leave a judged packet alone")
+    if closure_for_judged(dict(judged, live=False), {"live": False}) is not None:
+        bad += 1
+        print("FAIL  an already-closed judged packet needs no rewrite")
+    return bad
 
 
 def _queue_cases_in(d):
@@ -2872,7 +2904,15 @@ if __name__ == "__main__":
                   f"      -> batch/eval-queue/{os.path.basename(prior_path)}")
             continue
         if prior is not None and prior.get("match_w_cv") is not None:
-            print(f"KEPT  {(prior.get('title') or u)[:50]}: already judged, not re-prepped")
+            # The judgement stands, but a confirmed closure is news it must learn: left
+            # `live: true`, eval-write's liveness gate would publish a closed posting.
+            closed = closure_for_judged(prior, p)
+            if closed is not None:
+                write_packet(prior_path, closed)
+                disp.append({"url": u, "disposition": "closed"})
+                print(f"CLOSED {(prior.get('title') or u)[:50]}: judged packet kept, marked live: false")
+            else:
+                print(f"KEPT  {(prior.get('title') or u)[:50]}: already judged, not re-prepped")
             continue
         def supersede(name):
             # Only AFTER the new packet is written under `name`, so a path that writes

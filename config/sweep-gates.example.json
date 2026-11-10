@@ -3,5 +3,16 @@
   "tech_role": "engineer|developer|architect|scientist|researcher|technologist|technical (artist|director|animator)|technical art|tech art|\\bTD\\b|\\bFDE\\b|member of (the )?technical staff|\\bMTS\\b|programmer|rigger|consultant|\\bevals?\\b|evaluation",
   "not_tech": "\\b(electrical|mechanical|hardware|manufacturing|civil|structural|network|IT|facilities|field service|security operations)\\s+(engineer|engineering)\\b",
   "lane_a_title": "technical art|tech art|technical animator|creative technolog|rigging|\\brigger\\b|character (td|technical)|technical director",
-  "annual_max_floor": 150000
+  "annual_max_floor": 150000,
+  "remote_queries": [
+    "ai engineer",
+    "applied ai",
+    "agentic",
+    "llm evaluation",
+    "forward deployed engineer",
+    "solutions architect ai",
+    "machine learning engineer",
+    "technical artist",
+    "simulation engineer"
+  ]
 }
